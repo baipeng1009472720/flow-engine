@@ -72,4 +72,43 @@ class JsonSchemaCompatibilityTest {
         assertTrue(compatibility.isAssignable(Map.of("enum", List.of("A")),
                 Map.of("enum", List.of("A", "B"))));
     }
+
+    @Test
+    void unconstrained_source_cannot_satisfy_untyped_structural_target_constraints() {
+        Map<String, Object> objectTarget = Map.of(
+                "required", List.of("id"),
+                "properties", Map.of("id", Map.of("type", "string")));
+        Map<String, Object> arrayTarget = Map.of("items", Map.of("type", "string"));
+
+        assertFalse(compatibility.isAssignable(Map.of(), objectTarget));
+        assertFalse(compatibility.isAssignable(Map.of(), arrayTarget));
+    }
+
+    @Test
+    void explicit_structural_source_is_checked_against_untyped_target_recursively() {
+        Map<String, Object> objectTarget = Map.of(
+                "required", List.of("id"),
+                "properties", Map.of("id", Map.of("type", "string")));
+        Map<String, Object> arrayTarget = Map.of("items", Map.of("type", "string"));
+
+        assertTrue(compatibility.isAssignable(
+                Map.of("type", "object", "required", List.of("id"),
+                        "properties", Map.of("id", Map.of("type", "string"))), objectTarget));
+        assertFalse(compatibility.isAssignable(Map.of("type", "object"), objectTarget));
+        assertTrue(compatibility.isAssignable(
+                Map.of("type", "array", "items", Map.of("type", "string")), arrayTarget));
+        assertFalse(compatibility.isAssignable(
+                Map.of("type", "array", "items", Map.of("type", "number")), arrayTarget));
+    }
+
+    @Test
+    void exactly_equal_untyped_structural_schemas_remain_provably_compatible() {
+        Map<String, Object> objectSchema = Map.of(
+                "required", List.of("id"),
+                "properties", Map.of("id", Map.of("type", "string")));
+        Map<String, Object> arraySchema = Map.of("items", Map.of("type", "string"));
+
+        assertTrue(compatibility.isAssignable(objectSchema, objectSchema));
+        assertTrue(compatibility.isAssignable(arraySchema, arraySchema));
+    }
 }

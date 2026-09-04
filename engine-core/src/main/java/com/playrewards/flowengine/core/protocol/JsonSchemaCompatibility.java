@@ -18,6 +18,8 @@ public final class JsonSchemaCompatibility {
     private static final Set<String> SUPPORTED = Set.of(
             "type", "properties", "required", "additionalProperties", "items", "enum", "const",
             "minimum", "maximum", "minLength", "maxLength", "minItems", "maxItems");
+    private static final Set<String> OBJECT_CONSTRAINTS = Set.of(
+            "properties", "required", "additionalProperties");
 
     /**
      * Returns whether every value admitted by {@code source} is guaranteed to satisfy {@code target}.
@@ -43,10 +45,11 @@ public final class JsonSchemaCompatibility {
         if (!enumAssignable(source, target) || !boundsAssignable(source, target)) {
             return false;
         }
-        if (sourceTypes != null && sourceTypes.contains("object") && !objectAssignable(source, target)) {
+        if (mayContain(sourceTypes, "object") && hasAny(target, OBJECT_CONSTRAINTS)
+                && !objectAssignable(source, target)) {
             return false;
         }
-        if (sourceTypes != null && sourceTypes.contains("array") && target.containsKey("items")) {
+        if (mayContain(sourceTypes, "array") && target.containsKey("items")) {
             if (!(source.get("items") instanceof Map<?, ?> sourceItems
                     && target.get("items") instanceof Map<?, ?> targetItems
                     && isAssignable(stringMap(sourceItems), stringMap(targetItems)))) {
@@ -54,6 +57,14 @@ public final class JsonSchemaCompatibility {
             }
         }
         return true;
+    }
+
+    private static boolean mayContain(Set<String> sourceTypes, String type) {
+        return sourceTypes == null || sourceTypes.contains(type);
+    }
+
+    private static boolean hasAny(Map<String, Object> schema, Set<String> keys) {
+        return keys.stream().anyMatch(schema::containsKey);
     }
 
     private boolean objectAssignable(Map<String, Object> source, Map<String, Object> target) {
