@@ -27,11 +27,13 @@ import com.playrewards.flowengine.spi.DistributedLockProvider;
 import com.playrewards.flowengine.spi.LockLease;
 import com.playrewards.flowengine.spi.LockRequest;
 import com.playrewards.flowengine.spi.ScriptRuntime;
+import com.playrewards.flowengine.spi.ScriptRuntime.ScriptExecutionException;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -48,6 +50,91 @@ import org.junit.jupiter.api.Test;
 
 /** Verifies LOCK acquisition, release, timeout and scheduler-owned exceptional cleanup. */
 class LockExecutionTest {
+
+    @Test
+    void synchronous_lock_key_script_failure_keeps_safe_code_and_message() throws Exception {
+        ScriptRuntime runtime = invocation -> {
+            throw new ScriptExecutionException("SCRIPT_POLICY_DENIED", "safe lock policy failure");
+        };
+        try (FlowEngine engine = new FlowEngine(
+                registry(successfulWork(), runtime, new RecordingLocks(true)),
+                ConcurrencyGovernor.defaults(), Clock.systemUTC())) {
+            ExecutionResult result = await(engine.execute(lockPlan(0, 1_000), request(Map.of())));
+
+            assertEquals(ExecutionStatus.FAILED, result.status());
+            assertEquals("SCRIPT_POLICY_DENIED", result.errorCode());
+            assertEquals("safe lock policy failure", result.errorMessage());
+        }
+    }
+
+    @Test
+    void asynchronous_lock_key_script_failure_keeps_safe_code_and_message() throws Exception {
+        ScriptRuntime runtime = invocation -> CompletableFuture.failedFuture(
+                new ScriptExecutionException("SCRIPT_RUNTIME_LIMIT", "safe lock runtime failure"));
+        try (FlowEngine engine = new FlowEngine(
+                registry(successfulWork(), runtime, new RecordingLocks(true)),
+                ConcurrencyGovernor.defaults(), Clock.systemUTC())) {
+            ExecutionResult result = await(engine.execute(lockPlan(0, 1_000), request(Map.of())));
+
+            assertEquals(ExecutionStatus.FAILED, result.status());
+            assertEquals("SCRIPT_RUNTIME_LIMIT", result.errorCode());
+            assertEquals("safe lock runtime failure", result.errorMessage());
+        }
+    }
+
+    @Test
+    void provider_empty_result_is_rechecked_against_the_advanced_execution_deadline() throws Exception {
+        MutableClock clock = new MutableClock(Instant.parse("2026-09-04T00:00:00Z"));
+        Instant deadline = clock.instant().plusMillis(100);
+        DistributedLockProvider locks = new DistributedLockProvider() {
+            @Override
+            public Optional<LockLease> tryAcquire(LockRequest request) {
+                clock.set(deadline);
+                return Optional.empty();
+            }
+
+            @Override
+            public boolean release(LockLease lease) {
+                return false;
+            }
+        };
+        try (FlowEngine engine = new FlowEngine(
+                registry(successfulWork(), scripts(invocation -> "customer-secret"), locks, clock),
+                ConcurrencyGovernor.defaults(), clock)) {
+            ExecutionResult result = await(engine.execute(
+                    lockPlan(100, 1_000), request(Map.of(), Map.of(), deadline)));
+
+            assertEquals(ExecutionStatus.FAILED, result.status());
+            assertEquals("EXECUTION_DEADLINE_EXCEEDED", result.errorCode(), result::toString);
+        }
+    }
+
+    @Test
+    void extreme_wait_is_saturated_before_the_provider_advances_to_deadline() throws Exception {
+        MutableClock clock = new MutableClock(Instant.MAX.minusMillis(1));
+        Instant deadline = Instant.MAX;
+        DistributedLockProvider locks = new DistributedLockProvider() {
+            @Override
+            public Optional<LockLease> tryAcquire(LockRequest request) {
+                clock.set(deadline);
+                return Optional.empty();
+            }
+
+            @Override
+            public boolean release(LockLease lease) {
+                return false;
+            }
+        };
+        try (FlowEngine engine = new FlowEngine(
+                registry(successfulWork(), scripts(invocation -> "customer-secret"), locks, clock),
+                new ConcurrencyGovernor(8, 8, 8, 8, 8, clock), clock)) {
+            ExecutionResult result = await(engine.execute(
+                    lockPlan(Long.MAX_VALUE, 1_000), request(Map.of(), Map.of(), deadline)));
+
+            assertEquals(ExecutionStatus.FAILED, result.status());
+            assertEquals("EXECUTION_DEADLINE_EXCEEDED", result.errorCode(), result::toString);
+        }
+    }
 
     @Test
     void cancellation_waits_for_a_non_future_lock_key_source_to_clean_up() throws Exception {
@@ -619,6 +706,34 @@ class LockExecutionTest {
                 Thread.currentThread().interrupt();
             }
             return true;
+        }
+    }
+
+    private static final class MutableClock extends Clock {
+
+        private final AtomicReference<Instant> now;
+
+        private MutableClock(Instant initial) {
+            this.now = new AtomicReference<>(initial);
+        }
+
+        private void set(Instant value) {
+            now.set(value);
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return java.time.ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return now.get();
         }
     }
 }

@@ -6,16 +6,14 @@ import com.playrewards.flowengine.core.node.NodeExecutionException;
 import com.playrewards.flowengine.core.node.NodeExecutor;
 import com.playrewards.flowengine.core.node.NodeInvocation;
 import com.playrewards.flowengine.core.node.NodeResult;
+import com.playrewards.flowengine.core.node.ScriptExecutionSupport;
 import com.playrewards.flowengine.core.protocol.OutputValidator;
 import com.playrewards.flowengine.spi.ComponentInvocation;
 import com.playrewards.flowengine.spi.ScriptRuntime;
-import com.playrewards.flowengine.spi.ScriptRuntime.ScriptExecutionException;
 import com.playrewards.flowengine.spi.ScriptRuntime.ScriptInvocation;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.CancellationException;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 
 /** Runs a SCRIPT node through the injected sandbox and validates its single dynamic output. */
@@ -63,43 +61,13 @@ public final class ScriptNodeExecutor implements NodeExecutor {
         if (script == null) {
             throw new NodeExecutionException("SCRIPT_CONFIG_INVALID", "groovyScript must be non-blank");
         }
-        CompletionStage<Object> execution;
-        try {
-            execution = Objects.requireNonNull(runtime.execute(new ScriptInvocation(
+        return ScriptExecutionSupport.start(() -> runtime.execute(new ScriptInvocation(
                     script,
                     context.externalScopes(),
                     context.ctxView(),
                     context.executionLogger(),
                     context.cancellationToken(),
-                    context.request().deadline())), "script completion must not be null");
-        } catch (ScriptExecutionException failure) {
-            throw scriptFailure(failure);
-        }
-        return execution.handle((value, failure) -> {
-            if (failure == null) {
-                return value;
-            }
-            Throwable cause = unwrap(failure);
-            if (cause instanceof CancellationException cancellation) {
-                throw cancellation;
-            }
-            if (cause instanceof ScriptExecutionException scriptFailure) {
-                throw scriptFailure(scriptFailure);
-            }
-            throw new NodeExecutionException("SCRIPT_EXECUTION_FAILED", "script execution failed");
-        });
-    }
-
-    private static NodeExecutionException scriptFailure(ScriptExecutionException failure) {
-        return new NodeExecutionException(failure.code(), failure.getMessage());
-    }
-
-    private static Throwable unwrap(Throwable failure) {
-        Throwable current = failure;
-        while (current instanceof CompletionException && current.getCause() != null) {
-            current = current.getCause();
-        }
-        return current;
+                    context.request().deadline()))).completion();
     }
 
     private static String text(Object value) {

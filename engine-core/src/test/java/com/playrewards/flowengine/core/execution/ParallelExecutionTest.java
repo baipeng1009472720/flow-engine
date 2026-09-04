@@ -10,6 +10,7 @@ import static com.playrewards.flowengine.core.execution.StructuredExecutionTestS
 import static com.playrewards.flowengine.core.execution.StructuredExecutionTestSupport.request;
 import static com.playrewards.flowengine.core.execution.StructuredExecutionTestSupport.scripts;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.playrewards.flowengine.contract.component.ComponentType;
@@ -22,11 +23,16 @@ import com.playrewards.flowengine.core.node.NodeExecutionException;
 import com.playrewards.flowengine.core.node.NodeExecutor;
 import com.playrewards.flowengine.core.node.NodeInvocation;
 import com.playrewards.flowengine.core.node.NodeResult;
+import com.playrewards.flowengine.spi.ComponentInvocation;
 import com.playrewards.flowengine.spi.DistributedLockProvider;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.time.Clock;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -34,6 +40,67 @@ import org.junit.jupiter.api.Test;
 
 /** Verifies real scheduler fan-out, stable branch scopes, natural join and fail-fast cleanup. */
 class ParallelExecutionTest {
+
+    @Test
+    void root_failure_reason_wins_before_sibling_cleanup_and_late_user_cancel() throws Exception {
+        CountDownLatch siblingStarted = new CountDownLatch(1);
+        CountDownLatch stopObserved = new CountDownLatch(1);
+        CountDownLatch allowCleanup = new CountDownLatch(1);
+        NodeExecutor nodes = outcomeRaceExecutor(
+                false, siblingStarted, stopObserved, allowCleanup);
+        try (FlowEngine engine = new FlowEngine(
+                registry(nodes, scripts(invocation -> null), noLocks()),
+                ConcurrencyGovernor.defaults(), Clock.systemUTC())) {
+            ExecutionHandle handle = engine.execute(parallelPlan(), request(Map.of()));
+            assertTrue(stopObserved.await(2, TimeUnit.SECONDS));
+
+            assertFalse(handle.cancel(), "FAILURE must be selected before cleanup starts");
+            assertFalse(handle.completion().toCompletableFuture().isDone(),
+                    "failure publication must still wait for sibling source cleanup");
+            allowCleanup.countDown();
+            ExecutionResult result = await(handle);
+
+            assertEquals(ExecutionStatus.FAILED, result.status());
+            assertEquals("BRANCH_FAILED", result.errorCode());
+        } finally {
+            allowCleanup.countDown();
+        }
+    }
+
+    @Test
+    void root_terminal_reason_wins_before_sibling_cleanup_and_concurrent_close() throws Exception {
+        CountDownLatch siblingStarted = new CountDownLatch(1);
+        CountDownLatch stopObserved = new CountDownLatch(1);
+        CountDownLatch allowCleanup = new CountDownLatch(1);
+        NodeExecutor nodes = outcomeRaceExecutor(
+                true, siblingStarted, stopObserved, allowCleanup);
+        FlowEngine engine = new FlowEngine(
+                registry(nodes, scripts(invocation -> null), noLocks()),
+                ConcurrencyGovernor.defaults(), Clock.systemUTC());
+        Thread closer = null;
+        try {
+            ExecutionHandle handle = engine.execute(parallelPlan(), request(Map.of()));
+            assertTrue(stopObserved.await(2, TimeUnit.SECONDS));
+
+            closer = Thread.ofVirtual().start(engine::close);
+            Thread.sleep(100);
+            assertTrue(closer.isAlive(), "close must wait for the selected terminal cleanup");
+            assertFalse(handle.completion().toCompletableFuture().isDone(),
+                    "terminal publication must still wait for sibling source cleanup");
+            allowCleanup.countDown();
+            closer.join(2_000);
+            ExecutionResult result = await(handle);
+
+            assertEquals(ExecutionStatus.SUCCEEDED, result.status());
+            assertEquals("terminal-won", result.result());
+        } finally {
+            allowCleanup.countDown();
+            if (closer != null) {
+                closer.join(2_000);
+            }
+            engine.close();
+        }
+    }
 
     @Test
     void inactive_if_path_inside_a_branch_does_not_block_the_parallel_join() throws Exception {
@@ -106,7 +173,9 @@ class ParallelExecutionTest {
                 return NodeResult.continueWith(Map.of("value", code), Set.of("NEXT"));
             }
             joinRuns.incrementAndGet();
-            return NodeResult.continueWith(Map.of("value", "joined"), Set.of("NEXT"));
+            String left = (String) context.lookupSource("left", "value").value();
+            String right = (String) context.lookupSource("right", "value").value();
+            return NodeResult.continueWith(Map.of("value", left + "+" + right), Set.of("NEXT"));
         });
         ExecutionPlan plan = parallelPlan();
         try (FlowEngine engine = new FlowEngine(registry(scripts, scripts(invocation -> null), noLocks()),
@@ -117,7 +186,7 @@ class ParallelExecutionTest {
             ExecutionResult result = await(handle);
 
             assertEquals(ExecutionStatus.SUCCEEDED, result.status());
-            assertEquals("joined", result.result());
+            assertEquals("left+right", result.result());
             assertEquals(1, joinRuns.get());
             assertEquals("root/parallel:parallel/branch:0", scopes.get("left"));
             assertEquals("root/parallel:parallel/branch:1", scopes.get("right"));
@@ -196,6 +265,68 @@ class ParallelExecutionTest {
                 }
             }
         };
+    }
+
+    private static NodeExecutor outcomeRaceExecutor(boolean terminal, CountDownLatch siblingStarted,
+            CountDownLatch stopObserved, CountDownLatch allowCleanup) {
+        return new NodeExecutor() {
+            @Override
+            public ComponentType supports() {
+                return ComponentType.SCRIPT;
+            }
+
+            @Override
+            public NodeInvocation execute(NodeExecutionContext context) {
+                String code = context.node().node().nodeCode();
+                if (code.equals("left")) {
+                    try {
+                        assertTrue(siblingStarted.await(2, TimeUnit.SECONDS));
+                    } catch (InterruptedException failure) {
+                        Thread.currentThread().interrupt();
+                        throw new java.util.concurrent.CancellationException("terminal branch interrupted");
+                    }
+                    if (terminal) {
+                        return NodeInvocation.completed(NodeResult.successfulEnd("terminal-won"));
+                    }
+                    throw new NodeExecutionException("BRANCH_FAILED", "branch failed");
+                }
+                if (code.equals("right")) {
+                    CompletableFuture<NodeResult> source = new CompletableFuture<>();
+                    siblingStarted.countDown();
+                    Thread.ofVirtual().start(() -> {
+                        try {
+                            while (!context.cancellationToken().isCancellationRequested()) {
+                                Thread.sleep(5);
+                            }
+                            stopObserved.countDown();
+                            allowCleanup.await();
+                            source.completeExceptionally(
+                                    new java.util.concurrent.CancellationException("sibling cleaned"));
+                        } catch (InterruptedException failure) {
+                            Thread.currentThread().interrupt();
+                            source.completeExceptionally(failure);
+                        }
+                    });
+                    return new NodeInvocation(nonFutureStage(source), ComponentInvocation.emptyContent());
+                }
+                return NodeInvocation.completed(
+                        NodeResult.continueWith(Map.of("value", "unreachable"), Set.of("NEXT")));
+            }
+        };
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> CompletionStage<T> nonFutureStage(CompletableFuture<T> delegate) {
+        return (CompletionStage<T>) Proxy.newProxyInstance(
+                ParallelExecutionTest.class.getClassLoader(),
+                new Class<?>[]{CompletionStage.class},
+                (proxy, method, arguments) -> {
+                    try {
+                        return method.invoke(delegate, arguments);
+                    } catch (InvocationTargetException exception) {
+                        throw exception.getCause();
+                    }
+                });
     }
 
     private static DistributedLockProvider noLocks() {

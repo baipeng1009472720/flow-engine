@@ -120,6 +120,11 @@ final class StructuredExecutionTestSupport {
 
     static NodeExecutorRegistry registry(NodeExecutor scriptExecutor, ScriptRuntime scripts,
             DistributedLockProvider locks) {
+        return registry(scriptExecutor, scripts, locks, Clock.systemUTC());
+    }
+
+    static NodeExecutorRegistry registry(NodeExecutor scriptExecutor, ScriptRuntime scripts,
+            DistributedLockProvider locks, Clock clock) {
         List<NodeExecutor> structural = new ArrayList<>();
         structural.add(instantiate("com.playrewards.flowengine.core.node.structure.ParallelCoordinator",
                 new Class<?>[0]));
@@ -129,7 +134,7 @@ final class StructuredExecutionTestSupport {
                 new Class<?>[0]));
         structural.add(instantiate("com.playrewards.flowengine.core.node.structure.LockNodeExecutor",
                 new Class<?>[]{ScriptRuntime.class, DistributedLockProvider.class, Clock.class},
-                scripts, locks, Clock.systemUTC()));
+                scripts, locks, clock));
         if (scriptExecutor != null) {
             structural.add(scriptExecutor);
         }

@@ -26,6 +26,7 @@ import com.playrewards.flowengine.core.node.NodeInvocation;
 import com.playrewards.flowengine.core.node.NodeResult;
 import com.playrewards.flowengine.spi.DistributedLockProvider;
 import com.playrewards.flowengine.spi.ScriptRuntime;
+import com.playrewards.flowengine.spi.ScriptRuntime.ScriptExecutionException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.time.Clock;
@@ -43,6 +44,77 @@ import org.junit.jupiter.api.Test;
 
 /** Verifies real LOOP frame scopes, iteration barriers, collection modes and ordered aggregation. */
 class LoopExecutionTest {
+
+    @Test
+    void done_scope_never_exposes_empty_single_or_multi_iteration_frame_outputs() throws Exception {
+        List<Map<String, Object>> doneViews = new java.util.concurrent.CopyOnWriteArrayList<>();
+        NodeExecutor nodes = new NodeExecutor() {
+            @Override
+            public ComponentType supports() {
+                return ComponentType.SCRIPT;
+            }
+
+            @Override
+            public NodeInvocation execute(NodeExecutionContext context) {
+                if (context.node().node().nodeCode().equals("after")) {
+                    doneViews.add(context.ctxView());
+                    return NodeInvocation.completed(NodeResult.continueWith(Map.of(), Set.of("NEXT")));
+                }
+                Map<?, ?> frame = (Map<?, ?>) context.ctxView().get("loop");
+                return NodeInvocation.completed(NodeResult.continueWith(
+                        Map.of("value", frame.get("item")), Set.of("NEXT")));
+            }
+        };
+        try (FlowEngine engine = new FlowEngine(
+                registry(nodes, scripts(invocation -> null), noLocks()),
+                ConcurrencyGovernor.defaults(), Clock.systemUTC())) {
+            for (List<Integer> items : List.of(List.<Integer>of(), List.of(7), List.of(7, 8))) {
+                assertEquals(ExecutionStatus.SUCCEEDED,
+                        await(engine.execute(loopVisibilityPlan(), request(Map.of("items", items)))).status());
+            }
+        }
+
+        assertEquals(3, doneViews.size());
+        for (Map<String, Object> view : doneViews) {
+            Map<?, ?> loop = (Map<?, ?>) view.get("loop");
+            assertFalse(loop.containsKey("item"));
+            assertFalse(loop.containsKey("index"));
+            assertFalse(view.containsKey("body"));
+        }
+    }
+
+    @Test
+    void synchronous_collection_script_failure_keeps_safe_code_and_message() throws Exception {
+        ScriptRuntime runtime = invocation -> {
+            throw new ScriptExecutionException("SCRIPT_POLICY_DENIED", "safe loop policy failure");
+        };
+        try (FlowEngine engine = new FlowEngine(
+                registry(bodyExecutor(context -> NodeResult.continueWith(Map.of(), Set.of("NEXT"))),
+                        runtime, noLocks()),
+                ConcurrencyGovernor.defaults(), Clock.systemUTC())) {
+            ExecutionResult result = await(engine.execute(groovyLoopPlan(), request(Map.of())));
+
+            assertEquals(ExecutionStatus.FAILED, result.status());
+            assertEquals("SCRIPT_POLICY_DENIED", result.errorCode());
+            assertEquals("safe loop policy failure", result.errorMessage());
+        }
+    }
+
+    @Test
+    void asynchronous_collection_script_failure_keeps_safe_code_and_message() throws Exception {
+        ScriptRuntime runtime = invocation -> CompletableFuture.failedFuture(
+                new ScriptExecutionException("SCRIPT_RUNTIME_LIMIT", "safe loop runtime failure"));
+        try (FlowEngine engine = new FlowEngine(
+                registry(bodyExecutor(context -> NodeResult.continueWith(Map.of(), Set.of("NEXT"))),
+                        runtime, noLocks()),
+                ConcurrencyGovernor.defaults(), Clock.systemUTC())) {
+            ExecutionResult result = await(engine.execute(groovyLoopPlan(), request(Map.of())));
+
+            assertEquals(ExecutionStatus.FAILED, result.status());
+            assertEquals("SCRIPT_RUNTIME_LIMIT", result.errorCode());
+            assertEquals("safe loop runtime failure", result.errorMessage());
+        }
+    }
 
     @Test
     void cancellation_waits_for_a_non_future_groovy_collection_source_to_clean_up() throws Exception {
@@ -308,6 +380,21 @@ class LoopExecutionTest {
                 edge("start", "loop", "NEXT", "ENTRY"), edge("loop", "body", "BODY", "IN"),
                 edge("body", "loopEnd", "NEXT", "IN"), edge("loopEnd", "loop", "NEXT", "NEXT"),
                 edge("loop", "end", "DONE", "IN")),
+                Map.of("loop", "loopEnd", "loopEnd", "loop"), Map.of(), Map.of());
+    }
+
+    private static ExecutionPlan loopVisibilityPlan() {
+        ExecutionPlan base = upstreamLoopPlan(true, 10);
+        CompiledNode after = node("after", ComponentType.SCRIPT, Map.of(), Map.of());
+        List<CompiledNode> nodes = new java.util.ArrayList<>(base.nodesById().values());
+        nodes.add(after);
+        return plan("loop-visibility", nodes, List.of(
+                edge("start", "loop", "NEXT", "ENTRY"),
+                edge("loop", "body", "BODY", "IN"),
+                edge("body", "loopEnd", "NEXT", "IN"),
+                edge("loopEnd", "loop", "NEXT", "NEXT"),
+                edge("loop", "after", "DONE", "IN"),
+                edge("after", "end", "NEXT", "IN")),
                 Map.of("loop", "loopEnd", "loopEnd", "loop"), Map.of(), Map.of());
     }
 

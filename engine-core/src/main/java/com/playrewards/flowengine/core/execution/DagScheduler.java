@@ -446,9 +446,21 @@ public final class DagScheduler implements AutoCloseable {
                 throw propagate(exception.getCause());
             }
             if (completed.failure() != null) {
-                cancellation.requestStopWithoutReason();
-                if (isRootRegion(seedScope, boundaryNodeId, subFlowDepth)) {
+                boolean rootRegion = isRootRegion(seedScope, boundaryNodeId, subFlowDepth);
+                if (rootRegion) {
+                    CancellationHandle.Reason reason = completed.failure()
+                            instanceof ExecutionDeadlineExceededException
+                                    ? CancellationHandle.Reason.DEADLINE
+                                    : CancellationHandle.Reason.FAILURE;
+                    lifecycleObserver.beforeControllerReasonSelection(reason);
+                    if (reason == CancellationHandle.Reason.DEADLINE) {
+                        cancellation.cancelForDeadline();
+                    } else {
+                        cancellation.cancelForFailure();
+                    }
                     Thread.interrupted();
+                } else {
+                    cancellation.requestStopWithoutReason();
                 }
                 boolean sourceCleanup = requiresSourceCleanup(
                         seedScope, boundaryNodeId, subFlowDepth, completed.scopePath());
@@ -466,9 +478,12 @@ public final class DagScheduler implements AutoCloseable {
             completed.result().outputs().forEach((key, value) ->
                     context.writeOnce(node.node().nodeCode(), completed.scopePath(), key, value));
             if (completed.result().terminalOutcome() != null) {
-                cancellation.requestStopWithoutReason();
-                if (isRootRegion(seedScope, boundaryNodeId, subFlowDepth)) {
+                boolean rootRegion = isRootRegion(seedScope, boundaryNodeId, subFlowDepth);
+                if (rootRegion) {
+                    cancellation.cancelForTerminal();
                     Thread.interrupted();
+                } else {
+                    cancellation.requestStopWithoutReason();
                 }
                 boolean sourceCleanup = requiresSourceCleanup(
                         seedScope, boundaryNodeId, subFlowDepth, completed.scopePath());
@@ -491,7 +506,7 @@ public final class DagScheduler implements AutoCloseable {
                 }
                 return new RegionOutcome(null, true);
             }
-            resolveOutgoing(plan, included, readiness, completed, ready);
+            resolveOutgoing(plan, included, readiness, completed, ready, context);
         }
         return new RegionOutcome(null, false);
         } catch (CancellationException | ExecutionDeadlineExceededException failure) {
@@ -964,7 +979,8 @@ public final class DagScheduler implements AutoCloseable {
     }
 
     private static void resolveOutgoing(ExecutionPlan plan, Set<String> included,
-            Map<String, Readiness> readiness, NodeCompletion completed, Queue<ReadyNode> ready) {
+            Map<String, Readiness> readiness, NodeCompletion completed, Queue<ReadyNode> ready,
+            ExecutionContext context) {
         ArrayDeque<Decision> decisions = new ArrayDeque<>();
         decisions.add(new Decision(completed.nodeId(), completed.result().activatedPorts(), completed.scopePath()));
         while (!decisions.isEmpty()) {
@@ -985,11 +1001,12 @@ public final class DagScheduler implements AutoCloseable {
                     state.resolvedIncoming++;
                     if (active) {
                         state.activeIncoming++;
-                        state.activeScopes.add(targetScope(plan, decision, port, target, index));
+                        state.activeScopes.add(targetScope(
+                                plan, decision, port, target, index, context));
                     }
                     if (state.resolvedIncoming == state.totalIncoming && state.state == NodeState.PENDING) {
                         if (state.activeIncoming > 0) {
-                            ready.add(new ReadyNode(target, collapseScopes(state.activeScopes)));
+                            ready.add(new ReadyNode(target, context.convergeScopes(state.activeScopes)));
                         } else {
                             state.state = NodeState.SKIPPED;
                             decisions.addLast(new Decision(target, Set.of(), decision.scopePath()));
@@ -1001,22 +1018,14 @@ public final class DagScheduler implements AutoCloseable {
     }
 
     private static ScopePath targetScope(ExecutionPlan plan, Decision decision,
-            String port, String target, int targetIndex) {
+            String port, String target, int targetIndex, ExecutionContext context) {
         CompiledNode source = plan.nodesById().get(decision.nodeId());
         if (source.componentContract().componentType() == ComponentType.PARALLEL
                 && "BRANCH".equals(port)) {
-            return decision.scopePath().child("parallel:" + source.node().nodeCode())
-                    .child("branch:" + targetIndex);
+            return context.parallelBranchScope(
+                    decision.scopePath(), source.node().nodeCode(), targetIndex);
         }
         return decision.scopePath();
-    }
-
-    private static ScopePath collapseScopes(List<ScopePath> scopes) {
-        ScopePath result = scopes.getFirst();
-        for (int index = 1; index < scopes.size(); index++) {
-            result = result.commonAncestor(scopes.get(index));
-        }
-        return result;
     }
 
     private static Set<String> collectRegion(ExecutionPlan plan, Set<String> seeds, String boundaryNodeId) {

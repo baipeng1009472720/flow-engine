@@ -9,6 +9,7 @@ import com.playrewards.flowengine.core.node.NodeExecutionException;
 import com.playrewards.flowengine.core.node.NodeExecutor;
 import com.playrewards.flowengine.core.node.NodeInvocation;
 import com.playrewards.flowengine.core.node.NodeResult;
+import com.playrewards.flowengine.core.node.ScriptExecutionSupport;
 import com.playrewards.flowengine.spi.ScriptRuntime;
 import java.util.ArrayList;
 import java.util.List;
@@ -50,6 +51,7 @@ public final class LoopCoordinator implements NodeExecutor {
         context.throwIfStopped();
         String mode = text(context.node().node().config().get("collectionMode"));
         CompletionStage<Object> source;
+        CompletionStage<Object> sourceCompletion;
         if ("UPSTREAM".equals(mode)) {
             Source binding = source(context.node().node().config().get("collectionBinding"),
                     "LOOP_COLLECTION_BINDING_INVALID");
@@ -58,21 +60,25 @@ public final class LoopCoordinator implements NodeExecutor {
                 throw new NodeExecutionException("LOOP_COLLECTION_MISSING", "LOOP collection source is missing");
             }
             source = CompletableFuture.completedFuture(value.value());
+            sourceCompletion = source;
         } else if ("GROOVY".equals(mode)) {
             String expression = text(context.node().node().config().get("collectionExpression"));
             if (expression == null) {
                 throw new NodeExecutionException("LOOP_COLLECTION_CONFIG_INVALID",
                         "LOOP GROOVY collectionExpression must be non-blank");
             }
-            source = scripts.execute(new ScriptRuntime.ScriptInvocation(expression,
-                    context.externalScopes(), context.ctxView(), context.executionLogger(),
-                    context.cancellationToken(), context.request().deadline()));
+            ScriptExecutionSupport.ScriptExecution script = ScriptExecutionSupport.start(
+                    () -> scripts.execute(new ScriptRuntime.ScriptInvocation(expression,
+                            context.externalScopes(), context.ctxView(), context.executionLogger(),
+                            context.cancellationToken(), context.request().deadline())));
+            source = script.completion();
+            sourceCompletion = script.sourceCompletion();
         } else {
             throw new NodeExecutionException("LOOP_COLLECTION_CONFIG_INVALID",
                     "LOOP collectionMode must be UPSTREAM or GROOVY");
         }
         return new CollectionEvaluation(
-                source.thenApply(value -> validateCollection(context, value)), source);
+                source.thenApply(value -> validateCollection(context, value)), sourceCompletion);
     }
 
     /** @return required positive configured maximum */

@@ -2,7 +2,9 @@ package com.playrewards.flowengine.core.execution;
 
 import com.playrewards.flowengine.contract.json.JsonValues;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -21,6 +23,9 @@ public final class ExecutionContext {
     private final Map<String, Map<String, Object>> externalScopes;
     private final ConcurrentHashMap<OutputAddress, StoredValue> outputs = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ChildExecution> childExecutions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<ScopePath, ParallelBranch> parallelBranches = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<ScopePath, Set<ScopePath>> parallelConvergences =
+            new ConcurrentHashMap<>();
 
     /**
      * Creates an isolated execution context.
@@ -69,8 +74,8 @@ public final class ExecutionContext {
     }
 
     /**
-     * Resolves an exact value, the closest ancestor frame, or one unique descendant branch value.
-     * Ambiguous descendants at a natural join fail closed instead of depending on completion order.
+     * Resolves an exact value, the closest ancestor frame, or a value from an explicitly converged
+     * parallel branch. Loop iterations and child-flow scopes are never promoted by uniqueness.
      */
     public ContextValue lookupVisible(String nodeCode, ScopePath scopePath, String outputKey) {
         String normalizedNode = JsonValues.requireText(nodeCode, "node code");
@@ -89,7 +94,7 @@ public final class ExecutionContext {
         List<Map.Entry<OutputAddress, StoredValue>> descendants = outputs.entrySet().stream()
                 .filter(entry -> entry.getKey().nodeCode().equals(normalizedNode)
                         && entry.getKey().outputKey().equals(normalizedOutput)
-                        && entry.getKey().scopePath().isWithin(scopePath))
+                        && isParallelConverged(entry.getKey().scopePath(), scopePath))
                 .sorted(Comparator.comparing(entry -> entry.getKey().scopePath().value()))
                 .toList();
         if (descendants.isEmpty()) {
@@ -100,6 +105,93 @@ public final class ExecutionContext {
                     + normalizedNode + "." + normalizedOutput);
         }
         return ContextValue.present(descendants.getFirst().getValue().value());
+    }
+
+    /**
+     * Creates and records one stable PARALLEL branch scope with explicit parent provenance.
+     *
+     * @param parentScope scope containing the PARALLEL node
+     * @param parallelNodeCode stable node code used only in the queryable address
+     * @param branchIndex stable compiled-target index
+     * @return registered branch scope
+     */
+    ScopePath parallelBranchScope(
+            ScopePath parentScope, String parallelNodeCode, int branchIndex) {
+        Objects.requireNonNull(parentScope, "parallel parent scope must not be null");
+        String normalizedCode = JsonValues.requireText(parallelNodeCode, "parallel node code");
+        if (branchIndex < 0) {
+            throw new IllegalArgumentException("parallel branch index must be non-negative");
+        }
+        ScopePath scope = parentScope.child("parallel:" + normalizedCode)
+                .child("branch:" + branchIndex);
+        ParallelBranch branch = new ParallelBranch(parentScope, normalizedCode, branchIndex);
+        ParallelBranch existing = parallelBranches.putIfAbsent(scope, branch);
+        if (existing != null && !existing.equals(branch)) {
+            throw new IllegalStateException("parallel branch scope provenance is inconsistent");
+        }
+        return scope;
+    }
+
+    /**
+     * Collapses only explicitly related parallel branch scopes and records their convergence.
+     * Identical scopes, including LOOP iteration scopes, remain exact and create no promotion grant.
+     *
+     * @param activeScopes scopes carried by activated incoming edges
+     * @return exact scope or validated PARALLEL parent convergence scope
+     */
+    ScopePath convergeScopes(Collection<ScopePath> activeScopes) {
+        Objects.requireNonNull(activeScopes, "active scopes must not be null");
+        LinkedHashSet<ScopePath> distinct = new LinkedHashSet<>(activeScopes);
+        if (distinct.isEmpty()) {
+            throw new IllegalArgumentException("active scopes must not be empty");
+        }
+        if (distinct.size() == 1) {
+            return distinct.getFirst();
+        }
+        ScopePath convergence = null;
+        for (ScopePath scope : distinct) {
+            ParallelBranch branch = parallelBranches.get(scope);
+            ScopePath candidate = branch == null ? scope : branch.parentScope();
+            if (convergence == null) {
+                convergence = candidate;
+            } else if (!convergence.equals(candidate)) {
+                throw new IllegalStateException("active scopes do not share one explicit parallel convergence");
+            }
+        }
+        Set<ScopePath> branches = new LinkedHashSet<>();
+        for (ScopePath scope : distinct) {
+            if (scope.equals(convergence)) {
+                continue;
+            }
+            ParallelBranch branch = parallelBranches.get(scope);
+            if (branch == null || !branch.parentScope().equals(convergence)) {
+                throw new IllegalStateException("scope is not an explicit branch of the convergence");
+            }
+            branches.add(scope);
+        }
+        if (branches.isEmpty()) {
+            throw new IllegalStateException("parallel convergence requires at least one branch scope");
+        }
+        parallelConvergences.compute(convergence, (ignored, current) -> {
+            LinkedHashSet<ScopePath> merged = new LinkedHashSet<>(
+                    current == null ? Set.of() : current);
+            merged.addAll(branches);
+            return Set.copyOf(merged);
+        });
+        return convergence;
+    }
+
+    private boolean isParallelConverged(ScopePath outputScope, ScopePath convergenceScope) {
+        Set<ScopePath> sources = parallelConvergences.get(convergenceScope);
+        if (sources == null) {
+            return false;
+        }
+        for (ScopePath source : sources) {
+            if (outputScope.equals(source) || isParallelConverged(outputScope, source)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -218,6 +310,10 @@ public final class ExecutionContext {
     }
 
     private record StoredValue(Object value) {
+    }
+
+    /** Explicit origin of one PARALLEL branch path; address text is never parsed for semantics. */
+    private record ParallelBranch(ScopePath parentScope, String nodeCode, int branchIndex) {
     }
 
     /** Independently owned child-flow context and its stable scope identity. */

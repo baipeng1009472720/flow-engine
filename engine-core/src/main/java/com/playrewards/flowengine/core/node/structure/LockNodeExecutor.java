@@ -8,6 +8,7 @@ import com.playrewards.flowengine.core.node.NodeExecutionException;
 import com.playrewards.flowengine.core.node.NodeExecutor;
 import com.playrewards.flowengine.core.node.NodeInvocation;
 import com.playrewards.flowengine.core.node.NodeResult;
+import com.playrewards.flowengine.core.node.ScriptExecutionSupport;
 import com.playrewards.flowengine.spi.DistributedLockProvider;
 import com.playrewards.flowengine.spi.LockLease;
 import com.playrewards.flowengine.spi.LockRequest;
@@ -16,6 +17,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
+import java.time.DateTimeException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -78,7 +80,7 @@ public final class LockNodeExecutor implements NodeExecutor {
         }
         String lockName = scopedName(context, key);
         String ownerId = context.executionId() + ":" + context.node().node().id() + ":" + context.scopePath().value();
-        Instant waitDeadline = min(context.request().deadline(), clock.instant().plusMillis(waitMillis));
+        Instant waitDeadline = min(context.request().deadline(), saturatedPlusMillis(clock.instant(), waitMillis));
         boolean singleAttempt = waitMillis == 0;
         do {
             context.throwIfStopped();
@@ -89,6 +91,8 @@ public final class LockNodeExecutor implements NodeExecutor {
             if (acquired.isPresent()) {
                 return acquired.get();
             }
+            // The provider call may itself consume the remaining execution budget.
+            context.throwIfStopped();
             if (singleAttempt || !clock.instant().isBefore(waitDeadline)) {
                 break;
             }
@@ -128,13 +132,18 @@ public final class LockNodeExecutor implements NodeExecutor {
     }
 
     private Object awaitScript(NodeExecutionContext context, String expression) {
-        CompletionStage<Object> source = scripts.execute(new ScriptRuntime.ScriptInvocation(expression,
-                context.externalScopes(), context.ctxView(), context.executionLogger(),
-                context.cancellationToken(), context.request().deadline()));
+        ScriptExecutionSupport.ScriptExecution script = ScriptExecutionSupport.start(
+                () -> scripts.execute(new ScriptRuntime.ScriptInvocation(expression,
+                        context.externalScopes(), context.ctxView(), context.executionLogger(),
+                        context.cancellationToken(), context.request().deadline())));
+        CompletionStage<Object> source = script.completion();
+        CompletionStage<Object> sourceCompletion = script.sourceCompletion();
         CompletableFuture<Object> future = new CompletableFuture<>();
         java.util.concurrent.CountDownLatch sourceDone = new java.util.concurrent.CountDownLatch(1);
-        source.whenComplete((value, failure) -> {
+        sourceCompletion.whenComplete((value, failure) -> {
             sourceDone.countDown();
+        });
+        source.whenComplete((value, failure) -> {
             if (failure == null) {
                 future.complete(value);
             } else {
@@ -144,24 +153,20 @@ public final class LockNodeExecutor implements NodeExecutor {
         try {
             return future.get(Math.max(1, remainingMillis(context.request().deadline())), TimeUnit.MILLISECONDS);
         } catch (InterruptedException failure) {
-            cancelSource(source, future);
+            cancelSource(source, sourceCompletion, future);
             RuntimeException selected = stoppedFailure(context,
                     new java.util.concurrent.CancellationException("lock key evaluation interrupted"));
             awaitSourceCleanup(sourceDone, context, selected);
             Thread.currentThread().interrupt();
             throw selected;
         } catch (TimeoutException failure) {
-            cancelSource(source, future);
+            cancelSource(source, sourceCompletion, future);
             RuntimeException selected = stoppedFailure(context,
                     new ExecutionDeadlineExceededException("execution deadline exceeded", failure));
             awaitSourceCleanup(sourceDone, context, selected);
             throw selected;
         } catch (ExecutionException failure) {
-            Throwable cause = failure.getCause();
-            if (cause instanceof RuntimeException runtime) {
-                throw runtime;
-            }
-            throw new NodeExecutionException("LOCK_KEY_EVALUATION_FAILED", "LOCK key evaluation failed");
+            throw ScriptExecutionSupport.safeFailure(failure.getCause());
         }
     }
 
@@ -209,15 +214,23 @@ public final class LockNodeExecutor implements NodeExecutor {
         }
     }
 
-    private static void cancelSource(CompletionStage<?> source, CompletableFuture<?> bridge) {
+    private static void cancelSource(CompletionStage<?> stage, CompletionStage<?> source,
+            CompletableFuture<?> bridge) {
         if (source instanceof Future<?> cancellable) {
+            cancellable.cancel(true);
+        }
+        if (stage != source && stage instanceof Future<?> cancellable) {
             cancellable.cancel(true);
         }
         bridge.cancel(true);
     }
 
     private long remainingMillis(Instant deadline) {
-        return Math.max(0, clock.instant().until(deadline, ChronoUnit.MILLIS));
+        try {
+            return Math.max(0, clock.instant().until(deadline, ChronoUnit.MILLIS));
+        } catch (ArithmeticException overflow) {
+            return clock.instant().isBefore(deadline) ? Long.MAX_VALUE : 0;
+        }
     }
 
     private static long nonNegative(NodeExecutionContext context, String field, long defaultValue) {
@@ -254,6 +267,14 @@ public final class LockNodeExecutor implements NodeExecutor {
 
     private static Instant min(Instant left, Instant right) {
         return left.isBefore(right) ? left : right;
+    }
+
+    private static Instant saturatedPlusMillis(Instant start, long millis) {
+        try {
+            return start.plusMillis(millis);
+        } catch (DateTimeException | ArithmeticException overflow) {
+            return Instant.MAX;
+        }
     }
 
     private static String text(Object value) {
