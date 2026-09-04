@@ -102,6 +102,82 @@ class CancellationAndDeadlineTest {
     }
 
     @Test
+    void close_cancels_active_non_future_source_and_restores_shared_capacity_for_another_scheduler()
+            throws Exception {
+        CloseAwareStageExecutor closeAware = new CloseAwareStageExecutor();
+        NodeExecutorRegistry registry = NodeExecutorRegistry.withBuiltIns(List.of(closeAware));
+        ExecutionPlan plan = closeAwarePlan();
+        DagScheduler closing = new DagScheduler(registry, ConcurrencyGovernor.defaults(), Clock.systemUTC());
+        DagScheduler survivor = new DagScheduler(registry, ConcurrencyGovernor.defaults(), Clock.systemUTC());
+        try {
+            ExecutionHandle active = closing.schedule(plan, request(Map.of()));
+            assertTrue(closeAware.firstEntered.await(2, TimeUnit.SECONDS));
+
+            closing.close();
+            assertEquals(ExecutionStatus.CANCELLED, await(active).status());
+            assertTrue(closeAware.firstObservedCancellation.await(2, TimeUnit.SECONDS));
+
+            ExecutionHandle next = survivor.schedule(plan, request(Map.of()));
+            assertFalse(closeAware.secondEntered.await(200, TimeUnit.MILLISECONDS));
+            closeAware.allowFirstSourceCompletion.countDown();
+
+            assertTrue(closeAware.firstSourceCompleted.await(2, TimeUnit.SECONDS));
+            assertEquals(ExecutionStatus.SUCCEEDED, await(next).status());
+            assertTrue(closeAware.secondEntered.await(2, TimeUnit.SECONDS));
+        } finally {
+            closeAware.allowFirstSourceCompletion.countDown();
+            closing.close();
+            survivor.close();
+        }
+    }
+
+    @Test
+    void schedule_after_close_returns_a_completed_rejection_without_consuming_admission() throws Exception {
+        DagScheduler scheduler = new DagScheduler(
+                NodeExecutorRegistry.builtIns(), ConcurrencyGovernor.defaults(), Clock.systemUTC());
+        scheduler.close();
+
+        ExecutionResult rejected = await(scheduler.schedule(closeAwarePlan(), request(Map.of())));
+
+        assertEquals(ExecutionStatus.FAILED, rejected.status());
+        assertEquals("EXECUTION_SCHEDULER_CLOSED", rejected.errorCode());
+    }
+
+    @Test
+    void concurrent_schedule_and_close_always_returns_a_terminal_handle() throws Exception {
+        ExecutionPlan plan = compile(
+                List.of(node("race-start", "builtin.start", "raceStart", Map.of()),
+                        node("race-end", "builtin.end", "raceEnd", Map.of("resultStatus", "SUCCESS"))),
+                List.of(edge("race-edge", "race-start", "race-end", "NEXT", "IN")), Map.of(
+                        "builtin.start", contract("builtin.start", ComponentType.START, Map.of(), Map.of()),
+                        "builtin.end", contract("builtin.end", ComponentType.END, Map.of(), Map.of())));
+        for (int iteration = 0; iteration < 50; iteration++) {
+            DagScheduler scheduler = new DagScheduler(
+                    NodeExecutorRegistry.builtIns(), ConcurrencyGovernor.defaults(), Clock.systemUTC(), 4, 1);
+            CountDownLatch startRace = new CountDownLatch(1);
+            CompletableFuture<ExecutionHandle> scheduled = CompletableFuture.supplyAsync(() -> {
+                awaitLatch(startRace);
+                return scheduler.schedule(plan, request(Map.of()));
+            });
+            CompletableFuture<Void> closed = CompletableFuture.runAsync(() -> {
+                awaitLatch(startRace);
+                scheduler.close();
+            });
+
+            startRace.countDown();
+            ExecutionResult result = await(scheduled.get(2, TimeUnit.SECONDS));
+            closed.get(2, TimeUnit.SECONDS);
+
+            assertTrue(result.status() == ExecutionStatus.SUCCEEDED
+                    || result.status() == ExecutionStatus.CANCELLED
+                    || result.status() == ExecutionStatus.FAILED);
+            if (result.status() == ExecutionStatus.FAILED) {
+                assertEquals("EXECUTION_SCHEDULER_CLOSED", result.errorCode());
+            }
+        }
+    }
+
+    @Test
     void cancellation_fans_out_past_a_failing_callback_and_closed_registrations_are_removed() {
         CancellationHandle cancellation = new CancellationHandle();
         AtomicBoolean removedCallback = new AtomicBoolean();
@@ -253,6 +329,33 @@ class CancellationAndDeadlineTest {
                 registry, ConcurrencyGovernor.defaults(), Clock.systemUTC(), 1)) {
             assertEquals(ExecutionStatus.SUCCEEDED, await(scheduler.schedule(plan, request(Map.of()))).status());
             assertEquals(1, maximum.get());
+        }
+    }
+
+    @Test
+    void node_admission_waits_for_both_source_completion_and_callable_exit() throws Exception {
+        PostCompletionBlockingExecutor blocking = new PostCompletionBlockingExecutor();
+        NodeExecutorRegistry registry = NodeExecutorRegistry.withBuiltIns(List.of(blocking));
+        ExecutionPlan firstPlan = twoInvocationPlan("a", "test.post-completion-a");
+        ExecutionPlan secondPlan = twoInvocationPlan("b", "test.post-completion-b");
+
+        try (DagScheduler scheduler = new DagScheduler(
+                registry, new ConcurrencyGovernor(8, 8, 8, 8, 8, Clock.systemUTC()),
+                Clock.systemUTC(), 1, 2)) {
+            ExecutionHandle first = scheduler.schedule(firstPlan, request(Map.of()));
+            assertTrue(blocking.sourceCallbackCompleted.await(2, TimeUnit.SECONDS));
+
+            ExecutionHandle second = scheduler.schedule(secondPlan, request(Map.of()));
+            boolean enteredWhileFirstCallableStillRunning =
+                    blocking.secondEntered.await(200, TimeUnit.MILLISECONDS);
+            blocking.allowFirstCallableExit.countDown();
+
+            assertFalse(enteredWhileFirstCallableStillRunning);
+            assertEquals(ExecutionStatus.SUCCEEDED, await(first).status());
+            assertEquals(ExecutionStatus.SUCCEEDED, await(second).status());
+            assertTrue(blocking.secondEntered.await(2, TimeUnit.SECONDS));
+        } finally {
+            blocking.allowFirstCallableExit.countDown();
         }
     }
 
@@ -588,6 +691,23 @@ class CancellationAndDeadlineTest {
                         "builtin.end", contract("builtin.end", ComponentType.END, Map.of(), Map.of())));
     }
 
+    private static ExecutionPlan closeAwarePlan() {
+        return twoInvocationPlan("close", "test.close-aware");
+    }
+
+    private static ExecutionPlan twoInvocationPlan(String suffix, String componentCode) {
+        FlowNode start = node("start-" + suffix, "builtin.start", "start" + suffix, Map.of());
+        FlowNode work = node("work-" + suffix, componentCode, "work" + suffix, Map.of());
+        FlowNode end = node("end-" + suffix, "builtin.end", "end" + suffix,
+                Map.of("resultStatus", "SUCCESS"));
+        return compile(List.of(start, work, end), List.of(
+                edge("first-" + suffix, start.id(), work.id(), "NEXT", "IN"),
+                edge("last-" + suffix, work.id(), end.id(), "NEXT", "IN")), Map.of(
+                        "builtin.start", contract("builtin.start", ComponentType.START, Map.of(), Map.of()),
+                        componentCode, contract(componentCode, ComponentType.SCRIPT, Map.of(), Map.of(), 1),
+                        "builtin.end", contract("builtin.end", ComponentType.END, Map.of(), Map.of())));
+    }
+
     private static ExecutionPlan wideHoldingPlan(int width) {
         List<FlowNode> nodes = new ArrayList<>(width + 2);
         List<FlowEdge> edges = new ArrayList<>(width * 2);
@@ -620,6 +740,15 @@ class CancellationAndDeadlineTest {
                 "test.blocking", contract("test.blocking", ComponentType.SCRIPT, Map.of(), Map.of()),
                 "builtin.end", contract("builtin.end", ComponentType.END, Map.of(), Map.of()));
         return compile(List.of(start, blocking, end), edges, contracts);
+    }
+
+    private static void awaitLatch(CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(exception);
+        }
     }
 
     private static final class BlockingExecutor implements NodeExecutor {
@@ -672,6 +801,75 @@ class CancellationAndDeadlineTest {
             started.countDown();
             return new NodeInvocation(completion,
                     com.playrewards.flowengine.spi.ComponentInvocation.emptyContent());
+        }
+    }
+
+    private static final class CloseAwareStageExecutor implements NodeExecutor {
+
+        private final AtomicInteger invocations = new AtomicInteger();
+        private final CountDownLatch firstEntered = new CountDownLatch(1);
+        private final CountDownLatch firstObservedCancellation = new CountDownLatch(1);
+        private final CountDownLatch allowFirstSourceCompletion = new CountDownLatch(1);
+        private final CountDownLatch firstSourceCompleted = new CountDownLatch(1);
+        private final CountDownLatch secondEntered = new CountDownLatch(1);
+
+        @Override
+        public ComponentType supports() {
+            return ComponentType.SCRIPT;
+        }
+
+        @Override
+        public NodeInvocation execute(NodeExecutionContext context) {
+            if (invocations.incrementAndGet() != 1) {
+                secondEntered.countDown();
+                return NodeInvocation.completed(NodeResult.continueWith(Map.of(), java.util.Set.of("NEXT")));
+            }
+            firstEntered.countDown();
+            CompletableFuture<NodeResult> source = new CompletableFuture<>();
+            Thread.ofVirtual().start(() -> {
+                long stopAt = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                try {
+                    while (!context.cancellationToken().isCancellationRequested()
+                            && System.nanoTime() < stopAt) {
+                        Thread.sleep(10);
+                    }
+                    if (context.cancellationToken().isCancellationRequested()) {
+                        firstObservedCancellation.countDown();
+                    }
+                    allowFirstSourceCompletion.await(3, TimeUnit.SECONDS);
+                    source.complete(NodeResult.continueWith(Map.of(), java.util.Set.of("NEXT")));
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    source.completeExceptionally(exception);
+                } finally {
+                    firstSourceCompleted.countDown();
+                }
+            });
+            return new NodeInvocation(nonFutureStage(source), ComponentInvocation.emptyContent());
+        }
+    }
+
+    private static final class PostCompletionBlockingExecutor implements NodeExecutor {
+
+        private final AtomicInteger invocations = new AtomicInteger();
+        private final CountDownLatch sourceCallbackCompleted = new CountDownLatch(1);
+        private final CountDownLatch allowFirstCallableExit = new CountDownLatch(1);
+        private final CountDownLatch secondEntered = new CountDownLatch(1);
+
+        @Override
+        public ComponentType supports() {
+            return ComponentType.SCRIPT;
+        }
+
+        @Override
+        public NodeInvocation execute(NodeExecutionContext context) {
+            if (invocations.incrementAndGet() != 1) {
+                secondEntered.countDown();
+                return NodeInvocation.completed(NodeResult.continueWith(Map.of(), java.util.Set.of("NEXT")));
+            }
+            NodeResult result = NodeResult.continueWith(Map.of(), java.util.Set.of("NEXT"));
+            return new NodeInvocation(callbackThenBlockStage(
+                    result, sourceCallbackCompleted, allowFirstCallableExit), ComponentInvocation.emptyContent());
         }
     }
 
@@ -763,6 +961,29 @@ class CancellationAndDeadlineTest {
                 (proxy, method, arguments) -> {
                     try {
                         return method.invoke(delegate, arguments);
+                    } catch (InvocationTargetException exception) {
+                        throw exception.getCause();
+                    }
+                });
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> CompletionStage<T> callbackThenBlockStage(
+            T value, CountDownLatch callbackCompleted, CountDownLatch allowReturn) {
+        CompletableFuture<T> delegate = CompletableFuture.completedFuture(value);
+        return (CompletionStage<T>) Proxy.newProxyInstance(
+                CancellationAndDeadlineTest.class.getClassLoader(),
+                new Class<?>[] {CompletionStage.class},
+                (proxy, method, arguments) -> {
+                    try {
+                        Object returned = method.invoke(delegate, arguments);
+                        if ("whenComplete".equals(method.getName())) {
+                            callbackCompleted.countDown();
+                            if (!allowReturn.await(2, TimeUnit.SECONDS)) {
+                                throw new IllegalStateException("node callable was not released");
+                            }
+                        }
+                        return returned;
                     } catch (InvocationTargetException exception) {
                         throw exception.getCause();
                     }

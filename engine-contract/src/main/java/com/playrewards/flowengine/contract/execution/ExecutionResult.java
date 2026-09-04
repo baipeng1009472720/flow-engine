@@ -51,7 +51,7 @@ public record ExecutionResult(String executionId, ExecutionStatus status, Object
      * @param executionId unique run identity
      * @param status terminal lifecycle status
      * @param result optional successful business result
-     * @param errorCode optional stable failure code
+     * @param errorCode stable failure code, required for FAILED/CANCELLED and forbidden for SUCCEEDED
      * @param errorId optional diagnostic correlation identity
      * @param startedAt execution start time
      * @param finishedAt execution finish time

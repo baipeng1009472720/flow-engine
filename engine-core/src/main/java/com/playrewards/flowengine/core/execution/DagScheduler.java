@@ -36,14 +36,17 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionService;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -70,6 +73,10 @@ public final class DagScheduler implements AutoCloseable {
     private final Semaphore nodeTaskAdmission;
     private final Semaphore executionAdmission;
     private final ExecutorService virtualThreads = Executors.newVirtualThreadPerTaskExecutor();
+    private final Object lifecycleMonitor = new Object();
+    private final AtomicBoolean closed = new AtomicBoolean();
+    private final ConcurrentHashMap<CancellationHandle, ExecutionRegistration> activeExecutions =
+            new ConcurrentHashMap<>();
 
     /**
      * Creates a scheduler using process-shared finite admissions and immutable registries.
@@ -140,51 +147,72 @@ public final class DagScheduler implements AutoCloseable {
      *
      * @param plan immutable compiled topology
      * @param request per-run input, deadline and tenant metadata
-     * @return immediately usable asynchronous execution handle
+     * @return immediately usable asynchronous execution handle; a closed scheduler returns a completed rejection
      */
     public ExecutionHandle schedule(ExecutionPlan plan, ExecutionRequest request) {
         Objects.requireNonNull(plan, "plan must not be null");
         Objects.requireNonNull(request, "request must not be null");
+        Instant scheduledAt = clock.instant();
         String executionId = UUID.randomUUID().toString();
         ExecutionContext context = new ExecutionContext(request.externalScopes());
         CancellationHandle cancellation = new CancellationHandle();
         CompletableFuture<ExecutionResult> completion = new CompletableFuture<>();
         ExecutionHandle handle = new ExecutionHandle(executionId, completion, context, cancellation);
-        if (!executionAdmission.tryAcquire()) {
-            Instant rejectedAt = clock.instant();
-            cancellation.cancelForFailure();
-            completion.complete(result(executionId, ExecutionStatus.FAILED, null,
-                    "EXECUTION_CAPACITY_EXCEEDED", "execution capacity exceeded", rejectedAt));
-            return handle;
-        }
-        AtomicReference<Thread> controller = new AtomicReference<>();
-        Map<Future<NodeCompletion>, AdmissionLease> runningNodes = new java.util.concurrent.ConcurrentHashMap<>();
-        CancellationHandle.CancellationRegistration controllerRegistration = cancellation.onCancellation(() -> {
-            runningNodes.forEach(DagScheduler::cancelRunningTask);
-            Thread thread = controller.get();
-            if (thread != null) {
-                thread.interrupt();
+        synchronized (lifecycleMonitor) {
+            if (closed.get()) {
+                cancellation.cancelForFailure();
+                completion.complete(result(executionId, ExecutionStatus.FAILED, null,
+                        "EXECUTION_SCHEDULER_CLOSED", "execution scheduler is closed", scheduledAt));
+                return handle;
             }
-        });
-        try {
-            virtualThreads.submit(() -> {
-                controller.set(Thread.currentThread());
-                try {
-                    completion.complete(run(executionId, plan, request, context, cancellation, runningNodes));
-                } catch (Throwable failure) {
-                    completion.completeExceptionally(failure);
-                } finally {
-                    controllerRegistration.close();
-                    controller.set(null);
-                    runningNodes.forEach(DagScheduler::cancelRunningTask);
-                    runningNodes.clear();
-                    executionAdmission.release();
+            if (!executionAdmission.tryAcquire()) {
+                cancellation.cancelForFailure();
+                completion.complete(result(executionId, ExecutionStatus.FAILED, null,
+                        "EXECUTION_CAPACITY_EXCEEDED", "execution capacity exceeded", scheduledAt));
+                return handle;
+            }
+            AtomicReference<Thread> controller = new AtomicReference<>();
+            Map<Future<NodeCompletion>, AdmissionLease> runningNodes = new ConcurrentHashMap<>();
+            CancellationHandle.CancellationRegistration controllerRegistration = cancellation.onCancellation(() -> {
+                runningNodes.forEach(DagScheduler::cancelRunningTask);
+                Thread thread = controller.get();
+                if (thread != null) {
+                    thread.interrupt();
                 }
             });
-        } catch (RuntimeException failure) {
-            controllerRegistration.close();
-            executionAdmission.release();
-            throw failure;
+            ExecutionRegistration registration = new ExecutionRegistration(
+                    executionId, scheduledAt, cancellation, completion);
+            activeExecutions.put(cancellation, registration);
+            try {
+                Future<?> controllerFuture = virtualThreads.submit(() -> {
+                    if (!registration.start()) {
+                        return;
+                    }
+                    controller.set(Thread.currentThread());
+                    try {
+                        completion.complete(run(executionId, plan, request, context, cancellation, runningNodes));
+                    } catch (Throwable failure) {
+                        completion.completeExceptionally(failure);
+                    } finally {
+                        controllerRegistration.close();
+                        controller.set(null);
+                        runningNodes.forEach(DagScheduler::cancelRunningTask);
+                        runningNodes.clear();
+                        registration.finish();
+                    }
+                });
+                registration.controllerFuture(controllerFuture);
+            } catch (RejectedExecutionException failure) {
+                controllerRegistration.close();
+                cancellation.cancelForFailure();
+                registration.finishBeforeStart();
+                completion.complete(result(executionId, ExecutionStatus.FAILED, null,
+                        "EXECUTION_SCHEDULING_REJECTED", "execution scheduling was rejected", scheduledAt));
+            } catch (RuntimeException failure) {
+                controllerRegistration.close();
+                registration.finishBeforeStart();
+                throw failure;
+            }
         }
         return handle;
     }
@@ -579,9 +607,81 @@ public final class DagScheduler implements AutoCloseable {
         return new RuntimeException(failure);
     }
 
+    /**
+     * Atomically rejects future schedules, cancels every active execution token and then stops this
+     * scheduler's virtual-thread executor. Process-shared governors and admissions remain usable by
+     * other schedulers.
+     */
     @Override
     public void close() {
+        List<ExecutionRegistration> registrations;
+        synchronized (lifecycleMonitor) {
+            if (!closed.compareAndSet(false, true)) {
+                return;
+            }
+            registrations = List.copyOf(activeExecutions.values());
+        }
+        registrations.forEach(ExecutionRegistration::cancelFromClose);
         virtualThreads.shutdownNow();
+    }
+
+    /** Owns one controller admission across submit, start, close and completion races. */
+    private final class ExecutionRegistration {
+
+        private static final int SUBMITTED = 0;
+        private static final int RUNNING = 1;
+        private static final int FINISHED = 2;
+
+        private final String executionId;
+        private final Instant scheduledAt;
+        private final CancellationHandle cancellation;
+        private final CompletableFuture<ExecutionResult> completion;
+        private final AtomicInteger state = new AtomicInteger(SUBMITTED);
+        private volatile Future<?> controllerFuture;
+
+        private ExecutionRegistration(String executionId, Instant scheduledAt,
+                CancellationHandle cancellation, CompletableFuture<ExecutionResult> completion) {
+            this.executionId = executionId;
+            this.scheduledAt = scheduledAt;
+            this.cancellation = cancellation;
+            this.completion = completion;
+        }
+
+        private boolean start() {
+            return state.compareAndSet(SUBMITTED, RUNNING);
+        }
+
+        private void controllerFuture(Future<?> future) {
+            this.controllerFuture = Objects.requireNonNull(future, "controller future must not be null");
+        }
+
+        private void cancelFromClose() {
+            cancellation.cancel();
+            Future<?> future = controllerFuture;
+            if (future != null) {
+                future.cancel(true);
+            }
+            finishBeforeStart();
+            completion.complete(result(executionId, ExecutionStatus.CANCELLED, null,
+                    "EXECUTION_CANCELLED", "execution was cancelled", scheduledAt));
+        }
+
+        private void finishBeforeStart() {
+            if (state.compareAndSet(SUBMITTED, FINISHED)) {
+                release();
+            }
+        }
+
+        private void finish() {
+            if (state.compareAndSet(RUNNING, FINISHED)) {
+                release();
+            }
+        }
+
+        private void release() {
+            activeExecutions.remove(cancellation, this);
+            executionAdmission.release();
+        }
     }
 
     private enum NodeState {
@@ -654,53 +754,63 @@ public final class DagScheduler implements AutoCloseable {
                 try {
                     permit.close();
                 } finally {
-                    admissionLease.releaseAfterSource();
+                    admissionLease.sourceDone();
                 }
             }
         }
     }
 
-    /** Releases admission before start, after synchronous work, or after a deferred source exactly once. */
+    /** Releases node admission only after both the source and its submitted callable are finished. */
     private static final class AdmissionLease {
 
-        private static final int NEW = 0;
-        private static final int RUNNING = 1;
-        private static final int DEFERRED = 2;
-        private static final int RELEASED = 3;
-
         private final Semaphore admission;
-        private final AtomicInteger state = new AtomicInteger(NEW);
+        private boolean started;
+        private boolean deferred;
+        private boolean sourceDone;
+        private boolean taskDone;
+        private boolean released;
 
         private AdmissionLease(Semaphore admission) {
             this.admission = admission;
         }
 
-        private void started() {
-            if (!state.compareAndSet(NEW, RUNNING)) {
+        private synchronized void started() {
+            if (started || released) {
                 throw new IllegalStateException("cancelled node task started after admission was released");
             }
+            started = true;
         }
 
-        private void releaseBeforeStart() {
-            if (state.compareAndSet(NEW, RELEASED)) {
+        private synchronized void releaseBeforeStart() {
+            if (!started && !released) {
+                released = true;
                 admission.release();
             }
         }
 
-        private void releaseAfterRun() {
-            if (state.compareAndSet(RUNNING, RELEASED)) {
-                admission.release();
-            }
+        private synchronized void releaseAfterRun() {
+            taskDone = true;
+            releaseIfFinished();
         }
 
-        private void deferToSource() {
-            if (!state.compareAndSet(RUNNING, DEFERRED)) {
+        private synchronized void deferToSource() {
+            if (!started || taskDone || deferred || released) {
                 throw new IllegalStateException("node admission cannot be transferred after release");
             }
+            deferred = true;
         }
 
-        private void releaseAfterSource() {
-            if (state.compareAndSet(DEFERRED, RELEASED)) {
+        private synchronized void sourceDone() {
+            if (!deferred) {
+                throw new IllegalStateException("source completion arrived before admission transfer");
+            }
+            sourceDone = true;
+            releaseIfFinished();
+        }
+
+        private void releaseIfFinished() {
+            if (!released && taskDone && (!deferred || sourceDone)) {
+                released = true;
                 admission.release();
             }
         }

@@ -56,7 +56,7 @@ public final class FlowEngine implements AutoCloseable {
                 Objects.requireNonNull(request, "request must not be null"));
     }
 
-    /** Interrupts scheduler work owned by this embedded engine. */
+    /** Cancels active executions and closes only the scheduler work owned by this embedded engine. */
     @Override
     public void close() {
         scheduler.close();
