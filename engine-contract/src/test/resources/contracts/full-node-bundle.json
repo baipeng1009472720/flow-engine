@@ -15,15 +15,18 @@
       { "id": "n9", "componentCode": "builtin.variable", "nodeCode": "variable", "nodeName": "变量", "config": {} },
       { "id": "n10", "componentCode": "builtin.script", "nodeCode": "script", "nodeName": "脚本", "config": {} },
       { "id": "n11", "componentCode": "builtin.subflow", "nodeCode": "subflow", "nodeName": "子流程", "config": {} },
-      { "id": "n12", "componentCode": "builtin.lock", "nodeCode": "lock", "nodeName": "锁", "config": { "role": "ACQUIRE" } },
-      { "id": "n13", "componentCode": "builtin.http", "nodeCode": "http", "nodeName": "HTTP", "config": {} },
-      { "id": "n14", "componentCode": "business.reward", "nodeCode": "business", "nodeName": "业务", "config": {} }
+      { "id": "n12", "componentCode": "builtin.lock", "nodeCode": "lockAcquire", "nodeName": "锁获取", "config": { "role": "ACQUIRE" } },
+      { "id": "n13", "componentCode": "builtin.lock", "nodeCode": "lockRelease", "nodeName": "锁释放", "config": { "role": "RELEASE" } },
+      { "id": "n14", "componentCode": "builtin.http", "nodeCode": "http", "nodeName": "HTTP", "config": {} },
+      { "id": "n15", "componentCode": "business.reward", "nodeCode": "business", "nodeName": "业务", "config": {} }
     ],
     "edges": [ { "id": "e1", "sourceNodeId": "n1", "targetNodeId": "n2", "sourcePort": "NEXT", "targetPort": "IN" } ]
   },
   "componentContracts": {
     "legacy.merge": { "componentCode": "legacy.merge", "componentType": "MERGE", "configSchema": {}, "inputSlots": {}, "outputSlots": {}, "capabilities": { "effect": "PURE", "supportsTrial": true, "streaming": false, "retryable": false, "maxConcurrency": 1 } },
-    "legacy.switch": { "componentCode": "legacy.switch", "componentType": "SWITCH", "configSchema": {}, "inputSlots": {}, "outputSlots": {}, "capabilities": { "effect": "PURE", "supportsTrial": true, "streaming": false, "retryable": false, "maxConcurrency": 1 } }
+    "legacy.switch": { "componentCode": "legacy.switch", "componentType": "SWITCH", "configSchema": {}, "inputSlots": {}, "outputSlots": {}, "capabilities": { "effect": "PURE", "supportsTrial": true, "streaming": false, "retryable": false, "maxConcurrency": 1 } },
+    "builtin.loop": { "componentCode": "builtin.loop", "componentType": "LOOP", "configSchema": {}, "inputSlots": {}, "outputSlots": {}, "capabilities": { "effect": "PURE", "supportsTrial": true, "streaming": false, "retryable": false, "maxConcurrency": 1 } },
+    "builtin.lock": { "componentCode": "builtin.lock", "componentType": "LOCK", "configSchema": {}, "inputSlots": {}, "outputSlots": {}, "capabilities": { "effect": "SIDE_EFFECT", "supportsTrial": false, "streaming": false, "retryable": false, "maxConcurrency": 1 } }
   },
   "protocolSchemas": {},
   "externalScopeSchemas": {},

@@ -5,7 +5,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.alibaba.fastjson2.JSON;
+import com.alibaba.fastjson2.JSONObject;
 import com.playrewards.flowengine.contract.bundle.BundleTrust;
 import com.playrewards.flowengine.contract.bundle.ExecutableFlowBundle;
 import com.playrewards.flowengine.contract.bundle.FlowIdentity;
@@ -34,13 +37,17 @@ class ContractJsonTest {
 
         assertEquals("1.0", bundle.contractVersion());
         assertEquals("2.0", bundle.flowDefinition().schemaVersion());
-        assertEquals(14, bundle.flowDefinition().nodes().size());
+        assertEquals(15, bundle.flowDefinition().nodes().size());
         assertEquals("start", bundle.flowDefinition().nodes().getFirst().nodeCode());
         assertEquals("builtin.start", bundle.flowDefinition().nodes().getFirst().componentCode());
         assertEquals("NEXT", bundle.flowDefinition().edges().getFirst().sourcePort());
         assertEquals("IN", bundle.flowDefinition().edges().getFirst().targetPort());
         assertEquals(ComponentType.MERGE, bundle.componentContracts().get("legacy.merge").componentType());
         assertEquals(ComponentType.SWITCH, bundle.componentContracts().get("legacy.switch").componentType());
+        assertRole(bundle, "loopStart", ComponentType.LOOP, "START");
+        assertRole(bundle, "loopEnd", ComponentType.LOOP, "END");
+        assertRole(bundle, "lockAcquire", ComponentType.LOCK, "ACQUIRE");
+        assertRole(bundle, "lockRelease", ComponentType.LOCK, "RELEASE");
         assertDoesNotThrow(() -> ContractJson.fromBundleJson(ContractJson.toBundleJson(bundle)));
     }
 
@@ -72,6 +79,11 @@ class ContractJsonTest {
 
         assertEquals(first.calculateBundleHash(), second.calculateBundleHash());
         assertNotEquals(first.calculateBundleHash(), changed.calculateBundleHash());
+        ExecutableFlowBundle excludedFieldsChanged = new ExecutableFlowBundle(
+                first.contractVersion(), first.flowIdentity(), first.flowDefinition(), first.componentContracts(),
+                first.protocolSchemas(), first.externalScopeSchemas(), "f".repeat(64),
+                new BundleTrust("issuer", "key", "different-signature"));
+        assertEquals(first.calculateBundleHash(), excludedFieldsChanged.calculateBundleHash());
         assertEquals(first.calculateBundleHash(), first.withCalculatedHash().bundleHash());
     }
 
@@ -110,6 +122,35 @@ class ContractJsonTest {
         assertFalse(rendered.contains("vault:context"));
     }
 
+    @Test
+    void rejects_non_finite_float_and_double_values_before_json_serialization_or_hashing() {
+        assertNonFiniteNumberRejected(Double.NaN, "Double");
+        assertNonFiniteNumberRejected(Double.POSITIVE_INFINITY, "Double");
+        assertNonFiniteNumberRejected(Double.NEGATIVE_INFINITY, "Double");
+        assertNonFiniteNumberRejected(Float.NaN, "Float");
+        assertNonFiniteNumberRejected(Float.POSITIVE_INFINITY, "Float");
+        assertNonFiniteNumberRejected(Float.NEGATIVE_INFINITY, "Float");
+
+        assertThrows(IllegalArgumentException.class,
+                () -> bundleWithConfig(Map.of("limit", Double.POSITIVE_INFINITY)).calculateBundleHash());
+    }
+
+    @Test
+    void schema_non_blank_constraints_match_required_java_text_fields() throws IOException {
+        JSONObject schema = JSON.parseObject(resource("schema/executable-flow-bundle-1.0.schema.json"));
+        JSONObject definitions = schema.getJSONObject("$defs");
+        assertEquals(1, definitions.getJSONObject("nonBlankString").getIntValue("minLength"));
+        assertEquals("\\S", definitions.getJSONObject("nonBlankString").getString("pattern"));
+
+        assertNonBlankReference(definitions.getJSONObject("flowIdentity"),
+                "tenantId", "flowId", "version");
+        assertNonBlankReference(definitions.getJSONObject("flowNode"), "id", "componentCode", "nodeCode", "nodeName");
+        assertNonBlankReference(definitions.getJSONObject("flowEdge"), "id", "sourceNodeId", "targetNodeId",
+                "sourcePort", "targetPort");
+        assertNonBlankReference(definitions.getJSONObject("componentContract"), "componentCode", "executorRef");
+        assertNonBlankReference(definitions.getJSONObject("protocolSchema"), "code", "version");
+    }
+
     private static ExecutableFlowBundle bundleWithConfig(Map<String, Object> config) {
         return new ExecutableFlowBundle(
                 "1.0", new FlowIdentity("tenant", "flow", "v1"),
@@ -122,6 +163,29 @@ class ContractJsonTest {
         config.put("z", List.of(2, 1));
         config.put("a", Map.of("b", true));
         return config;
+    }
+
+    private static void assertRole(ExecutableFlowBundle bundle, String nodeCode, ComponentType type, String role) {
+        FlowNode node = bundle.flowDefinition().nodes().stream()
+                .filter(candidate -> nodeCode.equals(candidate.nodeCode()))
+                .findFirst()
+                .orElseThrow();
+        assertEquals(type, bundle.componentContracts().get(node.componentCode()).componentType());
+        assertEquals(role, node.config().get("role"));
+    }
+
+    private static void assertNonBlankReference(JSONObject object, String... propertyNames) {
+        JSONObject properties = object.getJSONObject("properties");
+        for (String propertyName : propertyNames) {
+            assertEquals("#/$defs/nonBlankString", properties.getJSONObject(propertyName).getString("$ref"));
+        }
+    }
+
+    private static void assertNonFiniteNumberRejected(Number value, String valueType) {
+        IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
+                () -> new FlowNode("n1", "builtin.script", "script", "脚本", Map.of("value", value)));
+        assertTrue(failure.getMessage().contains("node config.value"));
+        assertTrue(failure.getMessage().contains(valueType));
     }
 
     private static String resource(String name) throws IOException {

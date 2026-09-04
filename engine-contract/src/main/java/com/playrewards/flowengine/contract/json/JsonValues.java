@@ -39,16 +39,28 @@ public final class JsonValues {
     }
 
     /**
-     * Copies a JSON value recursively, rejecting host-specific mutable or executable values.
+     * Copies a JSON value recursively, rejecting host-specific mutable/executable values and non-finite
+     * floating-point numbers which have no JSON representation.
      *
      * @param value source JSON value
      * @param fieldName field used in validation messages
      * @return immutable JSON-compatible value
      */
     public static Object copyValue(Object value, String fieldName) {
+        if (value instanceof Double doubleValue) {
+            if (!Double.isFinite(doubleValue)) {
+                throw new IllegalArgumentException(fieldName + " must not contain non-finite Double value");
+            }
+            return doubleValue;
+        }
+        if (value instanceof Float floatValue) {
+            if (!Float.isFinite(floatValue)) {
+                throw new IllegalArgumentException(fieldName + " must not contain non-finite Float value");
+            }
+            return floatValue;
+        }
         if (value == null || value instanceof String || value instanceof Boolean || value instanceof Integer
-                || value instanceof Long || value instanceof Short || value instanceof Byte
-                || value instanceof Double || value instanceof Float || value instanceof BigDecimal
+                || value instanceof Long || value instanceof Short || value instanceof Byte || value instanceof BigDecimal
                 || value instanceof BigInteger) {
             return value;
         }
