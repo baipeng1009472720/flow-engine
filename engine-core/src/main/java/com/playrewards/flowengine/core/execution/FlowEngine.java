@@ -3,6 +3,7 @@ package com.playrewards.flowengine.core.execution;
 import com.playrewards.flowengine.contract.execution.ExecutionRequest;
 import com.playrewards.flowengine.core.compile.ExecutionPlan;
 import com.playrewards.flowengine.core.node.NodeExecutorRegistry;
+import com.playrewards.flowengine.spi.ExecutionLogger;
 import java.time.Clock;
 import java.util.Objects;
 
@@ -39,9 +40,23 @@ public final class FlowEngine implements AutoCloseable {
      * @param clock deadline and lifecycle time source
      */
     public FlowEngine(NodeExecutorRegistry executors, ConcurrencyGovernor governor, Clock clock) {
+        this(executors, governor, clock, ExecutionLogger.NOOP);
+    }
+
+    /**
+     * Creates an engine with explicit startup dependencies and a structured node log sink.
+     *
+     * @param executors immutable component-type registry
+     * @param governor hierarchical concurrency gate
+     * @param clock deadline and lifecycle time source
+     * @param executionLogger structured sink supplied to every node attempt
+     */
+    public FlowEngine(NodeExecutorRegistry executors, ConcurrencyGovernor governor, Clock clock,
+            ExecutionLogger executionLogger) {
         this.scheduler = new DagScheduler(Objects.requireNonNull(executors, "executors must not be null"),
                 Objects.requireNonNull(governor, "governor must not be null"),
-                Objects.requireNonNull(clock, "clock must not be null"));
+                Objects.requireNonNull(clock, "clock must not be null"),
+                Objects.requireNonNull(executionLogger, "executionLogger must not be null"));
     }
 
     /**

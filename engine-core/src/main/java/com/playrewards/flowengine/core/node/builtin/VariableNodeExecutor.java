@@ -9,6 +9,9 @@ import com.playrewards.flowengine.core.node.NodeExecutor;
 import com.playrewards.flowengine.core.node.NodeInvocation;
 import com.playrewards.flowengine.core.node.NodeResult;
 import com.playrewards.flowengine.core.protocol.JsonSchemaCompatibility;
+import com.playrewards.flowengine.core.protocol.OutputValidator;
+import com.playrewards.flowengine.spi.ComponentInvocation;
+import com.playrewards.flowengine.spi.ScriptRuntime;
 import java.lang.reflect.Array;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -16,11 +19,31 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.Objects;
 
 /** Resolves FIXED VARIABLE sources in configured order and writes its unique declared output slot. */
 public final class VariableNodeExecutor implements NodeExecutor {
 
     private static final JsonSchemaCompatibility SCHEMA_COMPATIBILITY = new JsonSchemaCompatibility();
+    private final ScriptRuntime scriptRuntime;
+    private final OutputValidator outputValidator;
+
+    /** Creates the legacy FIXED-only executor used by the dependency-free registry. */
+    public VariableNodeExecutor() {
+        this.scriptRuntime = null;
+        this.outputValidator = new OutputValidator();
+    }
+
+    /**
+     * Creates the executor with GROOVY mode enabled through the supplied sandbox runtime.
+     *
+     * @param scriptRuntime adapter-owned sandbox implementation
+     * @param outputValidator shared declared-output validator
+     */
+    public VariableNodeExecutor(ScriptRuntime scriptRuntime, OutputValidator outputValidator) {
+        this.scriptRuntime = Objects.requireNonNull(scriptRuntime, "script runtime must not be null");
+        this.outputValidator = Objects.requireNonNull(outputValidator, "output validator must not be null");
+    }
 
     @Override
     public ComponentType supports() {
@@ -32,7 +55,20 @@ public final class VariableNodeExecutor implements NodeExecutor {
         context.throwIfStopped();
         String mode = text(context.node().node().config().get("valueMode"));
         if ("GROOVY".equals(mode)) {
-            throw new NodeExecutionException("NODE_MODE_UNSUPPORTED", "VARIABLE GROOVY is implemented by Task 6");
+            if (scriptRuntime == null) {
+                throw new NodeExecutionException("NODE_MODE_UNSUPPORTED",
+                        "VARIABLE GROOVY requires an explicitly configured ScriptRuntime");
+            }
+            if (context.node().componentContract().outputSlots().size() != 1) {
+                throw new NodeExecutionException("VARIABLE_OUTPUT_CONTRACT_INVALID",
+                        "VARIABLE must declare exactly one output slot");
+            }
+            String outputKey = context.node().componentContract().outputSlots().keySet().iterator().next();
+            return new NodeInvocation(ScriptNodeExecutor.executeScript(context, scriptRuntime).thenApply(value -> {
+                Map<String, Object> outputs = new LinkedHashMap<>();
+                outputs.put(outputKey, value);
+                return outputValidator.validate(context.node(), outputs);
+            }), ComponentInvocation.emptyContent());
         }
         if (!"FIXED".equals(mode)) {
             throw new NodeExecutionException("VARIABLE_CONFIG_INVALID",

@@ -11,6 +11,9 @@ import java.util.Map;
  */
 public interface ExecutionLogger {
 
+    /** Safe default sink used when an embedding host has not configured observation storage yet. */
+    ExecutionLogger NOOP = entry -> { };
+
     /** Logs debug diagnostics with a deeply immutable attribute snapshot. */
     default void debug(String message, Throwable throwable, Map<String, ?> attributes) {
         write(ExecutionLogEntry.of(ExecutionLogLevel.DEBUG, message, throwable, attributes));

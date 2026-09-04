@@ -6,6 +6,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -104,6 +105,29 @@ public final class ExecutionContext {
             return matches.getFirst().getValue().value();
         }
         throw new IllegalArgumentException("unsupported context path: " + path);
+    }
+
+    /**
+     * Returns a deeply immutable snapshot of outputs visible in one execution scope.
+     *
+     * <p>The snapshot is grouped by stable node code and output key. It is used only to create
+     * adapter-neutral read views; callers cannot mutate the append-only store.</p>
+     */
+    public Map<String, Map<String, Object>> outputsByNode(ScopePath scopePath) {
+        Objects.requireNonNull(scopePath, "scope path must not be null");
+        Map<String, Map<String, Object>> grouped = new TreeMap<>();
+        outputs.entrySet().stream()
+                .filter(entry -> entry.getKey().scopePath().equals(scopePath))
+                .sorted(Comparator.comparing((Map.Entry<OutputAddress, StoredValue> entry) ->
+                                entry.getKey().nodeCode())
+                        .thenComparing(entry -> entry.getKey().outputKey()))
+                .forEach(entry -> grouped.computeIfAbsent(
+                                entry.getKey().nodeCode(), ignored -> new TreeMap<>())
+                        .put(entry.getKey().outputKey(), entry.getValue().value()));
+        Map<String, Map<String, Object>> snapshot = new java.util.LinkedHashMap<>();
+        grouped.forEach((nodeCode, values) -> snapshot.put(
+                nodeCode, JsonValues.copyObject(values, "ctx." + nodeCode)));
+        return java.util.Collections.unmodifiableMap(snapshot);
     }
 
     private static OutputAddress address(String nodeCode, ScopePath scopePath, String outputKey) {

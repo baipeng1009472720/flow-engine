@@ -2,9 +2,15 @@ package com.playrewards.flowengine.core.node;
 
 import com.playrewards.flowengine.contract.component.ComponentType;
 import com.playrewards.flowengine.core.node.builtin.EndNodeExecutor;
+import com.playrewards.flowengine.core.node.builtin.BusinessNodeExecutor;
 import com.playrewards.flowengine.core.node.builtin.IfNodeExecutor;
+import com.playrewards.flowengine.core.node.builtin.ScriptNodeExecutor;
 import com.playrewards.flowengine.core.node.builtin.StartNodeExecutor;
 import com.playrewards.flowengine.core.node.builtin.VariableNodeExecutor;
+import com.playrewards.flowengine.core.component.FlowBusinessComponentRegistry;
+import com.playrewards.flowengine.core.protocol.InputBindingResolver;
+import com.playrewards.flowengine.core.protocol.OutputValidator;
+import com.playrewards.flowengine.spi.ScriptRuntime;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.EnumMap;
@@ -54,6 +60,30 @@ public final class NodeExecutorRegistry {
     /** @return a registry containing only START, END, IF and VARIABLE */
     public static NodeExecutorRegistry builtIns() {
         return withBuiltIns(List.of());
+    }
+
+    /**
+     * Creates the complete Task 6 registry with one shared script runtime and BUSINESS registry.
+     *
+     * <p>Hosts must use this explicit factory for real runtime assembly. The dependency-free
+     * {@link #builtIns()} remains available only for START/END and non-Groovy Task 5 embedding.</p>
+     *
+     * @param scriptRuntime adapter-owned bounded script runtime
+     * @param businessComponents immutable startup business registry
+     * @return complete START/END/IF/VARIABLE/SCRIPT/BUSINESS executor registry
+     */
+    public static NodeExecutorRegistry runtimeBuiltIns(ScriptRuntime scriptRuntime,
+            FlowBusinessComponentRegistry businessComponents) {
+        Objects.requireNonNull(scriptRuntime, "script runtime must not be null");
+        Objects.requireNonNull(businessComponents, "business components must not be null");
+        OutputValidator outputValidator = new OutputValidator();
+        return new NodeExecutorRegistry(List.of(
+                new StartNodeExecutor(),
+                new EndNodeExecutor(),
+                new IfNodeExecutor(scriptRuntime),
+                new VariableNodeExecutor(scriptRuntime, outputValidator),
+                new ScriptNodeExecutor(scriptRuntime, outputValidator),
+                new BusinessNodeExecutor(businessComponents, new InputBindingResolver(), outputValidator)));
     }
 
     /**

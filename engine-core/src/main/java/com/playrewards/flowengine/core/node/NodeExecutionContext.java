@@ -10,7 +10,12 @@ import com.playrewards.flowengine.core.execution.ExecutionDeadlineExceededExcept
 import com.playrewards.flowengine.core.execution.ScopePath;
 import com.playrewards.flowengine.spi.CancellationToken;
 import com.playrewards.flowengine.spi.ComponentInputs;
+import com.playrewards.flowengine.spi.ExecutionLogger;
+import com.playrewards.flowengine.contract.component.ComponentType;
+import com.playrewards.flowengine.contract.json.JsonValues;
 import java.time.Clock;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 
 /** Immutable per-attempt view supplied to a node executor. */
@@ -25,6 +30,7 @@ public final class NodeExecutionContext {
     private final CancellationHandle cancellation;
     private final ExecutionRequest request;
     private final Clock clock;
+    private final ExecutionLogger executionLogger;
 
     /**
      * Creates the complete context after scheduler-side input binding resolution.
@@ -42,6 +48,28 @@ public final class NodeExecutionContext {
     public NodeExecutionContext(String executionId, ExecutionPlan plan, CompiledNode node,
             ExecutionContext executionContext, ScopePath scopePath, ComponentInputs inputs,
             CancellationHandle cancellation, ExecutionRequest request, Clock clock) {
+        this(executionId, plan, node, executionContext, scopePath, inputs, cancellation, request,
+                clock, ExecutionLogger.NOOP);
+    }
+
+    /**
+     * Creates the complete context with the node-scoped structured log sink.
+     *
+     * @param executionId unique run identity
+     * @param plan immutable plan containing source contracts
+     * @param node compiled node being invoked
+     * @param executionContext isolated append-only value store
+     * @param scopePath active structured-execution scope
+     * @param inputs scheduler-resolved component inputs
+     * @param cancellation execution-wide cooperative stop source
+     * @param request original dynamic request
+     * @param clock deadline time source
+     * @param executionLogger node-scoped structured log sink
+     */
+    public NodeExecutionContext(String executionId, ExecutionPlan plan, CompiledNode node,
+            ExecutionContext executionContext, ScopePath scopePath, ComponentInputs inputs,
+            CancellationHandle cancellation, ExecutionRequest request, Clock clock,
+            ExecutionLogger executionLogger) {
         this.executionId = Objects.requireNonNull(executionId, "executionId must not be null");
         this.plan = Objects.requireNonNull(plan, "plan must not be null");
         this.node = Objects.requireNonNull(node, "node must not be null");
@@ -51,6 +79,7 @@ public final class NodeExecutionContext {
         this.cancellation = Objects.requireNonNull(cancellation, "cancellation must not be null");
         this.request = Objects.requireNonNull(request, "request must not be null");
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
+        this.executionLogger = Objects.requireNonNull(executionLogger, "execution logger must not be null");
     }
 
     /** @return execution identity */
@@ -86,6 +115,39 @@ public final class NodeExecutionContext {
     /** @return isolated execution value store */
     public ExecutionContext executionContext() {
         return executionContext;
+    }
+
+    /** @return immutable external namespaces captured for this execution */
+    public Map<String, Map<String, Object>> externalScopes() {
+        return executionContext.externalScopes();
+    }
+
+    /** @return node-scoped structured logger, or the safe no-op default */
+    public ExecutionLogger executionLogger() {
+        return executionLogger;
+    }
+
+    /**
+     * Builds the current read-only Groovy {@code ctx} view.
+     *
+     * <p>VARIABLE keeps its public scalar {@code ctx.<nodeCode>} shape. Other nodes expose a map of
+     * named outputs, matching {@code ctx.<nodeCode>.<outputKey>}.</p>
+     */
+    public Map<String, Object> ctxView() {
+        Map<String, Object> view = new LinkedHashMap<>();
+        executionContext.outputsByNode(scopePath).forEach((nodeCode, outputs) -> {
+            CompiledNode source = plan.nodesById().values().stream()
+                    .filter(candidate -> candidate.node().nodeCode().equals(nodeCode))
+                    .findFirst().orElse(null);
+            if (source != null
+                    && source.componentContract().componentType() == ComponentType.VARIABLE
+                    && outputs.size() == 1) {
+                view.put(nodeCode, outputs.values().iterator().next());
+            } else {
+                view.put(nodeCode, outputs);
+            }
+        });
+        return JsonValues.copyObject(view, "script ctx");
     }
 
     /**

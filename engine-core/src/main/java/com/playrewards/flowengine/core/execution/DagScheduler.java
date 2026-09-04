@@ -1,22 +1,21 @@
 package com.playrewards.flowengine.core.execution;
 
-import com.playrewards.flowengine.contract.bundle.InputSlotContract;
-import com.playrewards.flowengine.contract.bundle.OutputSlotContract;
 import com.playrewards.flowengine.contract.execution.ExecutionMode;
 import com.playrewards.flowengine.contract.execution.ExecutionRequest;
 import com.playrewards.flowengine.contract.execution.ExecutionResult;
 import com.playrewards.flowengine.contract.execution.ExecutionStatus;
 import com.playrewards.flowengine.core.compile.CompiledNode;
-import com.playrewards.flowengine.core.compile.CompiledNode.InputBinding;
 import com.playrewards.flowengine.core.compile.ExecutionPlan;
-import com.playrewards.flowengine.core.node.JsonValueValidator;
 import com.playrewards.flowengine.core.node.NodeExecutionContext;
 import com.playrewards.flowengine.core.node.NodeExecutionException;
 import com.playrewards.flowengine.core.node.NodeExecutor;
 import com.playrewards.flowengine.core.node.NodeExecutorRegistry;
 import com.playrewards.flowengine.core.node.NodeInvocation;
 import com.playrewards.flowengine.core.node.NodeResult;
+import com.playrewards.flowengine.core.protocol.InputBindingResolver;
+import com.playrewards.flowengine.core.protocol.OutputValidator;
 import com.playrewards.flowengine.spi.ComponentInputs;
+import com.playrewards.flowengine.spi.ExecutionLogger;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -73,6 +72,9 @@ public final class DagScheduler implements AutoCloseable {
     private final Semaphore nodeTaskAdmission;
     private final Semaphore executionAdmission;
     private final ExecutionLifecycleObserver lifecycleObserver;
+    private final InputBindingResolver inputBindingResolver = new InputBindingResolver();
+    private final OutputValidator outputValidator = new OutputValidator();
+    private final ExecutionLogger executionLogger;
     private final ExecutorService virtualThreads = Executors.newVirtualThreadPerTaskExecutor();
     private final Object lifecycleMonitor = new Object();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -88,7 +90,21 @@ public final class DagScheduler implements AutoCloseable {
      */
     public DagScheduler(NodeExecutorRegistry executors, ConcurrencyGovernor governor, Clock clock) {
         this(executors, governor, clock, PROCESS_NODE_TASK_ADMISSION, PROCESS_EXECUTION_ADMISSION,
-                ExecutionLifecycleObserver.NOOP);
+                ExecutionLifecycleObserver.NOOP, ExecutionLogger.NOOP);
+    }
+
+    /**
+     * Creates a scheduler with an explicit node log sink and process-shared finite admissions.
+     *
+     * @param executors startup executor registry
+     * @param governor shared hierarchical concurrency gate
+     * @param clock deadline and result timestamp source
+     * @param executionLogger structured sink supplied to every node attempt
+     */
+    public DagScheduler(NodeExecutorRegistry executors, ConcurrencyGovernor governor, Clock clock,
+            ExecutionLogger executionLogger) {
+        this(executors, governor, clock, PROCESS_NODE_TASK_ADMISSION, PROCESS_EXECUTION_ADMISSION,
+                ExecutionLifecycleObserver.NOOP, executionLogger);
     }
 
     /**
@@ -125,12 +141,12 @@ public final class DagScheduler implements AutoCloseable {
         this(executors, governor, clock,
                 new Semaphore(positive(maxInFlightNodeTasks, "maxInFlightNodeTasks"), true),
                 new Semaphore(positive(maxInFlightExecutions, "maxInFlightExecutions"), true),
-                ExecutionLifecycleObserver.NOOP);
+                ExecutionLifecycleObserver.NOOP, ExecutionLogger.NOOP);
     }
 
     private DagScheduler(NodeExecutorRegistry executors, ConcurrencyGovernor governor, Clock clock,
             Semaphore nodeTaskAdmission, Semaphore executionAdmission,
-            ExecutionLifecycleObserver lifecycleObserver) {
+            ExecutionLifecycleObserver lifecycleObserver, ExecutionLogger executionLogger) {
         this.executors = Objects.requireNonNull(executors, "executors must not be null");
         this.governor = Objects.requireNonNull(governor, "governor must not be null");
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
@@ -138,6 +154,7 @@ public final class DagScheduler implements AutoCloseable {
         this.executionAdmission = Objects.requireNonNull(
                 executionAdmission, "executionAdmission must not be null");
         this.lifecycleObserver = Objects.requireNonNull(lifecycleObserver, "lifecycleObserver must not be null");
+        this.executionLogger = Objects.requireNonNull(executionLogger, "executionLogger must not be null");
     }
 
     /**
@@ -156,7 +173,7 @@ public final class DagScheduler implements AutoCloseable {
         this(executors, governor, clock,
                 new Semaphore(positive(maxInFlightNodeTasks, "maxInFlightNodeTasks"), true),
                 new Semaphore(positive(maxInFlightExecutions, "maxInFlightExecutions"), true),
-                lifecycleObserver);
+                lifecycleObserver, ExecutionLogger.NOOP);
     }
 
     private static int positive(int value, String name) {
@@ -418,9 +435,9 @@ public final class DagScheduler implements AutoCloseable {
         try {
             checkStop(request, cancellation);
             CompiledNode node = plan.nodesById().get(nodeId);
-            ComponentInputs inputs = resolveInputs(plan, node, context);
+            ComponentInputs inputs = inputBindingResolver.resolve(plan, node, context, ScopePath.root());
             NodeExecutionContext nodeContext = new NodeExecutionContext(executionId, plan, node, context,
-                    ScopePath.root(), inputs, cancellation, request, clock);
+                    ScopePath.root(), inputs, cancellation, request, clock, executionLogger);
             String resourceKey = resourceKey(node);
             ConcurrencyGovernor.PermitRequest permitRequest = new ConcurrencyGovernor.PermitRequest(
                     request.tenantId(), plan.flowIdentity().flowId(), node.node().componentCode(), resourceKey,
@@ -436,7 +453,7 @@ public final class DagScheduler implements AutoCloseable {
             try (CancellationHandle.CancellationRegistration ignoredRegistration =
                     cancellation.onCancellation(awaiter::cancel)) {
                 NodeResult result = awaitNode(awaiter, request, cancellation);
-                validateOutputs(node, result);
+                outputValidator.validateResult(node, result);
                 return NodeCompletion.success(nodeId, result);
             }
         } catch (Throwable failure) {
@@ -514,50 +531,6 @@ public final class DagScheduler implements AutoCloseable {
             throw failure;
         }
         return new StageAwaiter(completion, source instanceof Future<?> future ? future : null);
-    }
-
-    private ComponentInputs resolveInputs(ExecutionPlan plan, CompiledNode node, ExecutionContext context) {
-        Map<String, Object> required = new LinkedHashMap<>();
-        Map<String, Object> optional = new LinkedHashMap<>();
-        Map<String, InputSlotContract> slots = new TreeMap<>(node.componentContract().inputSlots());
-        for (Map.Entry<String, InputSlotContract> slot : slots.entrySet()) {
-            InputBinding binding = node.inputBindings().get(slot.getKey());
-            if (binding == null) {
-                if (slot.getValue().required()) {
-                    throw new NodeExecutionException("NODE_REQUIRED_INPUT_MISSING",
-                            "required input has no binding: " + slot.getKey());
-                }
-                continue;
-            }
-            CompiledNode source = plan.nodesById().get(binding.sourceNodeId());
-            ExecutionContext.ContextValue value = context.lookup(
-                    source.node().nodeCode(), ScopePath.root(), binding.sourceOutputKey());
-            if (!value.present()) {
-                if (slot.getValue().required()) {
-                    throw new NodeExecutionException("NODE_REQUIRED_INPUT_MISSING",
-                            "required input source produced no value: " + slot.getKey());
-                }
-                continue;
-            }
-            JsonValueValidator.validate(value.value(), slot.getValue().protocol(), "NODE_INPUT_INVALID",
-                    "inputs." + slot.getKey());
-            (slot.getValue().required() ? required : optional).put(slot.getKey(), value.value());
-        }
-        return new ComponentInputs(required, optional);
-    }
-
-    private static void validateOutputs(CompiledNode node, NodeResult result) {
-        Objects.requireNonNull(result, "node result must not be null");
-        Map<String, OutputSlotContract> slots = node.componentContract().outputSlots();
-        for (Map.Entry<String, Object> output : result.outputs().entrySet()) {
-            OutputSlotContract slot = slots.get(output.getKey());
-            if (slot == null) {
-                throw new NodeExecutionException("NODE_OUTPUT_UNKNOWN",
-                        "node produced undeclared output: " + output.getKey());
-            }
-            JsonValueValidator.validate(output.getValue(), slot.protocol(), "NODE_OUTPUT_INVALID",
-                    "outputs." + output.getKey());
-        }
     }
 
     private static void resolveOutgoing(ExecutionPlan plan, Map<String, Readiness> readiness,
