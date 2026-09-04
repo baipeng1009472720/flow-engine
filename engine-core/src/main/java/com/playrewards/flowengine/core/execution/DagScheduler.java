@@ -509,11 +509,22 @@ public final class DagScheduler implements AutoCloseable {
             resolveOutgoing(plan, included, readiness, completed, ready, context);
         }
         return new RegionOutcome(null, false);
-        } catch (CancellationException | ExecutionDeadlineExceededException failure) {
+        } catch (ExecutionDeadlineExceededException failure) {
+            if (isRootRegion(seedScope, boundaryNodeId, subFlowDepth)) {
+                lifecycleObserver.beforeControllerReasonSelection(CancellationHandle.Reason.DEADLINE);
+            }
+            cancellation.cancelForDeadline();
+            Thread.interrupted();
+            if (!cancelAndAwait(regionRunning, CleanupBudget.standard(), true)) {
+                logStructuredCleanupTimeout(executionId, seedScope);
+            }
+            throw failure;
+        } catch (CancellationException failure) {
             cancellation.requestStopWithoutReason();
             Thread.interrupted();
             if (!cancelAndAwait(regionRunning, CleanupBudget.standard(),
-                    requiresRegionSourceCleanup(seedScope, boundaryNodeId, subFlowDepth))) {
+                    cancellation.reason() == CancellationHandle.Reason.DEADLINE
+                            || requiresRegionSourceCleanup(seedScope, boundaryNodeId, subFlowDepth))) {
                 logStructuredCleanupTimeout(executionId, seedScope);
             }
             throw failure;
@@ -521,7 +532,8 @@ public final class DagScheduler implements AutoCloseable {
             Thread.interrupted();
             cancellation.requestStopWithoutReason();
             if (!cancelAndAwait(regionRunning, CleanupBudget.standard(),
-                    requiresRegionSourceCleanup(seedScope, boundaryNodeId, subFlowDepth))) {
+                    cancellation.reason() == CancellationHandle.Reason.DEADLINE
+                            || requiresRegionSourceCleanup(seedScope, boundaryNodeId, subFlowDepth))) {
                 logStructuredCleanupTimeout(executionId, seedScope);
             }
             throw failure;

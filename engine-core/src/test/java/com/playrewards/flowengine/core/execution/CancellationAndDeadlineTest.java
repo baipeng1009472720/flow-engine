@@ -88,6 +88,45 @@ class CancellationAndDeadlineTest {
     }
 
     @Test
+    void root_controller_deadline_wins_before_non_future_source_cleanup_and_publication() throws Exception {
+        DeadlineCleanupExecutor executor = new DeadlineCleanupExecutor();
+        DagScheduler scheduler = new DagScheduler(
+                NodeExecutorRegistry.withBuiltIns(List.of(executor)),
+                ConcurrencyGovernor.defaults(), Clock.systemUTC());
+        Thread closer = null;
+        try {
+            ExecutionHandle handle = scheduler.schedule(
+                    blockingPlan(), request(Map.of(), Instant.now().plusMillis(300)));
+            assertTrue(executor.started.await(2, TimeUnit.SECONDS));
+            assertTrue(executor.deadlineCancellationObserved.await(2, TimeUnit.SECONDS));
+
+            boolean userCancelAccepted = handle.cancel();
+            closer = Thread.ofVirtual().start(scheduler::close);
+            closer.join(200);
+
+            assertFalse(userCancelAccepted,
+                    "the controller deadline must win before source cleanup starts");
+            assertTrue(closer.isAlive(), "close must wait for the root source cleanup barrier");
+            assertFalse(handle.completion().toCompletableFuture().isDone(),
+                    "deadline result publication must wait for the actual source completion");
+
+            executor.allowCleanup.countDown();
+            closer.join(2_000);
+            ExecutionResult result = await(handle);
+
+            assertEquals(ExecutionStatus.FAILED, result.status());
+            assertEquals("EXECUTION_DEADLINE_EXCEEDED", result.errorCode());
+            assertEquals(0, executor.cleaned.getCount());
+        } finally {
+            executor.allowCleanup.countDown();
+            if (closer != null) {
+                closer.join(2_000);
+            }
+            scheduler.close();
+        }
+    }
+
+    @Test
     void cancellation_cancels_an_outstanding_asynchronous_node_completion() throws Exception {
         AsyncExecutor asynchronous = new AsyncExecutor();
         ExecutionPlan plan = blockingPlan();
@@ -648,11 +687,12 @@ class CancellationAndDeadlineTest {
 
         try (DagScheduler scheduler = new DagScheduler(
                 registry, ConcurrencyGovernor.defaults(), Clock.systemUTC(), 16, 16)) {
-            ExecutionResult timedOut = await(scheduler.schedule(
-                    plan, request(Map.of(), Instant.now().plus(150, ChronoUnit.MILLIS))));
-            assertEquals(ExecutionStatus.FAILED, timedOut.status());
-            assertEquals("EXECUTION_DEADLINE_EXCEEDED", timedOut.errorCode());
-            assertTrue(deferred.firstToken.isCancellationRequested());
+            ExecutionHandle timedOutHandle = scheduler.schedule(
+                    plan, request(Map.of(), Instant.now().plus(150, ChronoUnit.MILLIS)));
+            assertTrue(deferred.firstEntered.await(2, TimeUnit.SECONDS));
+            assertTrue(awaitCancellation(deferred.firstToken));
+            assertFalse(timedOutHandle.completion().toCompletableFuture().isDone(),
+                    "deadline publication must retain the root source cleanup barrier");
 
             ExecutionHandle second = scheduler.schedule(plan, request(Map.of()));
             boolean enteredBeforeSourceCompletion = deferred.secondEntered.await(200, TimeUnit.MILLISECONDS);
@@ -660,6 +700,9 @@ class CancellationAndDeadlineTest {
                     NodeResult.continueWith(Map.of(), java.util.Set.of("NEXT")));
 
             assertFalse(enteredBeforeSourceCompletion);
+            ExecutionResult timedOut = await(timedOutHandle);
+            assertEquals(ExecutionStatus.FAILED, timedOut.status());
+            assertEquals("EXECUTION_DEADLINE_EXCEEDED", timedOut.errorCode());
             assertEquals(ExecutionStatus.SUCCEEDED, await(second).status());
             assertTrue(deferred.secondEntered.await(2, TimeUnit.SECONDS));
         }
@@ -938,6 +981,14 @@ class CancellationAndDeadlineTest {
         }
     }
 
+    private static boolean awaitCancellation(CancellationToken token) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (!token.isCancellationRequested() && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+        }
+        return token.isCancellationRequested();
+    }
+
     private static final class BlockingExecutor implements NodeExecutor {
 
         private final CountDownLatch started = new CountDownLatch(1);
@@ -1030,6 +1081,43 @@ class CancellationAndDeadlineTest {
                     source.completeExceptionally(exception);
                 } finally {
                     firstSourceCompleted.countDown();
+                }
+            });
+            return new NodeInvocation(nonFutureStage(source), ComponentInvocation.emptyContent());
+        }
+    }
+
+    private static final class DeadlineCleanupExecutor implements NodeExecutor {
+
+        private final CountDownLatch started = new CountDownLatch(1);
+        private final CountDownLatch deadlineCancellationObserved = new CountDownLatch(1);
+        private final CountDownLatch allowCleanup = new CountDownLatch(1);
+        private final CountDownLatch cleaned = new CountDownLatch(1);
+
+        @Override
+        public ComponentType supports() {
+            return ComponentType.SCRIPT;
+        }
+
+        @Override
+        public NodeInvocation execute(NodeExecutionContext context) {
+            CompletableFuture<NodeResult> source = new CompletableFuture<>();
+            started.countDown();
+            Thread.ofVirtual().start(() -> {
+                try {
+                    while (!context.cancellationToken().isCancellationRequested()) {
+                        Thread.sleep(5);
+                    }
+                    deadlineCancellationObserved.countDown();
+                    allowCleanup.await();
+                    cleaned.countDown();
+                    source.completeExceptionally(
+                            new java.util.concurrent.CancellationException("deadline source cleaned"));
+                } catch (InterruptedException failure) {
+                    Thread.currentThread().interrupt();
+                    source.completeExceptionally(failure);
+                } finally {
+                    cleaned.countDown();
                 }
             });
             return new NodeInvocation(nonFutureStage(source), ComponentInvocation.emptyContent());
