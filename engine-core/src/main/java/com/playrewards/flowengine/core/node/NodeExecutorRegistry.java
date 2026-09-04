@@ -16,6 +16,11 @@ import com.playrewards.flowengine.core.protocol.InputBindingResolver;
 import com.playrewards.flowengine.core.protocol.OutputValidator;
 import com.playrewards.flowengine.spi.ScriptRuntime;
 import com.playrewards.flowengine.spi.DistributedLockProvider;
+import com.playrewards.flowengine.spi.HttpNodeClient;
+import com.playrewards.flowengine.core.idempotency.IdempotencyCoordinator;
+import com.playrewards.flowengine.core.retry.RetryPolicy;
+import com.playrewards.flowengine.core.node.builtin.HttpNodeExecutor;
+import java.time.Duration;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -92,6 +97,37 @@ public final class NodeExecutorRegistry {
                 new ParallelCoordinator(),
                 new LoopCoordinator(scriptRuntime),
                 new SubFlowNodeExecutor(),
+                new BusinessNodeExecutor(businessComponents, new InputBindingResolver(), outputValidator)));
+    }
+
+    /**
+     * Creates the complete Task 8 runtime registry including adapter-neutral HTTP execution.
+     *
+     * @param scriptRuntime shared bounded Groovy adapter
+     * @param businessComponents immutable business component registry
+     * @param lockProvider distributed lease provider
+     * @param httpClient bounded target-policy-enforcing HTTP adapter
+     * @param clock shared deadline clock
+     * @return all Task 5-8 executors wired into the scheduler registry
+     */
+    public static NodeExecutorRegistry runtimeBuiltIns(ScriptRuntime scriptRuntime,
+            FlowBusinessComponentRegistry businessComponents, DistributedLockProvider lockProvider,
+            HttpNodeClient httpClient, Clock clock) {
+        Objects.requireNonNull(httpClient, "HTTP client must not be null");
+        OutputValidator outputValidator = new OutputValidator();
+        return new NodeExecutorRegistry(List.of(
+                new StartNodeExecutor(),
+                new EndNodeExecutor(),
+                new IfNodeExecutor(scriptRuntime),
+                new VariableNodeExecutor(scriptRuntime, outputValidator),
+                new ScriptNodeExecutor(scriptRuntime, outputValidator),
+                new ParallelCoordinator(),
+                new LoopCoordinator(scriptRuntime),
+                new SubFlowNodeExecutor(),
+                new LockNodeExecutor(scriptRuntime, lockProvider, clock),
+                new HttpNodeExecutor(scriptRuntime, httpClient,
+                        new RetryPolicy(3, Duration.ofMillis(100), Duration.ofSeconds(2)),
+                        new IdempotencyCoordinator(), clock, Duration.ofSeconds(30), 1_048_576),
                 new BusinessNodeExecutor(businessComponents, new InputBindingResolver(), outputValidator)));
     }
 

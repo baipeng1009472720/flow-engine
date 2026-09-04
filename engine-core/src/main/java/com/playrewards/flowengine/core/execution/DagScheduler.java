@@ -336,7 +336,7 @@ public final class DagScheduler implements AutoCloseable {
         } catch (NodeExecutionException exception) {
             lifecycleObserver.beforeControllerReasonSelection(CancellationHandle.Reason.FAILURE);
             registration.selectReason(CancellationHandle.Reason.FAILURE);
-            return result(executionId, ExecutionStatus.FAILED, null,
+            return result(executionId, exception.terminalStatus(), null,
                     exception.code(), exception.getMessage(), startedAt);
         } catch (RuntimeException exception) {
             lifecycleObserver.beforeControllerReasonSelection(CancellationHandle.Reason.FAILURE);
@@ -510,6 +510,19 @@ public final class DagScheduler implements AutoCloseable {
         }
         return new RegionOutcome(null, false);
         } catch (ExecutionDeadlineExceededException failure) {
+            if (cancellation.hasUnresolvedSideEffect()) {
+                if (isRootRegion(seedScope, boundaryNodeId, subFlowDepth)) {
+                    lifecycleObserver.beforeControllerReasonSelection(CancellationHandle.Reason.FAILURE);
+                }
+                cancellation.cancelForFailure();
+                Thread.interrupted();
+                if (!cancelAndAwait(regionRunning, CleanupBudget.standard(), true)) {
+                    logStructuredCleanupTimeout(executionId, seedScope);
+                }
+                throw new NodeExecutionException("HTTP_SIDE_EFFECT_UNCERTAIN",
+                        "HTTP side effect may have been sent; manual confirmation is required",
+                        ExecutionStatus.WAITING_MANUAL);
+            }
             if (isRootRegion(seedScope, boundaryNodeId, subFlowDepth)) {
                 lifecycleObserver.beforeControllerReasonSelection(CancellationHandle.Reason.DEADLINE);
             }
@@ -1357,6 +1370,7 @@ public final class DagScheduler implements AutoCloseable {
                 case DEADLINE -> result(executionId, ExecutionStatus.FAILED, null,
                         "EXECUTION_DEADLINE_EXCEEDED", "execution deadline exceeded", scheduledAt);
                 case FAILURE -> candidate.status() == ExecutionStatus.FAILED
+                        || candidate.status() == ExecutionStatus.WAITING_MANUAL
                         ? candidate
                         : result(executionId, ExecutionStatus.FAILED, null,
                                 "NODE_EXECUTION_FAILED", "node execution failed", scheduledAt);

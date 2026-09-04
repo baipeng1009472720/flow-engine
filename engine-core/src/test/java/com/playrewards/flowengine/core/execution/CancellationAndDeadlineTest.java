@@ -249,6 +249,48 @@ class CancellationAndDeadlineTest {
     }
 
     @Test
+    void close_preserves_waiting_manual_after_uncertain_side_effect_wins_terminal_arbitration()
+            throws Exception {
+        BlockingPublicationObserver observer = new BlockingPublicationObserver(
+                CancellationHandle.Reason.FAILURE);
+        NodeExecutor uncertainSideEffect = new NodeExecutor() {
+            @Override
+            public ComponentType supports() {
+                return ComponentType.SCRIPT;
+            }
+
+            @Override
+            public NodeInvocation execute(NodeExecutionContext context) {
+                throw new NodeExecutionException("HTTP_SIDE_EFFECT_UNCERTAIN",
+                        "manual confirmation is required", ExecutionStatus.WAITING_MANUAL);
+            }
+        };
+        DagScheduler scheduler = observedScheduler(
+                NodeExecutorRegistry.withBuiltIns(List.of(uncertainSideEffect)),
+                Clock.systemUTC(), observer);
+        Thread closer = null;
+        try {
+            ExecutionHandle handle = scheduler.schedule(blockingPlan(), request(Map.of()));
+            assertTrue(observer.entered.await(2, TimeUnit.SECONDS));
+
+            closer = Thread.ofVirtual().start(scheduler::close);
+            observer.release.countDown();
+            closer.join(2_000);
+
+            ExecutionResult result = await(handle);
+            assertEquals(ExecutionStatus.WAITING_MANUAL, result.status());
+            assertEquals("HTTP_SIDE_EFFECT_UNCERTAIN", result.errorCode());
+            assertFalse(handle.cancel());
+        } finally {
+            observer.release.countDown();
+            if (closer != null) {
+                closer.join(2_000);
+            }
+            scheduler.close();
+        }
+    }
+
+    @Test
     void close_preserves_a_deadline_that_won_before_result_publication() throws Exception {
         Instant deadline = Instant.parse("2026-09-04T00:00:00Z");
         Clock afterDeadline = Clock.fixed(deadline.plusMillis(1), ZoneOffset.UTC);

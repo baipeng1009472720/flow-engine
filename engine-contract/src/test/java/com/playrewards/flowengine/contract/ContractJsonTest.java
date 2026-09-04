@@ -199,7 +199,8 @@ class ContractJsonTest {
         for (ExecutionStatus status : ExecutionStatus.values()) {
             if (status != ExecutionStatus.SUCCEEDED
                     && status != ExecutionStatus.FAILED
-                    && status != ExecutionStatus.CANCELLED) {
+                    && status != ExecutionStatus.CANCELLED
+                    && status != ExecutionStatus.WAITING_MANUAL) {
                 assertThrows(IllegalArgumentException.class,
                         () -> new ExecutionResult("execution", status, null,
                                 "NOT_TERMINAL", null, null, now, now));
@@ -225,6 +226,10 @@ class ContractJsonTest {
         ExecutionResult cancelled = new ExecutionResult("execution", ExecutionStatus.CANCELLED,
                 null, "EXECUTION_CANCELLED", "cancelled", null, now, now);
         assertEquals(cancelled, JSON.parseObject(JSON.toJSONString(cancelled), ExecutionResult.class));
+        ExecutionResult waitingManual = new ExecutionResult("execution", ExecutionStatus.WAITING_MANUAL,
+                null, "HTTP_SIDE_EFFECT_UNCERTAIN", "manual confirmation required", null, now, now);
+        assertEquals(waitingManual,
+                JSON.parseObject(JSON.toJSONString(waitingManual), ExecutionResult.class));
     }
 
     @Test

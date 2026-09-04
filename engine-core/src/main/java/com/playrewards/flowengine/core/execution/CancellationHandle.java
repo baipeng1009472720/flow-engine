@@ -4,6 +4,8 @@ import com.playrewards.flowengine.spi.CancellationToken;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.ConcurrentHashMap;
+import com.playrewards.flowengine.spi.HttpNodeClient;
 
 /** Thread-safe cancellation source exposed as the narrower SPI token to running nodes. */
 public final class CancellationHandle implements CancellationToken {
@@ -21,16 +23,19 @@ public final class CancellationHandle implements CancellationToken {
     private final CopyOnWriteArrayList<Runnable> callbacks = new CopyOnWriteArrayList<>();
     private final CancellationHandle root;
     private final CancellationRegistration parentRegistration;
+    private final ConcurrentHashMap<String, Boolean> unresolvedSideEffects;
 
     /** Creates one root cancellation source whose reason participates in public terminal arbitration. */
     public CancellationHandle() {
         this.root = this;
         this.parentRegistration = null;
+        this.unresolvedSideEffects = new ConcurrentHashMap<>();
     }
 
     private CancellationHandle(CancellationHandle parent) {
         this.root = parent.root;
         this.parentRegistration = parent.onCancellation(this::requestStop);
+        this.unresolvedSideEffects = root.unresolvedSideEffects;
     }
 
     /** Requests explicit cancellation once and invokes registered interruption callbacks. */
@@ -41,6 +46,37 @@ public final class CancellationHandle implements CancellationToken {
     /** @return the winning cancellation reason, or {@code null} while active */
     public Reason reason() {
         return root.reason.get();
+    }
+
+    /** Creates an execution-root marker used only for unprotected external side effects. */
+    public HttpNodeClient.SendObserver sideEffectObserver(String identity) {
+        java.util.Objects.requireNonNull(identity, "side effect identity must not be null");
+        return new HttpNodeClient.SendObserver() {
+            @Override
+            public void sent() {
+                unresolvedSideEffects.put(identity, Boolean.TRUE);
+            }
+
+            @Override
+            public void resolved() {
+                unresolvedSideEffects.remove(identity);
+            }
+
+            @Override
+            public boolean isSentUnresolved() {
+                return unresolvedSideEffects.containsKey(identity);
+            }
+
+            @Override
+            public String toString() {
+                return "SendObserver[identity=<redacted>]";
+            }
+        };
+    }
+
+    /** @return whether any unprotected request may have escaped without a definitive outcome */
+    boolean hasUnresolvedSideEffect() {
+        return !unresolvedSideEffects.isEmpty();
     }
 
     @Override
@@ -85,7 +121,8 @@ public final class CancellationHandle implements CancellationToken {
      *
      * @return idempotent registration which removes the callback after normal child completion
      */
-    CancellationRegistration onCancellation(Runnable callback) {
+    @Override
+    public CancellationRegistration onCancellation(Runnable callback) {
         if (isCancellationRequested()) {
             callback.run();
             return CancellationRegistration.closed();
@@ -125,7 +162,7 @@ public final class CancellationHandle implements CancellationToken {
     }
 
     /** Idempotent callback registration owned by the task that created it. */
-    static final class CancellationRegistration implements AutoCloseable {
+    public static final class CancellationRegistration implements CancellationToken.CancellationRegistration {
 
         private final CopyOnWriteArrayList<Runnable> callbacks;
         private final Runnable callback;

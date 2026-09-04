@@ -14,6 +14,7 @@ import com.playrewards.flowengine.core.execution.ScopePath;
 import com.playrewards.flowengine.spi.CancellationToken;
 import com.playrewards.flowengine.spi.ComponentInputs;
 import com.playrewards.flowengine.spi.ExecutionLogger;
+import com.playrewards.flowengine.spi.HttpNodeClient;
 import java.time.Clock;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -132,6 +133,17 @@ public final class NodeExecutionContext {
     /** @return node-scoped structured logger, or the safe no-op default */
     public ExecutionLogger executionLogger() {
         return executionLogger;
+    }
+
+    /**
+     * Creates a redacted execution-root send marker for this exact node scope.
+     *
+     * <p>Only unprotected HTTP side effects should request this observer. Safe or idempotency-key
+     * protected calls use the no-op observer and remain ordinary deadline failures.</p>
+     */
+    public HttpNodeClient.SendObserver unprotectedSideEffectObserver() {
+        return cancellation.sideEffectObserver(
+                executionId + "\u0000" + node.node().nodeCode() + "\u0000" + scopePath.value());
     }
 
     /**

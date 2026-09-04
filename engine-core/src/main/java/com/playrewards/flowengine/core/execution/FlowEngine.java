@@ -7,6 +7,7 @@ import com.playrewards.flowengine.core.component.FlowBusinessComponentRegistry;
 import com.playrewards.flowengine.spi.DistributedLockProvider;
 import com.playrewards.flowengine.spi.ExecutionLogger;
 import com.playrewards.flowengine.spi.ScriptRuntime;
+import com.playrewards.flowengine.spi.HttpNodeClient;
 import java.time.Clock;
 import java.util.Objects;
 
@@ -73,6 +74,21 @@ public final class FlowEngine implements AutoCloseable {
     public FlowEngine(ScriptRuntime scripts, FlowBusinessComponentRegistry businessComponents,
             DistributedLockProvider locks, Clock clock) {
         this(NodeExecutorRegistry.runtimeBuiltIns(scripts, businessComponents, locks, clock),
+                PROCESS_GOVERNOR, clock);
+    }
+
+    /**
+     * Creates the complete Task 8 embedded runtime, including a host-owned bounded HTTP adapter.
+     *
+     * @param scripts bounded sandbox runtime
+     * @param businessComponents immutable business component registry
+     * @param locks distributed lease provider
+     * @param httpClient transport enforcing production/trial target policy
+     * @param clock shared deadline clock
+     */
+    public FlowEngine(ScriptRuntime scripts, FlowBusinessComponentRegistry businessComponents,
+            DistributedLockProvider locks, HttpNodeClient httpClient, Clock clock) {
+        this(NodeExecutorRegistry.runtimeBuiltIns(scripts, businessComponents, locks, httpClient, clock),
                 PROCESS_GOVERNOR, clock);
     }
 
