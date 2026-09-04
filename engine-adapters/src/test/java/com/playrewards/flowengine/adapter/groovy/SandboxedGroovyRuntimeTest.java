@@ -30,6 +30,7 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -64,6 +65,28 @@ class SandboxedGroovyRuntimeTest {
         assertEquals("", stdout.toString(StandardCharsets.UTF_8));
     }
 
+    @Test
+    void supports_only_json_reads_and_allowlisted_business_operations() throws Exception {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            Object result = await(runtime.execute(invocation("""
+                    def subtotal = play.amount * 2
+                    if (ctx.before.enabled && play.name.startsWith('A')) {
+                        return [message: play.name.trim().toUpperCase(),
+                                values: [subtotal, ctx.before.count + 1],
+                                present: play.containsKey('amount')]
+                    }
+                    return [message: 'skipped', values: [], present: false]
+                    """, Map.of("play", Map.of("name", "Ada ", "amount", 6)),
+                    Map.of("before", Map.of("enabled", true, "count", 2)),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(2))));
+
+            assertEquals(Map.of(
+                    "message", "ADA",
+                    "values", List.of(12, 3),
+                    "present", true), result);
+        }
+    }
+
     @ParameterizedTest(name = "rejects escape: {0}")
     @MethodSource("forbiddenScripts")
     void rejects_file_process_reflection_class_loading_thread_and_network_escapes(String label, String script) {
@@ -76,6 +99,21 @@ class SandboxedGroovyRuntimeTest {
             assertTrue(failure.getCause() instanceof ScriptExecutionException, label);
             assertEquals("SCRIPT_SECURITY_VIOLATION",
                     ((ScriptExecutionException) failure.getCause()).code(), label);
+        }
+    }
+
+    @Test
+    void rejects_property_getters_even_when_the_receiver_arrives_through_json_ctx() {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            CompletionException failure = assertThrows(CompletionException.class,
+                    () -> runtime.execute(invocation("return ctx.secret.allWhitespace", Map.of(),
+                            Map.of("secret", "   "),
+                            entry -> { }, () -> false, Instant.now().plusSeconds(2)))
+                            .toCompletableFuture().join());
+
+            assertTrue(failure.getCause() instanceof ScriptExecutionException);
+            assertEquals("SCRIPT_SECURITY_VIOLATION",
+                    ((ScriptExecutionException) failure.getCause()).code());
         }
     }
 
@@ -104,6 +142,114 @@ class SandboxedGroovyRuntimeTest {
                         () -> completion.toCompletableFuture().join());
             }
         });
+    }
+
+    @Test
+    void cancelling_returned_future_stops_the_real_worker_and_releases_runtime_for_reuse() {
+        assertTimeoutPreemptively(Duration.ofSeconds(2), () -> {
+            try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                    Duration.ofSeconds(5), 10_000, 32_000, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+                var running = runtime.execute(invocation("while (true) { }", Map.of(), Map.of(),
+                        entry -> { }, () -> false, Instant.now().plusSeconds(5))).toCompletableFuture();
+                awaitActiveInvocations(runtime, 1);
+
+                assertTrue(running.cancel(true));
+                assertThrows(CancellationException.class, running::join);
+                awaitActiveInvocations(runtime, 0);
+
+                assertEquals(7, await(runtime.execute(invocation("return 7", Map.of(), Map.of(),
+                        entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+            }
+        });
+    }
+
+    @Test
+    void caller_cannot_forge_completion_while_the_real_worker_is_still_running() {
+        assertTimeoutPreemptively(Duration.ofSeconds(2), () -> {
+            try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                    Duration.ofSeconds(5), 10_000, 32_000, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+                var running = runtime.execute(invocation("while (true) { }", Map.of(), Map.of(),
+                        entry -> { }, () -> false, Instant.now().plusSeconds(5))).toCompletableFuture();
+                awaitActiveInvocations(runtime, 1);
+
+                assertFalse(running.complete("forged"));
+                assertFalse(running.isDone());
+                assertEquals(1, runtime.activeInvocationCount());
+
+                running.cancel(true);
+                awaitActiveInvocations(runtime, 0);
+            }
+        });
+    }
+
+    @Test
+    void one_finite_admission_covers_compile_and_execution_until_the_worker_really_stops() {
+        assertTimeoutPreemptively(Duration.ofSeconds(2), () -> {
+            try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                    Duration.ofSeconds(5), 10_000, 32_000, 8, Duration.ofMinutes(1), Clock.systemUTC(),
+                    1, 1_024, 8_192, 32)) {
+                var running = runtime.execute(invocation("while (true) { }", Map.of(), Map.of(),
+                        entry -> { }, () -> false, Instant.now().plusSeconds(5))).toCompletableFuture();
+                awaitActiveInvocations(runtime, 1);
+
+                assertScriptCode(runtime, "return 2", "SCRIPT_CAPACITY_EXCEEDED");
+                running.cancel(true);
+                awaitActiveInvocations(runtime, 0);
+                assertEquals(3, await(runtime.execute(invocation("return 3", Map.of(), Map.of(),
+                        entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+            }
+        });
+    }
+
+    @Test
+    void compilation_itself_is_async_admitted_timed_and_cancelled_before_runtime_reuse() {
+        assertTimeoutPreemptively(Duration.ofSeconds(3), () -> {
+            StringBuilder source = new StringBuilder();
+            for (int index = 0; index < 4_000; index++) {
+                source.append("def value").append(index).append(" = ").append(index).append('\n');
+            }
+            source.append("return value3999");
+            AtomicReference<java.util.concurrent.CompletionStage<Object>> completion = new AtomicReference<>();
+            try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                    Duration.ofSeconds(2), 100_000, 32_000, 8, Duration.ofMinutes(1), Clock.systemUTC(),
+                    1, 1_024, 8_192, 32)) {
+                assertEquals(9, await(runtime.execute(invocation("return 9", Map.of(), Map.of(),
+                        entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+                assertTimeoutPreemptively(Duration.ofMillis(100), () -> completion.set(runtime.execute(
+                        invocation(source.toString(), Map.of(), Map.of(), entry -> { }, () -> false,
+                                Instant.now().plusMillis(50)))));
+
+                CompletionException timeout = assertThrows(CompletionException.class,
+                        () -> completion.get().toCompletableFuture().join());
+                assertEquals("SCRIPT_TIMEOUT", ((ScriptExecutionException) timeout.getCause()).code());
+                awaitActiveInvocations(runtime, 0);
+                assertEquals(9, await(runtime.execute(invocation("return 9", Map.of(), Map.of(),
+                        entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+            }
+        });
+    }
+
+    @Test
+    void truncates_logs_by_line_bytes_total_bytes_and_entry_count() throws Exception {
+        CollectingLogger logger = new CollectingLogger();
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 32_000, 8, Duration.ofMinutes(1), Clock.systemUTC(),
+                1, 16, 24, 2)) {
+            assertEquals(true, await(runtime.execute(invocation("""
+                    println('你好世界你好世界')
+                    println('abcdefghijklmnopqrstuvwxyz')
+                    println('abcdefghijklmnopqrstuvwxyz')
+                    return true
+                    """, Map.of(), Map.of(), logger, () -> false, Instant.now().plusSeconds(1)))));
+        }
+
+        assertEquals(List.of("你好世[...]", "abcde[...]"),
+                logger.entries.stream().map(ExecutionLogEntry::message).toList());
+        assertTrue(logger.entries.stream()
+                .mapToInt(entry -> entry.message().getBytes(StandardCharsets.UTF_8).length)
+                .allMatch(bytes -> bytes <= 16));
+        assertEquals(24, logger.entries.stream()
+                .mapToInt(entry -> entry.message().getBytes(StandardCharsets.UTF_8).length).sum());
     }
 
     @Test
@@ -198,6 +344,18 @@ class SandboxedGroovyRuntimeTest {
                         "return groovy.util.Eval.me(\"return System.getProperty('user.home')\")"),
                 org.junit.jupiter.params.provider.Arguments.of("script evaluator",
                         "return evaluate('return 1')"),
+                org.junit.jupiter.params.provider.Arguments.of("script receiver",
+                        "return this.dump()"),
+                org.junit.jupiter.params.provider.Arguments.of("unlisted GDK method",
+                        "return 'secret'.getBytes()"),
+                org.junit.jupiter.params.provider.Arguments.of("indirect getter property",
+                        "return 'secret'.bytes"),
+                org.junit.jupiter.params.provider.Arguments.of("local getter property bypass",
+                        "def secret = '   '; return secret.allWhitespace"),
+                org.junit.jupiter.params.provider.Arguments.of("direct attribute access",
+                        "return ctx.@table"),
+                org.junit.jupiter.params.provider.Arguments.of("closure dispatch",
+                        "return [1, 2].collect { it + 1 }"),
                 org.junit.jupiter.params.provider.Arguments.of("thread",
                         "new java.lang.Thread({ -> }); return true"),
                 org.junit.jupiter.params.provider.Arguments.of("network",
@@ -212,6 +370,15 @@ class SandboxedGroovyRuntimeTest {
 
     private static Object await(java.util.concurrent.CompletionStage<Object> completion) throws Exception {
         return completion.toCompletableFuture().get(2, TimeUnit.SECONDS);
+    }
+
+    private static void awaitActiveInvocations(SandboxedGroovyRuntime runtime, int expected)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+        while (runtime.activeInvocationCount() != expected && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+        }
+        assertEquals(expected, runtime.activeInvocationCount());
     }
 
     private static void assertScriptCode(ScriptRuntime runtime, String script, String code) {

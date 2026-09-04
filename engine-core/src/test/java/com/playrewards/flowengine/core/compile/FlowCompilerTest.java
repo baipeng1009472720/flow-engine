@@ -170,7 +170,7 @@ class FlowCompilerTest {
     }
 
     @Test
-    void excludes_engine_input_bindings_from_strict_component_config_schema_only() {
+    void excludes_all_engine_reserved_fields_from_strict_component_config_schema() {
         CompiledComponentContract work = new CompiledComponentContract(
                 "business.work", ComponentType.BUSINESS, "workExecutor",
                 Map.of("type", "object", "additionalProperties", false,
@@ -186,8 +186,10 @@ class FlowCompilerTest {
                         Map.of("order", output("订单", ORDER))),
                 "business.work", work,
                 "builtin.end", contract("builtin.end", ComponentType.END, null, Map.of(), Map.of()));
-        Map<String, Object> validConfig = Map.of("mode", "strict", "inputBindings",
-                List.of(binding("order", "start", "order")));
+        Map<String, Object> validConfig = Map.of(
+                "mode", "strict",
+                "inputBindings", List.of(binding("order", "start", "order")),
+                "resourceKey", "tenant:42");
 
         ExecutionPlan plan = new FlowCompiler().compile(bundle(nodes, edges, contracts, Map.of("work", validConfig)));
         assertTrue(plan.nodesById().get("work").inputBindings().containsKey("order"));

@@ -1,7 +1,9 @@
 package com.playrewards.flowengine.core.node;
 
 import com.playrewards.flowengine.contract.bundle.OutputSlotContract;
+import com.playrewards.flowengine.contract.component.ComponentType;
 import com.playrewards.flowengine.contract.execution.ExecutionRequest;
+import com.playrewards.flowengine.contract.json.JsonValues;
 import com.playrewards.flowengine.core.compile.CompiledNode;
 import com.playrewards.flowengine.core.compile.ExecutionPlan;
 import com.playrewards.flowengine.core.execution.CancellationHandle;
@@ -11,12 +13,11 @@ import com.playrewards.flowengine.core.execution.ScopePath;
 import com.playrewards.flowengine.spi.CancellationToken;
 import com.playrewards.flowengine.spi.ComponentInputs;
 import com.playrewards.flowengine.spi.ExecutionLogger;
-import com.playrewards.flowengine.contract.component.ComponentType;
-import com.playrewards.flowengine.contract.json.JsonValues;
 import java.time.Clock;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.TreeMap;
 
 /** Immutable per-attempt view supplied to a node executor. */
 public final class NodeExecutionContext {
@@ -135,12 +136,14 @@ public final class NodeExecutionContext {
      */
     public Map<String, Object> ctxView() {
         Map<String, Object> view = new LinkedHashMap<>();
-        executionContext.outputsByNode(scopePath).forEach((nodeCode, outputs) -> {
-            CompiledNode source = plan.nodesById().values().stream()
-                    .filter(candidate -> candidate.node().nodeCode().equals(nodeCode))
-                    .findFirst().orElse(null);
-            if (source != null
-                    && source.componentContract().componentType() == ComponentType.VARIABLE
+        Map<String, CompiledNode> visibleNodes = new TreeMap<>();
+        plan.ancestorNodeIds(node.node().id()).forEach(nodeId -> {
+            CompiledNode ancestor = plan.nodesById().get(nodeId);
+            visibleNodes.put(ancestor.node().nodeCode(), ancestor);
+        });
+        executionContext.outputsByNode(scopePath, visibleNodes.keySet()).forEach((nodeCode, outputs) -> {
+            CompiledNode source = visibleNodes.get(nodeCode);
+            if (source.componentContract().componentType() == ComponentType.VARIABLE
                     && outputs.size() == 1) {
                 view.put(nodeCode, outputs.values().iterator().next());
             } else {

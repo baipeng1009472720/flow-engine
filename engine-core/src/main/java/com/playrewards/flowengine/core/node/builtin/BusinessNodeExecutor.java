@@ -4,6 +4,7 @@ import com.playrewards.flowengine.contract.component.ComponentCapabilities;
 import com.playrewards.flowengine.contract.component.ComponentType;
 import com.playrewards.flowengine.contract.execution.ExecutionPurpose;
 import com.playrewards.flowengine.core.component.FlowBusinessComponentRegistry;
+import com.playrewards.flowengine.core.config.EngineReservedConfig;
 import com.playrewards.flowengine.core.node.NodeExecutionContext;
 import com.playrewards.flowengine.core.node.NodeExecutionException;
 import com.playrewards.flowengine.core.node.NodeExecutor;
@@ -15,10 +16,8 @@ import com.playrewards.flowengine.spi.ComponentExecutionContext;
 import com.playrewards.flowengine.spi.ComponentInvocation;
 import com.playrewards.flowengine.spi.FlowBusinessComponent;
 import com.playrewards.flowengine.spi.ReadOnlyExecutionContext;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 
 /**
  * Executes every BUSINESS node through the startup-built component registry.
@@ -28,8 +27,6 @@ import java.util.Set;
  * framework container and preserves a component's content publisher unchanged.</p>
  */
 public final class BusinessNodeExecutor implements NodeExecutor {
-
-    private static final Set<String> ENGINE_RESERVED_CONFIG_FIELDS = Set.of("inputBindings");
 
     private final FlowBusinessComponentRegistry components;
     private final InputBindingResolver bindingResolver;
@@ -85,13 +82,7 @@ public final class BusinessNodeExecutor implements NodeExecutor {
     }
 
     private static ComponentConfig componentConfig(Map<String, Object> nodeConfig) {
-        Map<String, Object> businessConfig = new LinkedHashMap<>();
-        nodeConfig.forEach((key, value) -> {
-            if (!ENGINE_RESERVED_CONFIG_FIELDS.contains(key)) {
-                businessConfig.put(key, value);
-            }
-        });
-        return new ComponentConfig(businessConfig);
+        return new ComponentConfig(EngineReservedConfig.withoutEngineFields(nodeConfig));
     }
 
     private static void checkCapabilities(NodeExecutionContext context, ComponentCapabilities runtime) {

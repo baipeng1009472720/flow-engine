@@ -14,6 +14,7 @@ import com.playrewards.flowengine.contract.flow.FlowNode;
 import com.playrewards.flowengine.contract.json.JsonValues;
 import com.playrewards.flowengine.contract.protocol.ProtocolSchema;
 import com.playrewards.flowengine.core.compile.CompiledNode.InputBinding;
+import com.playrewards.flowengine.core.config.EngineReservedConfig;
 import com.playrewards.flowengine.core.protocol.JsonSchemaCompatibility;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -215,9 +216,7 @@ public final class FlowCompiler {
             }
             try {
                 JSONSchema schema = JSONSchema.of(JSON.parseObject(JSON.toJSONString(contract.configSchema())));
-                Map<String, Object> componentConfig = new LinkedHashMap<>(
-                        JsonValues.copyObject(node.config(), "node config"));
-                componentConfig.remove("inputBindings");
+                Map<String, Object> componentConfig = EngineReservedConfig.withoutEngineFields(node.config());
                 ValidateResult result = schema.validate(componentConfig);
                 if (!result.isSuccess()) {
                     issues.add(issue("FLOW_NODE_CONFIG_INVALID", node.id(), "config", result.getMessage()));
@@ -656,7 +655,7 @@ public final class FlowCompiler {
     }
 
     private static Map<String, InputBinding> parseBindings(FlowNode node, List<CompilationIssue> issues) {
-        Object raw = node.config().get("inputBindings");
+        Object raw = node.config().get(EngineReservedConfig.INPUT_BINDINGS);
         if (raw == null) {
             return Map.of();
         }

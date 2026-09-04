@@ -6,6 +6,7 @@ import com.playrewards.flowengine.contract.execution.ExecutionResult;
 import com.playrewards.flowengine.contract.execution.ExecutionStatus;
 import com.playrewards.flowengine.core.compile.CompiledNode;
 import com.playrewards.flowengine.core.compile.ExecutionPlan;
+import com.playrewards.flowengine.core.config.EngineReservedConfig;
 import com.playrewards.flowengine.core.node.NodeExecutionContext;
 import com.playrewards.flowengine.core.node.NodeExecutionException;
 import com.playrewards.flowengine.core.node.NodeExecutor;
@@ -595,7 +596,7 @@ public final class DagScheduler implements AutoCloseable {
     }
 
     private static String resourceKey(CompiledNode node) {
-        Object configured = node.node().config().get("resourceKey");
+        Object configured = node.node().config().get(EngineReservedConfig.RESOURCE_KEY);
         if (configured instanceof String text && !text.isBlank()) {
             return text.strip();
         }

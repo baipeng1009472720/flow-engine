@@ -6,6 +6,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -112,12 +113,19 @@ public final class ExecutionContext {
      *
      * <p>The snapshot is grouped by stable node code and output key. It is used only to create
      * adapter-neutral read views; callers cannot mutate the append-only store.</p>
+     *
+     * @param scopePath exact execution scope to project
+     * @param visibleNodeCodes statically visible ancestor node codes
+     * @return deeply immutable, deterministically ordered node-output projection
      */
-    public Map<String, Map<String, Object>> outputsByNode(ScopePath scopePath) {
+    public Map<String, Map<String, Object>> outputsByNode(
+            ScopePath scopePath, Set<String> visibleNodeCodes) {
         Objects.requireNonNull(scopePath, "scope path must not be null");
+        Objects.requireNonNull(visibleNodeCodes, "visible node codes must not be null");
         Map<String, Map<String, Object>> grouped = new TreeMap<>();
         outputs.entrySet().stream()
-                .filter(entry -> entry.getKey().scopePath().equals(scopePath))
+                .filter(entry -> entry.getKey().scopePath().equals(scopePath)
+                        && visibleNodeCodes.contains(entry.getKey().nodeCode()))
                 .sorted(Comparator.comparing((Map.Entry<OutputAddress, StoredValue> entry) ->
                                 entry.getKey().nodeCode())
                         .thenComparing(entry -> entry.getKey().outputKey()))

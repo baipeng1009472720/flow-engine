@@ -3,6 +3,7 @@ package com.playrewards.flowengine.core.node.builtin;
 import com.playrewards.flowengine.contract.bundle.OutputSlotContract;
 import com.playrewards.flowengine.contract.component.ComponentType;
 import com.playrewards.flowengine.contract.json.JsonValues;
+import com.playrewards.flowengine.core.config.EngineReservedConfig;
 import com.playrewards.flowengine.core.node.JsonValueValidator;
 import com.playrewards.flowengine.core.node.NodeExecutionContext;
 import com.playrewards.flowengine.core.node.NodeExecutionException;
@@ -132,7 +133,7 @@ public final class StartNodeExecutor implements NodeExecutor {
             throw new NodeExecutionException("START_CONFIG_INVALID",
                     "legacy configSchema.properties must be an object");
         }
-        Object rawBindings = container.get("inputBindings");
+        Object rawBindings = container.get(EngineReservedConfig.INPUT_BINDINGS);
         if (rawBindings == null) {
             return null;
         }

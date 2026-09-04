@@ -1,21 +1,22 @@
 package com.playrewards.flowengine.server;
 
-import com.playrewards.flowengine.core.fixture.ProhibitedSpringDependency;
+import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+import com.playrewards.flowengine.adapter.fixture.ProhibitedAdapterToCoreDependency;
+import com.playrewards.flowengine.contract.fixture.ProhibitedContractToCoreDependency;
+import com.playrewards.flowengine.core.fixture.ProhibitedCoreToAdapterDependency;
 import com.playrewards.flowengine.core.fixture.ProhibitedJavaSqlDependency;
 import com.playrewards.flowengine.core.fixture.ProhibitedJdkHttpServerDependency;
 import com.playrewards.flowengine.core.fixture.ProhibitedMySqlDependency;
 import com.playrewards.flowengine.core.fixture.ProhibitedPlayRewardsDomainDependency;
-import com.playrewards.flowengine.contract.fixture.ProhibitedContractToCoreDependency;
-import com.playrewards.flowengine.adapters.fixture.ProhibitedAdapterToCoreDependency;
+import com.playrewards.flowengine.core.fixture.ProhibitedSpringDependency;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
 import com.tngtech.archunit.core.importer.ImportOption;
 import com.tngtech.archunit.junit.AnalyzeClasses;
 import com.tngtech.archunit.junit.ArchTest;
 import com.tngtech.archunit.lang.ArchRule;
 import org.junit.jupiter.api.Test;
-
-import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * Verifies that the engine's contract, core, and SPI remain independent from framework and
@@ -75,6 +76,8 @@ final class ArchitectureTest {
         ClassFileImporter importer = new ClassFileImporter();
         assertThrows(AssertionError.class, () -> contractAndSpiRule()
                 .check(importer.importClasses(ProhibitedContractToCoreDependency.class)));
+        assertThrows(AssertionError.class, () -> coreLayerRule()
+                .check(importer.importClasses(ProhibitedCoreToAdapterDependency.class)));
         assertThrows(AssertionError.class, () -> adaptersLayerRule()
                 .check(importer.importClasses(ProhibitedAdapterToCoreDependency.class)));
     }
@@ -92,22 +95,20 @@ final class ArchitectureTest {
         return noClasses()
                 .that().resideInAnyPackage("..contract..", "..spi..")
                 .should().dependOnClassesThat()
-                .resideInAnyPackage("..core..", "..adapters..", "..server..")
-                .allowEmptyShould(true);
+                .resideInAnyPackage("..core..", "..adapter..", "..server..");
     }
 
     private static ArchRule coreLayerRule() {
         return noClasses()
                 .that().resideInAnyPackage("..core..")
                 .should().dependOnClassesThat()
-                .resideInAnyPackage("..adapters..", "..server..");
+                .resideInAnyPackage("..adapter..", "..server..");
     }
 
     private static ArchRule adaptersLayerRule() {
         return noClasses()
-                .that().resideInAnyPackage("..adapters..")
+                .that().resideInAnyPackage("..adapter..")
                 .should().dependOnClassesThat()
-                .resideInAnyPackage("..core..", "..server..")
-                .allowEmptyShould(true);
+                .resideInAnyPackage("..core..", "..server..");
     }
 }

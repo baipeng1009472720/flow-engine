@@ -91,11 +91,45 @@ class BusinessNodeExecutorTest {
         NodeExecutionContext optionalMissing = businessContext(
                 Map.of("optional", input(false, TEXT)), Map.of(), Map.of(), TEXT, PURE,
                 ExecutionPurpose.PRODUCTION,
-                Map.of("businessOption", "kept", "inputBindings", List.of(Map.of("private", true))));
+                Map.of("businessOption", "kept", "resourceKey", "queue:one",
+                        "inputBindings", List.of(Map.of("private", true))));
         join(executor.execute(optionalMissing));
 
         assertEquals(Map.of(), captured.get().inputs().optionalValues());
         assertEquals(Map.of("businessOption", "kept"), captured.get().config().values());
+    }
+
+    @Test
+    void ctx_view_contains_only_static_ancestors_and_excludes_completed_sibling_branches() {
+        Map<String, OutputSlotContract> output = Map.of("value", new OutputSlotContract("value", TEXT));
+        CompiledNode start = compiledNode("start", ComponentType.START, null,
+                Map.of(), output, Map.of(), Map.of(), PURE);
+        CompiledNode left = compiledNode("left", ComponentType.SCRIPT, null,
+                Map.of(), output, Map.of(), Map.of("groovyScript", "return 'left'"), PURE);
+        CompiledNode right = compiledNode("right", ComponentType.SCRIPT, null,
+                Map.of(), output, Map.of(), Map.of("groovyScript", "return 'right'"), PURE);
+        CompiledNode target = compiledNode("target", ComponentType.SCRIPT, null,
+                Map.of(), output, Map.of(), Map.of("groovyScript", "return ctx.left.value"), PURE);
+        Map<String, CompiledNode> nodes = Map.of(
+                "start", start, "left", left, "right", right, "target", target);
+        ExecutionPlan plan = new ExecutionPlan(new FlowIdentity("tenant", "flow", "v1"), "hash", nodes,
+                Map.of("start", List.of("left", "right"), "left", List.of("target")),
+                Map.of("start", List.of(), "left", List.of("start"), "right", List.of("start"),
+                        "target", List.of("left")),
+                Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of());
+        ExecutionContext values = new ExecutionContext(Map.of());
+        values.writeOnce("start", ScopePath.root(), "value", "root");
+        values.writeOnce("left", ScopePath.root(), "value", "visible");
+        values.writeOnce("right", ScopePath.root(), "value", "sibling-secret");
+        NodeExecutionContext context = new NodeExecutionContext("execution", plan, target, values,
+                ScopePath.root(), new com.playrewards.flowengine.spi.ComponentInputs(Map.of(), Map.of()),
+                new CancellationHandle(), request(ExecutionPurpose.PRODUCTION, Map.of(), Map.of()),
+                Clock.systemUTC());
+
+        assertEquals(Map.of(
+                "start", Map.of("value", "root"),
+                "left", Map.of("value", "visible")), context.ctxView());
+        assertFalse(context.ctxView().toString().contains("sibling-secret"));
     }
 
     @Test

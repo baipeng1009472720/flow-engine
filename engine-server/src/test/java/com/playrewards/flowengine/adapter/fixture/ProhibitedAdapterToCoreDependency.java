@@ -1,8 +1,8 @@
-package com.playrewards.flowengine.adapters.fixture;
+package com.playrewards.flowengine.adapter.fixture;
 
 import com.playrewards.flowengine.core.EngineCoreMarker;
 
-/** Test-only fixture proving adapters cannot depend on core. */
+/** Test-only fixture proving adapter code cannot depend on core. */
 public final class ProhibitedAdapterToCoreDependency {
     private EngineCoreMarker marker;
 }
