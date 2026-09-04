@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://playrewards.com/flow-engine/schema/executable-flow-bundle-1.0.schema.json",
+  "title": "Executable Flow Bundle 1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contractVersion", "flowIdentity", "flowDefinition", "componentContracts", "protocolSchemas", "externalScopeSchemas"],
+  "properties": {
+    "contractVersion": { "const": "1.0" },
+    "flowIdentity": { "type": "object", "required": ["tenantId", "flowId", "version"], "properties": { "tenantId": {"type": "string"}, "flowId": {"type": "string"}, "version": {"type": "string"} }, "additionalProperties": false },
+    "flowDefinition": { "$ref": "#/$defs/flowDefinition" },
+    "componentContracts": { "type": "object", "additionalProperties": { "$ref": "#/$defs/componentContract" } },
+    "protocolSchemas": { "type": "object", "additionalProperties": { "$ref": "#/$defs/protocolSchema" } },
+    "externalScopeSchemas": { "type": "object", "additionalProperties": { "$ref": "#/$defs/protocolSchema" } },
+    "bundleHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "trust": { "type": "object", "properties": { "issuer": {"type": "string"}, "keyId": {"type": "string"}, "signature": {"type": "string"} }, "additionalProperties": false }
+  },
+  "$defs": {
+    "flowDefinition": { "type": "object", "additionalProperties": false, "required": ["schemaVersion", "nodes", "edges"], "properties": { "schemaVersion": {"const": "2.0"}, "nodes": {"type": "array", "items": {"$ref": "#/$defs/flowNode"}}, "edges": {"type": "array", "items": {"$ref": "#/$defs/flowEdge"}} } },
+    "flowNode": { "type": "object", "additionalProperties": false, "required": ["id", "componentCode", "nodeCode", "nodeName", "config"], "properties": { "id": {"type": "string"}, "componentCode": {"type": "string"}, "nodeCode": {"type": "string"}, "nodeName": {"type": "string"}, "config": {"type": "object"} } },
+    "flowEdge": { "type": "object", "additionalProperties": false, "required": ["id", "sourceNodeId", "targetNodeId", "sourcePort", "targetPort"], "properties": { "id": {"type": "string"}, "sourceNodeId": {"type": "string"}, "targetNodeId": {"type": "string"}, "sourcePort": {"type": "string"}, "targetPort": {"type": "string"} } },
+    "componentContract": { "type": "object", "additionalProperties": false, "required": ["componentCode", "componentType", "configSchema", "inputSlots", "outputSlots", "capabilities"], "properties": { "componentCode": {"type": "string"}, "componentType": {"enum": ["START", "END", "IF", "MERGE", "SWITCH", "PARALLEL", "LOOP", "VARIABLE", "SCRIPT", "SUB_FLOW", "LOCK", "HTTP", "BUSINESS"]}, "executorRef": {"type": "string"}, "configSchema": {"type": "object"}, "inputSlots": {"type": "object", "additionalProperties": {"$ref": "#/$defs/protocolSchema"}}, "outputSlots": {"type": "object", "additionalProperties": {"$ref": "#/$defs/protocolSchema"}}, "capabilities": {"type": "object", "additionalProperties": false, "required": ["effect", "supportsTrial", "streaming", "retryable", "maxConcurrency"], "properties": {"effect": {"enum": ["PURE", "IDEMPOTENT", "SIDE_EFFECT"]}, "supportsTrial": {"type": "boolean"}, "streaming": {"type": "boolean"}, "retryable": {"type": "boolean"}, "maxConcurrency": {"type": "integer", "minimum": 1}}} } },
+    "protocolSchema": { "type": "object", "additionalProperties": false, "required": ["code", "version", "schema"], "properties": { "code": {"type": "string"}, "version": {"type": "string"}, "schema": {"type": "object"} } }
+  }
+}

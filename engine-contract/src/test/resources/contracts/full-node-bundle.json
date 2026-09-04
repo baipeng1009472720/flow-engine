@@ -1,0 +1,32 @@
+{
+  "contractVersion": "1.0",
+  "flowIdentity": { "tenantId": "tenant-a", "flowId": "flow-a", "version": "v7" },
+  "flowDefinition": {
+    "schemaVersion": "2.0",
+    "nodes": [
+      { "id": "n1", "componentCode": "builtin.start", "nodeCode": "start", "nodeName": "开始", "config": {} },
+      { "id": "n2", "componentCode": "builtin.end", "nodeCode": "end", "nodeName": "结束", "config": {} },
+      { "id": "n3", "componentCode": "builtin.if", "nodeCode": "if", "nodeName": "判断", "config": {} },
+      { "id": "n4", "componentCode": "legacy.merge", "nodeCode": "merge", "nodeName": "汇聚", "config": {} },
+      { "id": "n5", "componentCode": "legacy.switch", "nodeCode": "switch", "nodeName": "选择", "config": {} },
+      { "id": "n6", "componentCode": "builtin.parallel", "nodeCode": "parallel", "nodeName": "并行", "config": {} },
+      { "id": "n7", "componentCode": "builtin.loop", "nodeCode": "loopStart", "nodeName": "循环开始", "config": { "role": "START" } },
+      { "id": "n8", "componentCode": "builtin.loop", "nodeCode": "loopEnd", "nodeName": "循环结束", "config": { "role": "END" } },
+      { "id": "n9", "componentCode": "builtin.variable", "nodeCode": "variable", "nodeName": "变量", "config": {} },
+      { "id": "n10", "componentCode": "builtin.script", "nodeCode": "script", "nodeName": "脚本", "config": {} },
+      { "id": "n11", "componentCode": "builtin.subflow", "nodeCode": "subflow", "nodeName": "子流程", "config": {} },
+      { "id": "n12", "componentCode": "builtin.lock", "nodeCode": "lock", "nodeName": "锁", "config": { "role": "ACQUIRE" } },
+      { "id": "n13", "componentCode": "builtin.http", "nodeCode": "http", "nodeName": "HTTP", "config": {} },
+      { "id": "n14", "componentCode": "business.reward", "nodeCode": "business", "nodeName": "业务", "config": {} }
+    ],
+    "edges": [ { "id": "e1", "sourceNodeId": "n1", "targetNodeId": "n2", "sourcePort": "NEXT", "targetPort": "IN" } ]
+  },
+  "componentContracts": {
+    "legacy.merge": { "componentCode": "legacy.merge", "componentType": "MERGE", "configSchema": {}, "inputSlots": {}, "outputSlots": {}, "capabilities": { "effect": "PURE", "supportsTrial": true, "streaming": false, "retryable": false, "maxConcurrency": 1 } },
+    "legacy.switch": { "componentCode": "legacy.switch", "componentType": "SWITCH", "configSchema": {}, "inputSlots": {}, "outputSlots": {}, "capabilities": { "effect": "PURE", "supportsTrial": true, "streaming": false, "retryable": false, "maxConcurrency": 1 } }
+  },
+  "protocolSchemas": {},
+  "externalScopeSchemas": {},
+  "bundleHash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "trust": { "issuer": "playrewards", "keyId": "key-1", "signature": "opaque-signature" }
+}
