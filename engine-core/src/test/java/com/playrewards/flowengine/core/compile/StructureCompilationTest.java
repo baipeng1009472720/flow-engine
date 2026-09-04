@@ -6,6 +6,8 @@ import static com.playrewards.flowengine.core.compile.FlowCompilerTest.contract;
 import static com.playrewards.flowengine.core.compile.FlowCompilerTest.edge;
 import static com.playrewards.flowengine.core.compile.FlowCompilerTest.node;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.playrewards.flowengine.contract.bundle.CompiledComponentContract;
 import com.playrewards.flowengine.contract.bundle.ExecutableFlowBundle;
@@ -130,6 +132,45 @@ class StructureCompilationTest {
     }
 
     @Test
+    void accepts_an_inner_loop_inside_an_outer_loop() {
+        ExecutableFlowBundle bundle = nestedLoopBundle(false);
+
+        ExecutionPlan plan = new FlowCompiler().compile(bundle);
+
+        assertEquals("outerEnd", plan.loopPairs().get("outer"));
+        assertEquals("innerEnd", plan.loopPairs().get("inner"));
+        assertEquals(List.of("end", "inner"), plan.forwardAdjacency().get("outer"));
+        assertEquals(List.of("inner"), plan.forwardAdjacency().get("innerEnd"));
+    }
+
+    @Test
+    void rejects_a_real_outer_loop_boundary_bypass_through_an_inner_loop_done_path() {
+        FlowCompilationException failure = assertThrows(FlowCompilationException.class,
+                () -> new FlowCompiler().compile(nestedLoopBundle(true)));
+
+        assertTrue(failure.issues().stream().anyMatch(issue -> "FLOW_LOOP_BACK_EDGE_INVALID".equals(issue.code())
+                && "outer".equals(issue.nodeId())));
+    }
+
+    @Test
+    void rejects_a_real_inner_loop_body_boundary_bypass_without_blaming_the_outer_loop() {
+        FlowCompilationException failure = assertThrows(FlowCompilationException.class,
+                () -> new FlowCompiler().compile(nestedLoopWithInnerBoundaryBypass()));
+
+        assertTrue(failure.issues().stream().anyMatch(issue -> "FLOW_LOOP_BACK_EDGE_INVALID".equals(issue.code())
+                && "inner".equals(issue.nodeId())));
+        assertTrue(failure.issues().stream().noneMatch(issue -> "FLOW_LOOP_BACK_EDGE_INVALID".equals(issue.code())
+                && "outer".equals(issue.nodeId())));
+    }
+
+    @Test
+    void accepts_a_lock_region_containing_a_loop_and_rejects_a_real_release_bypass() {
+        new FlowCompiler().compile(lockContainingLoopBundle(false));
+
+        assertIssue(new FlowCompiler(), lockContainingLoopBundle(true), "FLOW_LOCK_RELEASE_BYPASS");
+    }
+
+    @Test
     void resolves_and_freezes_sub_flow_plan_but_rejects_direct_and_indirect_recursion() {
         ExecutableFlowBundle child = withIdentity(FlowCompilerTest.simpleBundle(), "child");
         ExecutableFlowBundle parent = subFlowBundle("parent", "child");
@@ -150,7 +191,7 @@ class StructureCompilationTest {
         assertIssue(new FlowCompiler(recursiveResolver), parent, "FLOW_SUB_FLOW_RECURSION");
     }
 
-    private static ExecutableFlowBundle subFlowBundle(String flowId, String targetFlowId) {
+    static ExecutableFlowBundle subFlowBundle(String flowId, String targetFlowId) {
         ExecutableFlowBundle raw = bundle(List.of(node("start", "builtin.start"), node("sub", "builtin.subflow"),
                         node("end", "builtin.end")),
                 List.of(edge("e1", "start", "sub", "NEXT", "IN"),
@@ -159,7 +200,7 @@ class StructureCompilationTest {
         return withIdentity(raw, flowId);
     }
 
-    private static ExecutableFlowBundle withIdentity(ExecutableFlowBundle bundle, String flowId) {
+    static ExecutableFlowBundle withIdentity(ExecutableFlowBundle bundle, String flowId) {
         ExecutableFlowBundle raw = new ExecutableFlowBundle(bundle.contractVersion(),
                 new FlowIdentity(bundle.flowIdentity().tenantId(), flowId, bundle.flowIdentity().version()),
                 bundle.flowDefinition(), bundle.componentContracts(), bundle.protocolSchemas(),
@@ -177,5 +218,59 @@ class StructureCompilationTest {
                 "builtin.lock", contract("builtin.lock", ComponentType.LOCK, null, Map.of(), Map.of()),
                 "builtin.subflow", contract("builtin.subflow", ComponentType.SUB_FLOW, null, Map.of(), Map.of()),
                 "builtin.work", contract("builtin.work", ComponentType.SCRIPT, null, Map.of(), Map.of()));
+    }
+
+    private static ExecutableFlowBundle nestedLoopBundle(boolean bypassOuterBoundary) {
+        Map<String, Map<String, Object>> configs = Map.of(
+                "outer", Map.of("role", "START", "pairNodeId", "outerEnd", "maxIterations", 10),
+                "outerEnd", Map.of("role", "END", "pairNodeId", "outer"),
+                "inner", Map.of("role", "START", "pairNodeId", "innerEnd", "maxIterations", 5),
+                "innerEnd", Map.of("role", "END", "pairNodeId", "inner"));
+        String innerDoneTarget = bypassOuterBoundary ? "end" : "afterInner";
+        return bundle(List.of(node("start", "builtin.start"), node("outer", "builtin.loop"),
+                        node("inner", "builtin.loop"), node("innerBody", "builtin.work"),
+                        node("innerEnd", "builtin.loop"), node("afterInner", "builtin.work"),
+                        node("outerEnd", "builtin.loop"), node("end", "builtin.end")),
+                List.of(edge("e1", "start", "outer", "NEXT", "ENTRY"),
+                        edge("e2", "outer", "inner", "BODY", "ENTRY"),
+                        edge("e3", "inner", "innerBody", "BODY", "IN"),
+                        edge("e4", "innerBody", "innerEnd", "NEXT", "IN"),
+                        edge("e5", "innerEnd", "inner", "NEXT", "NEXT"),
+                        edge("e6", "inner", innerDoneTarget, "DONE", "IN"),
+                        edge("e7", "afterInner", "outerEnd", "NEXT", "IN"),
+                        edge("e8", "outerEnd", "outer", "NEXT", "NEXT"),
+                        edge("e9", "outer", "end", "DONE", "IN")), baseContracts(), configs);
+    }
+
+    private static ExecutableFlowBundle lockContainingLoopBundle(boolean bypassRelease) {
+        Map<String, Map<String, Object>> configs = Map.of(
+                "acquire", Map.of("role", "ACQUIRE", "pairNodeId", "release"),
+                "release", Map.of("role", "RELEASE", "pairNodeId", "acquire"),
+                "loop", Map.of("role", "START", "pairNodeId", "loopEnd", "maxIterations", 4),
+                "loopEnd", Map.of("role", "END", "pairNodeId", "loop"));
+        String doneTarget = bypassRelease ? "end" : "release";
+        return bundle(List.of(node("start", "builtin.start"), node("acquire", "builtin.lock"),
+                        node("loop", "builtin.loop"), node("body", "builtin.work"),
+                        node("loopEnd", "builtin.loop"), node("release", "builtin.lock"),
+                        node("end", "builtin.end")),
+                List.of(edge("e1", "start", "acquire", "NEXT", "IN"),
+                        edge("e2", "acquire", "loop", "NEXT", "ENTRY"),
+                        edge("e3", "loop", "body", "BODY", "IN"),
+                        edge("e4", "body", "loopEnd", "NEXT", "IN"),
+                        edge("e5", "loopEnd", "loop", "NEXT", "NEXT"),
+                        edge("e6", "loop", doneTarget, "DONE", "IN"),
+                        edge("e7", "release", "end", "NEXT", "IN")), baseContracts(), configs);
+    }
+
+    private static ExecutableFlowBundle nestedLoopWithInnerBoundaryBypass() {
+        ExecutableFlowBundle valid = nestedLoopBundle(false);
+        List<com.playrewards.flowengine.contract.flow.FlowEdge> edges = new java.util.ArrayList<>(
+                valid.flowDefinition().edges());
+        edges.add(edge("innerBypass", "innerBody", "afterInner", "NEXT", "IN"));
+        ExecutableFlowBundle unhashed = new ExecutableFlowBundle(valid.contractVersion(), valid.flowIdentity(),
+                new com.playrewards.flowengine.contract.flow.FlowDefinition(
+                        valid.flowDefinition().schemaVersion(), valid.flowDefinition().nodes(), edges),
+                valid.componentContracts(), valid.protocolSchemas(), valid.externalScopeSchemas(), null, valid.trust());
+        return unhashed.withCalculatedHash();
     }
 }

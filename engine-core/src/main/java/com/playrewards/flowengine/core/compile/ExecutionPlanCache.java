@@ -48,15 +48,16 @@ public final class ExecutionPlanCache {
     public synchronized ExecutionPlan getOrCompile(ExecutableFlowBundle bundle, FlowCompiler compiler) {
         Objects.requireNonNull(bundle, "bundle must not be null");
         Objects.requireNonNull(compiler, "compiler must not be null");
-        Instant now = clock.instant();
-        evictExpired(now);
+        BundleHashValidator.validate(bundle);
+        Instant lookupTime = clock.instant();
+        evictExpired(lookupTime);
         Key key = new Key(bundle.flowIdentity(), bundle.bundleHash());
         Entry current = entries.get(key);
         if (current != null) {
             return current.plan();
         }
         ExecutionPlan plan = compiler.compile(bundle);
-        entries.put(key, new Entry(plan, now));
+        entries.put(key, new Entry(plan, clock.instant()));
         while (entries.size() > maxEntries) {
             Iterator<Key> iterator = entries.keySet().iterator();
             iterator.next();

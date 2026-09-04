@@ -11,6 +11,7 @@ import com.playrewards.flowengine.contract.bundle.OutputSlotContract;
 import com.playrewards.flowengine.contract.component.ComponentType;
 import com.playrewards.flowengine.contract.flow.FlowEdge;
 import com.playrewards.flowengine.contract.flow.FlowNode;
+import com.playrewards.flowengine.contract.json.JsonValues;
 import com.playrewards.flowengine.contract.protocol.ProtocolSchema;
 import com.playrewards.flowengine.core.compile.CompiledNode.InputBinding;
 import com.playrewards.flowengine.core.protocol.JsonSchemaCompatibility;
@@ -74,7 +75,7 @@ public final class FlowCompiler {
     private ExecutionPlan compile(ExecutableFlowBundle bundle, LinkedHashSet<FlowIdentity> ancestors,
             Map<FlowIdentity, ExecutionPlan> compiledPlans) {
         List<CompilationIssue> issues = new ArrayList<>();
-        validateHash(bundle, issues);
+        issues.addAll(BundleHashValidator.issues(bundle));
 
         List<FlowNode> nodes = bundle.flowDefinition().nodes().stream()
                 .sorted(Comparator.comparing(FlowNode::id).thenComparing(FlowNode::nodeCode))
@@ -113,18 +114,10 @@ public final class FlowCompiler {
         nodesById.forEach((id, node) -> compiledNodes.put(id, new CompiledNode(
                 node, contractsByNode.get(id), bindingsByNode.getOrDefault(id, Map.of()))));
         ExecutionPlan plan = new ExecutionPlan(bundle.flowIdentity(), bundle.bundleHash(), compiledNodes,
-                graph.forward(), graph.reverse(), graph.outgoingByPort(), graph.incomingByPort(),
-                graph.reverse(), loopPairs, lockPairs, subFlowPlans);
+                graph.rawForward(), graph.rawReverse(), graph.outgoingByPort(), graph.incomingByPort(),
+                graph.rawReverse(), loopPairs, lockPairs, subFlowPlans);
         compiledPlans.put(bundle.flowIdentity(), plan);
         return plan;
-    }
-
-    private static void validateHash(ExecutableFlowBundle bundle, List<CompilationIssue> issues) {
-        if (bundle.bundleHash() == null || bundle.bundleHash().isBlank()) {
-            issues.add(issue("FLOW_BUNDLE_HASH_REQUIRED", null, "bundleHash", "bundleHash 不能为空"));
-        } else if (!bundle.bundleHash().equals(bundle.calculateBundleHash())) {
-            issues.add(issue("FLOW_BUNDLE_HASH_MISMATCH", null, "bundleHash", "bundleHash 与规范化 bundle 内容不一致"));
-        }
     }
 
     private static Map<String, FlowNode> indexNodes(List<FlowNode> nodes, List<CompilationIssue> issues) {
@@ -221,7 +214,10 @@ public final class FlowCompiler {
             }
             try {
                 JSONSchema schema = JSONSchema.of(JSON.parseObject(JSON.toJSONString(contract.configSchema())));
-                ValidateResult result = schema.validate(node.config());
+                Map<String, Object> componentConfig = new LinkedHashMap<>(
+                        JsonValues.copyObject(node.config(), "node config"));
+                componentConfig.remove("inputBindings");
+                ValidateResult result = schema.validate(componentConfig);
                 if (!result.isSuccess()) {
                     issues.add(issue("FLOW_NODE_CONFIG_INVALID", node.id(), "config", result.getMessage()));
                 }
@@ -266,8 +262,10 @@ public final class FlowCompiler {
     private static Graph inspectGraph(Map<String, FlowNode> nodes, List<FlowEdge> edges,
             Map<String, CompiledComponentContract> contracts, Map<String, String> loopPairs,
             List<CompilationIssue> issues) {
-        Map<String, List<String>> forward = initializedListMap(nodes.keySet());
-        Map<String, List<String>> reverse = initializedListMap(nodes.keySet());
+        Map<String, List<String>> rawForward = initializedListMap(nodes.keySet());
+        Map<String, List<String>> rawReverse = initializedListMap(nodes.keySet());
+        Map<String, List<String>> controlForward = initializedListMap(nodes.keySet());
+        Map<String, List<String>> controlReverse = initializedListMap(nodes.keySet());
         Map<String, Map<String, List<String>>> outgoingByPort = initializedNestedMap(nodes.keySet());
         Map<String, Map<String, List<String>>> incomingByPort = initializedNestedMap(nodes.keySet());
         Set<String> edgeIds = new HashSet<>();
@@ -301,19 +299,46 @@ public final class FlowCompiler {
                     .add(target.id());
             incomingByPort.get(target.id()).computeIfAbsent(edge.targetPort(), ignored -> new ArrayList<>())
                     .add(source.id());
+            rawForward.get(source.id()).add(target.id());
+            rawReverse.get(target.id()).add(source.id());
             if (!isLoopBack(edge, source, target, loopPairs)) {
-                forward.get(source.id()).add(target.id());
-                reverse.get(target.id()).add(source.id());
+                controlForward.get(source.id()).add(target.id());
+                controlReverse.get(target.id()).add(source.id());
             }
         }
-        sortIndexes(forward);
-        sortIndexes(reverse);
+        reconnectLoopCompletions(nodes, loopPairs, outgoingByPort, controlForward, controlReverse);
+        sortIndexes(rawForward);
+        sortIndexes(rawReverse);
+        sortIndexes(controlForward);
+        sortIndexes(controlReverse);
         outgoingByPort.values().forEach(FlowCompiler::sortIndexes);
         incomingByPort.values().forEach(FlowCompiler::sortIndexes);
-        if (!isAcyclic(nodes.keySet(), forward, reverse)) {
+        if (!isAcyclic(nodes.keySet(), controlForward, controlReverse)) {
             issues.add(issue("FLOW_GRAPH_CYCLE", null, "edges", "流程存在非 LOOP 环路"));
         }
-        return new Graph(forward, reverse, outgoingByPort, incomingByPort);
+        return new Graph(rawForward, rawReverse, controlForward, controlReverse,
+                outgoingByPort, incomingByPort);
+    }
+
+    private static void reconnectLoopCompletions(Map<String, FlowNode> nodes, Map<String, String> loopPairs,
+            Map<String, Map<String, List<String>>> outgoingByPort,
+            Map<String, List<String>> controlForward, Map<String, List<String>> controlReverse) {
+        for (FlowNode loopEnd : nodes.values()) {
+            if (!"END".equals(text(loopEnd.config().get("role")))) {
+                continue;
+            }
+            String loopStartId = loopPairs.get(loopEnd.id());
+            if (loopStartId == null) {
+                continue;
+            }
+            for (String doneTarget : outgoingByPort.getOrDefault(loopStartId, Map.of())
+                    .getOrDefault("DONE", List.of())) {
+                if (!controlForward.get(loopEnd.id()).contains(doneTarget)) {
+                    controlForward.get(loopEnd.id()).add(doneTarget);
+                    controlReverse.get(doneTarget).add(loopEnd.id());
+                }
+            }
+        }
     }
 
     private static void validateStartEndAndReachability(Map<String, FlowNode> nodes,
@@ -328,11 +353,11 @@ public final class FlowCompiler {
         }
         if (starts.size() == 1) {
             FlowNode start = starts.getFirst();
-            if (!graph.reverse().getOrDefault(start.id(), List.of()).isEmpty()
+            if (!graph.rawReverse().getOrDefault(start.id(), List.of()).isEmpty()
                     || !graph.incomingByPort().getOrDefault(start.id(), Map.of()).isEmpty()) {
                 issues.add(issue("FLOW_START_INCOMING_EDGE", start.id(), "edges", "START 不允许存在入边"));
             }
-            Set<String> reachable = reachable(start.id(), graph.forward());
+            Set<String> reachable = reachable(start.id(), graph.controlForward());
             for (FlowNode node : nodes.values()) {
                 if (!reachable.contains(node.id())) {
                     issues.add(issue("FLOW_NODE_UNREACHABLE", node.id(), "id", "节点无法从 START 到达"));
@@ -394,12 +419,12 @@ public final class FlowCompiler {
             boolean validBack = loop.id().equals(backTarget) && startIn.get("NEXT").contains(end.id());
             String bodyTarget = startOut.get("BODY").getFirst();
             String doneTarget = startOut.get("DONE").getFirst();
-            if (!validBack || !allPathsReach(bodyTarget, end.id(), graph.forward(), new HashSet<>())
-                    || reachable(doneTarget, graph.forward()).contains(end.id())) {
+            if (!validBack || !allPathsReach(bodyTarget, end.id(), graph.controlForward(), new HashSet<>())
+                    || reachable(doneTarget, graph.controlForward()).contains(end.id())) {
                 issues.add(issue("FLOW_LOOP_BACK_EDGE_INVALID", loop.id(), "edges",
                         "循环体必须到达配套 LOOP END，且只允许固定 NEXT 回边"));
             }
-            Set<String> bodyNodes = nodesBefore(bodyTarget, end.id(), graph.forward());
+            Set<String> bodyNodes = nodesBefore(bodyTarget, end.id(), graph.controlForward());
             boolean forbiddenBoundary = bodyNodes.stream().map(nodes::get)
                     .filter(Objects::nonNull)
                     .map(node -> type(node, contracts))
@@ -433,9 +458,9 @@ public final class FlowCompiler {
             }
             pairs.put(lock.id(), pair.id());
             if ("ACQUIRE".equals(role)) {
-                List<String> exits = graph.forward().getOrDefault(lock.id(), List.of());
+                List<String> exits = graph.controlForward().getOrDefault(lock.id(), List.of());
                 if (exits.isEmpty() || exits.stream().anyMatch(
-                        next -> !allPathsReach(next, pair.id(), graph.forward(), new HashSet<>()))) {
+                        next -> !allPathsReach(next, pair.id(), graph.controlForward(), new HashSet<>()))) {
                     issues.add(issue("FLOW_LOCK_RELEASE_BYPASS", lock.id(), "config.pairNodeId",
                             "临界区所有出口必须经过对应 RELEASE"));
                 }
@@ -450,7 +475,7 @@ public final class FlowCompiler {
         String startId = nodes.values().stream().filter(node -> type(node, contracts) == ComponentType.START)
                 .map(FlowNode::id).findFirst().orElse(null);
         Map<String, Set<String>> dominators = startId == null
-                ? Map.of() : dominators(startId, nodes.keySet(), graph.reverse());
+                ? Map.of() : dominators(startId, nodes.keySet(), graph.controlReverse());
         Map<String, Map<String, InputBinding>> result = new TreeMap<>();
         for (FlowNode target : nodes.values()) {
             CompiledComponentContract targetContract = contracts.get(target.id());
@@ -776,8 +801,10 @@ public final class FlowCompiler {
     }
 
     private record Graph(
-            Map<String, List<String>> forward,
-            Map<String, List<String>> reverse,
+            Map<String, List<String>> rawForward,
+            Map<String, List<String>> rawReverse,
+            Map<String, List<String>> controlForward,
+            Map<String, List<String>> controlReverse,
             Map<String, Map<String, List<String>>> outgoingByPort,
             Map<String, Map<String, List<String>>> incomingByPort) {
     }

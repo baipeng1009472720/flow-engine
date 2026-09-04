@@ -35,20 +35,23 @@ public final class JsonSchemaCompatibility {
         if (!SUPPORTED.containsAll(source.keySet()) || !SUPPORTED.containsAll(target.keySet())) {
             return false;
         }
-        if (!typeAssignable(source.get("type"), target.get("type"))) {
+        Set<String> sourceTypes = typeSet(source.get("type"));
+        Set<String> targetTypes = typeSet(target.get("type"));
+        if (!typeAssignable(sourceTypes, targetTypes)) {
             return false;
         }
         if (!enumAssignable(source, target) || !boundsAssignable(source, target)) {
             return false;
         }
-        String targetType = target.get("type") instanceof String value ? value : null;
-        if ("object".equals(targetType)) {
-            return objectAssignable(source, target);
+        if (sourceTypes != null && sourceTypes.contains("object") && !objectAssignable(source, target)) {
+            return false;
         }
-        if ("array".equals(targetType) && target.containsKey("items")) {
-            return source.get("items") instanceof Map<?, ?> sourceItems
+        if (sourceTypes != null && sourceTypes.contains("array") && target.containsKey("items")) {
+            if (!(source.get("items") instanceof Map<?, ?> sourceItems
                     && target.get("items") instanceof Map<?, ?> targetItems
-                    && isAssignable(stringMap(sourceItems), stringMap(targetItems));
+                    && isAssignable(stringMap(sourceItems), stringMap(targetItems)))) {
+                return false;
+            }
         }
         return true;
     }
@@ -102,16 +105,11 @@ public final class JsonSchemaCompatibility {
         return true;
     }
 
-    private static boolean typeAssignable(Object source, Object target) {
-        if (target == null) {
+    private static boolean typeAssignable(Set<String> sourceTypes, Set<String> targetTypes) {
+        if (targetTypes == null) {
             return true;
         }
-        if (source == null) {
-            return false;
-        }
-        Set<String> sourceTypes = typeSet(source);
-        Set<String> targetTypes = typeSet(target);
-        if (sourceTypes == null || targetTypes == null) {
+        if (sourceTypes == null) {
             return false;
         }
         return sourceTypes.stream().allMatch(sourceType -> targetTypes.contains(sourceType)
@@ -119,6 +117,9 @@ public final class JsonSchemaCompatibility {
     }
 
     private static Set<String> typeSet(Object value) {
+        if (value == null) {
+            return null;
+        }
         if (value instanceof String text) {
             return Set.of(text);
         }

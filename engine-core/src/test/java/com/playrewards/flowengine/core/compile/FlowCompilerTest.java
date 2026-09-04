@@ -169,6 +169,35 @@ class FlowCompilerTest {
         assertTrue(hasIssue(failure, "FLOW_INPUT_PROTOCOL_MISMATCH"));
     }
 
+    @Test
+    void excludes_engine_input_bindings_from_strict_component_config_schema_only() {
+        CompiledComponentContract work = new CompiledComponentContract(
+                "business.work", ComponentType.BUSINESS, "workExecutor",
+                Map.of("type", "object", "additionalProperties", false,
+                        "required", List.of("mode"),
+                        "properties", Map.of("mode", Map.of("type", "string"))),
+                Map.of("order", input("订单", true, ORDER)), Map.of(), capabilities());
+        List<FlowNode> nodes = List.of(node("start", "builtin.start"), node("work", "business.work"),
+                node("end", "builtin.end"));
+        List<FlowEdge> edges = List.of(edge("e1", "start", "work", "NEXT", "IN"),
+                edge("e2", "work", "end", "NEXT", "IN"));
+        Map<String, CompiledComponentContract> contracts = Map.of(
+                "builtin.start", contract("builtin.start", ComponentType.START, null, Map.of(),
+                        Map.of("order", output("订单", ORDER))),
+                "business.work", work,
+                "builtin.end", contract("builtin.end", ComponentType.END, null, Map.of(), Map.of()));
+        Map<String, Object> validConfig = Map.of("mode", "strict", "inputBindings",
+                List.of(binding("order", "start", "order")));
+
+        ExecutionPlan plan = new FlowCompiler().compile(bundle(nodes, edges, contracts, Map.of("work", validConfig)));
+        assertTrue(plan.nodesById().get("work").inputBindings().containsKey("order"));
+
+        Map<String, Object> unknownConfig = Map.of("mode", "strict", "unexpected", true, "inputBindings",
+                List.of(binding("order", "start", "order")));
+        assertIssue(new FlowCompiler(), bundle(nodes, edges, contracts, Map.of("work", unknownConfig)),
+                "FLOW_NODE_CONFIG_INVALID");
+    }
+
     private static ExecutableFlowBundle linearBundle(CompiledComponentContract work, Map<String, Object> workConfig) {
         return bundle(List.of(node("start", "builtin.start"),
                         new FlowNode("work", "business.work", "work", "work", workConfig),
