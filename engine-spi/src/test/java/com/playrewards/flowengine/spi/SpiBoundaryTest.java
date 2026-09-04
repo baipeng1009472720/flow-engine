@@ -208,6 +208,27 @@ class SpiBoundaryTest {
     }
 
     @Test
+    void script_invocation_counts_null_map_keys_before_copying_or_building_field_paths() {
+        Map<String, Object> longKeyValues = new java.util.LinkedHashMap<>();
+        longKeyValues.put("k".repeat(1_048_575), null);
+        IllegalArgumentException tokenFailure = assertThrows(IllegalArgumentException.class,
+                () -> new ScriptRuntime.ScriptInvocation("return true",
+                        Map.of("play", longKeyValues), Map.of(), ExecutionLogger.NOOP,
+                        () -> false, Instant.now().plusSeconds(1)));
+        assertEquals("script invocation context exceeds the hard resource limit", tokenFailure.getMessage());
+
+        Map<String, Object> manyNullKeys = new java.util.LinkedHashMap<>();
+        for (int index = 0; index < 6; index++) {
+            manyNullKeys.put("k".repeat(700_000) + index, null);
+        }
+        IllegalArgumentException totalFailure = assertThrows(IllegalArgumentException.class,
+                () -> new ScriptRuntime.ScriptInvocation("return true",
+                        Map.of("play", manyNullKeys), Map.of(), ExecutionLogger.NOOP,
+                        () -> false, Instant.now().plusSeconds(1)));
+        assertEquals("script invocation context exceeds the hard resource limit", totalFailure.getMessage());
+    }
+
+    @Test
     void script_invocation_uses_encoded_json_bytes_before_copying_escaped_input() {
         String exactToken = "\n".repeat(524_287);
         assertDoesNotThrow(() -> new ScriptRuntime.ScriptInvocation("return true",

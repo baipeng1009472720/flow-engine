@@ -3,6 +3,9 @@ package com.playrewards.flowengine.core.protocol;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.management.ManagementFactory;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -38,6 +41,13 @@ class JsonSchemaCompatibilityTest {
                 Map.of("type", "array", "items", Map.of("type", "string")),
                 Map.of("type", "array", "items", Map.of("type", "string"))));
         assertFalse(compatibility.isAssignable(Map.of("type", "number"), Map.of("type", "integer")));
+    }
+
+    @Test
+    void float_bounds_keep_their_canonical_decimal_semantics() {
+        assertFalse(compatibility.isAssignable(
+                Map.of("type", "number", "minimum", 0.1f),
+                Map.of("type", "number", "minimum", new BigDecimal("0.100000001"))));
     }
 
     @Test
@@ -110,5 +120,26 @@ class JsonSchemaCompatibilityTest {
 
         assertTrue(compatibility.isAssignable(objectSchema, objectSchema));
         assertTrue(compatibility.isAssignable(arraySchema, arraySchema));
+    }
+
+    @Test
+    void compares_inflated_big_decimal_bounds_without_rendering_number_text() {
+        BigDecimal uncachedPrecision = new BigDecimal(
+                BigInteger.ONE.shiftLeft(2_000_000).subtract(BigInteger.ONE), 0);
+        com.sun.management.ThreadMXBean memory =
+                (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+        assertTrue(memory.isThreadAllocatedMemorySupported());
+        memory.setThreadAllocatedMemoryEnabled(true);
+        compatibility.isAssignable(Map.of("type", "number", "minimum", 1),
+                Map.of("type", "number", "minimum", 0));
+
+        long before = memory.getThreadAllocatedBytes(Thread.currentThread().threadId());
+        assertTrue(compatibility.isAssignable(
+                Map.of("type", "number", "minimum", uncachedPrecision),
+                Map.of("type", "number", "minimum", BigInteger.ONE)));
+        long allocated = memory.getThreadAllocatedBytes(Thread.currentThread().threadId()) - before;
+
+        assertTrue(allocated < 131_072,
+                () -> "schema number comparison allocated " + allocated + " bytes");
     }
 }

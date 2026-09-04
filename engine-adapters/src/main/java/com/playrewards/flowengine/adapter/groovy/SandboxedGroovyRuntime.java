@@ -846,11 +846,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
 
     /** Upper-bounds the digits a numeric operation may need without materializing numeric text. */
     private static long numericAllocationBytes(Number value) {
-        if (value instanceof BigDecimal decimal) {
-            long scaleMagnitude = Math.abs((long) decimal.scale());
-            return saturatedAdd(saturatedAdd(decimal.precision(), scaleMagnitude), 3);
-        }
-        return JsonValues.javaNumberTextUpperBoundBytes(value);
+        return JsonValues.numericOperationWorkspaceUpperBoundBytes(value);
     }
 
     /** Allocation and Unicode work reserved before scalar text construction. */
@@ -1345,10 +1341,11 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                 return;
             }
             if (value instanceof Number number) {
-                if (numericAllocationBytes(number) > maxBytes) {
+                try {
+                    addBytes(JsonValues.jsonEncodedNumberBytes(number, maxBytes));
+                } catch (JsonValues.JsonResourceLimitException failure) {
                     tooLarge("script result exceeds the configured numeric workspace limit");
                 }
-                addBytes(JsonValues.jsonEncodedNumberBytes(number));
                 return;
             }
             if (value instanceof Map<?, ?> map) {
@@ -1521,7 +1518,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                 return new JsonMeasure(5, 1);
             }
             if (value instanceof Number number) {
-                return new JsonMeasure(numericAllocationBytes(number), 1);
+                return new JsonMeasure(JsonValues.jsonNumberWorkspaceUpperBoundBytes(number), 1);
             }
             if (value instanceof Map<?, ?> map) {
                 long bytes = 2;

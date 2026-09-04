@@ -551,6 +551,16 @@ class SandboxedGroovyRuntimeTest {
     }
 
     @Test
+    void result_uses_exact_number_bytes_after_a_bounded_near_boundary_preflight() throws Exception {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 3, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+            assertEquals(new java.math.BigInteger("512"), await(runtime.execute(invocation(
+                    "return play.value", Map.of("play", Map.of("value", new java.math.BigInteger("512"))),
+                    Map.of(), entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+        }
+    }
+
+    @Test
     void large_big_integer_operations_preflight_before_rendering_decimal_text() throws Exception {
         try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
                 Duration.ofSeconds(1), 10_000, 64, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
@@ -579,6 +589,28 @@ class SandboxedGroovyRuntimeTest {
             assertEquals(29, await(runtime.execute(invocation("return 29", Map.of(), Map.of(),
                     entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
         }
+    }
+
+    @Test
+    void runtime_numeric_preflight_reuses_allocation_free_big_decimal_workspace_estimate()
+            throws Exception {
+        java.lang.reflect.Method preflight = SandboxedGroovyRuntime.class
+                .getDeclaredMethod("numericAllocationBytes", Number.class);
+        preflight.setAccessible(true);
+        preflight.invoke(null, java.math.BigDecimal.ONE);
+        java.math.BigDecimal uncachedPrecision = new java.math.BigDecimal(
+                java.math.BigInteger.ONE.shiftLeft(2_000_000).subtract(java.math.BigInteger.ONE), 0);
+        com.sun.management.ThreadMXBean memory = (com.sun.management.ThreadMXBean)
+                java.lang.management.ManagementFactory.getThreadMXBean();
+        memory.setThreadAllocatedMemoryEnabled(true);
+
+        long before = memory.getThreadAllocatedBytes(Thread.currentThread().threadId());
+        long estimate = (long) preflight.invoke(null, uncachedPrecision);
+        long allocated = memory.getThreadAllocatedBytes(Thread.currentThread().threadId()) - before;
+
+        assertTrue(estimate > 64);
+        assertTrue(allocated < 131_072,
+                () -> "runtime number preflight allocated " + allocated + " bytes");
     }
 
     @Test

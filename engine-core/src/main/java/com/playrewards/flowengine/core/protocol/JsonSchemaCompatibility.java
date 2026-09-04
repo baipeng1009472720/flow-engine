@@ -1,6 +1,8 @@
 package com.playrewards.flowengine.core.protocol;
 
+import com.playrewards.flowengine.contract.json.JsonValues;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.Map;
@@ -164,20 +166,52 @@ public final class JsonSchemaCompatibility {
         if (!(target.get(key) instanceof Number targetValue)) {
             return true;
         }
-        return source.get(key) instanceof Number sourceValue
-                && decimal(sourceValue).compareTo(decimal(targetValue)) >= 0;
+        if (!(source.get(key) instanceof Number sourceValue)) {
+            return false;
+        }
+        BigDecimal sourceDecimal = decimal(sourceValue);
+        BigDecimal targetDecimal = decimal(targetValue);
+        return sourceDecimal != null && targetDecimal != null
+                && sourceDecimal.compareTo(targetDecimal) >= 0;
     }
 
     private static boolean upperBound(Map<String, Object> source, Map<String, Object> target, String key) {
         if (!(target.get(key) instanceof Number targetValue)) {
             return true;
         }
-        return source.get(key) instanceof Number sourceValue
-                && decimal(sourceValue).compareTo(decimal(targetValue)) <= 0;
+        if (!(source.get(key) instanceof Number sourceValue)) {
+            return false;
+        }
+        BigDecimal sourceDecimal = decimal(sourceValue);
+        BigDecimal targetDecimal = decimal(targetValue);
+        return sourceDecimal != null && targetDecimal != null
+                && sourceDecimal.compareTo(targetDecimal) <= 0;
     }
 
     private static BigDecimal decimal(Number value) {
-        return new BigDecimal(value.toString());
+        try {
+            if (!JsonValues.isNumberWorkspaceSafelyBounded(value)) {
+                return null;
+            }
+        } catch (IllegalArgumentException failure) {
+            return null;
+        }
+        if (value instanceof BigDecimal decimal) {
+            return decimal;
+        }
+        if (value instanceof BigInteger integer) {
+            return new BigDecimal(integer);
+        }
+        if (value instanceof Byte || value instanceof Short
+                || value instanceof Integer || value instanceof Long) {
+            return BigDecimal.valueOf(value.longValue());
+        }
+        if (value instanceof Float floating) {
+            // Float.toString is fixed-size and preserves the schema value's canonical decimal
+            // semantics; widening to double first would manufacture additional significant digits.
+            return new BigDecimal(Float.toString(floating));
+        }
+        return BigDecimal.valueOf(value.doubleValue());
     }
 
     private static Set<String> strings(Object value) {

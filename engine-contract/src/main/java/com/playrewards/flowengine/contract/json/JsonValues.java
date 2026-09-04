@@ -18,6 +18,12 @@ import java.util.Objects;
  */
 public final class JsonValues {
 
+    private static final long MAX_EXACT_NUMBER_WORKSPACE_BYTES = 4_194_304;
+    private static final long NUMBER_ESTIMATE_SLACK_BYTES = 16;
+    private static final long LOG10_2_LOWER_NUMERATOR = 3_010_299;
+    private static final long LOG10_2_UPPER_NUMERATOR = 3_010_300;
+    private static final long LOG10_2_DENOMINATOR = 10_000_000;
+
     private JsonValues() {
     }
 
@@ -87,15 +93,16 @@ public final class JsonValues {
     }
 
     /**
-     * Measures several independent JSON roots without materializing their serialized byte arrays.
+     * Measures several independent JSON roots before copying or serializing their contents.
      *
-     * <p>The encoded-byte calculation matches Fastjson2's default UTF-8 string escaping, including
-     * quotes, short control escapes, Unicode surrogate pairs and replacement of unmatched
-     * surrogates. Limits are checked incrementally with saturated arithmetic.</p>
+     * <p>The admission footprint uses JSON encoding rules but deliberately counts every map entry,
+     * including null-valued entries which Fastjson2 may omit by default. This is a memory-safety
+     * boundary, not a promise about a serializer's null omission policy. Limits are checked
+     * incrementally with saturated arithmetic before callers build copied field paths.</p>
      *
-     * @param roots independent JSON-compatible values whose encoded sizes are added together
+     * @param roots independent JSON-compatible values whose admission footprints are added together
      * @param limits finite byte, token, depth and node limits
-     * @return exact encoded bytes and visited value nodes
+     * @return conservative admission bytes and visited value nodes
      * @throws JsonResourceLimitException when any configured limit is exceeded
      * @throws IllegalArgumentException when a root is not part of the supported JSON value subset
      */
@@ -228,11 +235,35 @@ public final class JsonValues {
      * @return ASCII bytes in its serialized representation
      */
     public static long jsonEncodedNumberBytes(Number value) {
+        return jsonEncodedNumberBytes(value, MAX_EXACT_NUMBER_WORKSPACE_BYTES);
+    }
+
+    /**
+     * Returns exact Fastjson2 number bytes only after its numeric workspace fits a finite bound.
+     *
+     * @param value supported JSON number
+     * @param maxWorkspaceBytes maximum logical digits/text workspace admitted before exact work
+     * @return exact ASCII bytes in the Fastjson2 representation
+     * @throws JsonResourceLimitException when exact calculation is not proven bounded
+     */
+    public static long jsonEncodedNumberBytes(Number value, long maxWorkspaceBytes) {
         validateJsonNumber(value);
-        if (value instanceof BigDecimal decimal) {
-            return fastjsonBigDecimalBytes(decimal);
+        requireNumberWorkspace(maxWorkspaceBytes);
+        long boundedWorkspace = Math.min(MAX_EXACT_NUMBER_WORKSPACE_BYTES,
+                saturatedAdd(maxWorkspaceBytes, NUMBER_ESTIMATE_SLACK_BYTES));
+        if (jsonNumberWorkspaceUpperBoundBytes(value) > boundedWorkspace) {
+            throw new JsonResourceLimitException();
         }
-        return value.toString().length();
+        long encodedBytes;
+        if (value instanceof BigDecimal decimal) {
+            encodedBytes = fastjsonBigDecimalBytes(decimal);
+        } else {
+            encodedBytes = value.toString().length();
+        }
+        if (encodedBytes > maxWorkspaceBytes) {
+            throw new JsonResourceLimitException();
+        }
+        return encodedBytes;
     }
 
     /**
@@ -246,6 +277,9 @@ public final class JsonValues {
      */
     public static long javaNumberTextBytes(Number value) {
         validateJsonNumber(value);
+        if (javaNumberTextUpperBoundBytes(value) > MAX_EXACT_NUMBER_WORKSPACE_BYTES) {
+            throw new JsonResourceLimitException();
+        }
         if (value instanceof BigDecimal decimal) {
             return javaBigDecimalTextBytes(decimal);
         }
@@ -264,13 +298,58 @@ public final class JsonValues {
     public static long javaNumberTextUpperBoundBytes(Number value) {
         validateJsonNumber(value);
         if (value instanceof BigInteger integer) {
-            long digits = saturatedAdd(saturatedMultiply(integer.bitLength(), 30_103L) / 100_000L, 1);
-            return saturatedAdd(digits, integer.signum() < 0 ? 1 : 0);
+            return signedDigitsUpperBound(integer);
         }
         if (value instanceof BigDecimal decimal) {
-            return javaBigDecimalTextBytes(decimal);
+            return javaBigDecimalWorkspaceUpperBoundBytes(decimal);
         }
-        return value.toString().length();
+        return primitiveNumberTextUpperBoundBytes(value);
+    }
+
+    /**
+     * Upper-bounds Fastjson2 number encoding and any precision workspace without calling
+     * {@link BigDecimal#precision()} or rendering decimal text.
+     *
+     * @param value supported JSON number
+     * @return saturated logical workspace bytes
+     */
+    public static long jsonNumberWorkspaceUpperBoundBytes(Number value) {
+        validateJsonNumber(value);
+        if (value instanceof BigDecimal decimal) {
+            DigitBounds digits = decimalDigitBounds(decimal.unscaledValue());
+            long javaWorkspace = javaBigDecimalWorkspaceUpperBoundBytes(decimal, digits);
+            long scaleWorkspace = saturatedAdd(
+                    saturatedAdd(digits.upper(), Math.abs((long) decimal.scale())), 3);
+            return Math.max(javaWorkspace, scaleWorkspace);
+        }
+        return javaNumberTextUpperBoundBytes(value);
+    }
+
+    /**
+     * Upper-bounds numeric arithmetic workspace from magnitude and scale without exact precision.
+     *
+     * @param value supported JSON number
+     * @return saturated logical workspace bytes for an allocating numeric operation
+     */
+    public static long numericOperationWorkspaceUpperBoundBytes(Number value) {
+        validateJsonNumber(value);
+        if (value instanceof BigDecimal decimal) {
+            return saturatedAdd(
+                    saturatedAdd(decimalDigitBounds(decimal.unscaledValue()).upper(),
+                            Math.abs((long) decimal.scale())),
+                    3);
+        }
+        return javaNumberTextUpperBoundBytes(value);
+    }
+
+    /**
+     * Returns whether shared numeric comparison/formatting may proceed under the absolute gate.
+     *
+     * @param value supported JSON number
+     * @return true only when magnitude and scale prove subsequent bounded work safe
+     */
+    public static boolean isNumberWorkspaceSafelyBounded(Number value) {
+        return jsonNumberWorkspaceUpperBoundBytes(value) <= MAX_EXACT_NUMBER_WORKSPACE_BYTES;
     }
 
     private static void validateJsonNumber(Number value) {
@@ -285,6 +364,77 @@ public final class JsonValues {
                 && value.getClass() != BigDecimal.class && value.getClass() != BigInteger.class) {
             throw new IllegalArgumentException("number type is outside the JSON value subset");
         }
+    }
+
+    private static void requireNumberWorkspace(long maxWorkspaceBytes) {
+        if (maxWorkspaceBytes < 1) {
+            throw new IllegalArgumentException("number workspace limit must be positive");
+        }
+    }
+
+    private static long primitiveNumberTextUpperBoundBytes(Number value) {
+        // Primitive wrapper text is intrinsically bounded (at most a few dozen bytes), so exact
+        // sizing cannot become an attacker-controlled large allocation.
+        return value.toString().length();
+    }
+
+    private static long signedDigitsUpperBound(BigInteger value) {
+        DigitBounds digits = decimalDigitBounds(value);
+        return saturatedAdd(digits.upper(), value.signum() < 0 ? 1 : 0);
+    }
+
+    private static DigitBounds decimalDigitBounds(BigInteger value) {
+        if (value.signum() == 0) {
+            return new DigitBounds(1, 1);
+        }
+        long bitLength = value.bitLength();
+        long magnitudeUpperBits = saturatedAdd(bitLength, value.signum() < 0 ? 1 : 0);
+        long upper = saturatedAdd(
+                saturatedMultiply(magnitudeUpperBits, LOG10_2_UPPER_NUMERATOR)
+                        / LOG10_2_DENOMINATOR,
+                1);
+        long lowerBits = Math.max(0, bitLength - 1);
+        long lower = saturatedAdd(
+                saturatedMultiply(lowerBits, LOG10_2_LOWER_NUMERATOR)
+                        / LOG10_2_DENOMINATOR,
+                1);
+        return new DigitBounds(Math.min(lower, upper), upper);
+    }
+
+    private static long javaBigDecimalWorkspaceUpperBoundBytes(BigDecimal value) {
+        return javaBigDecimalWorkspaceUpperBoundBytes(value, decimalDigitBounds(value.unscaledValue()));
+    }
+
+    private static long javaBigDecimalWorkspaceUpperBoundBytes(
+            BigDecimal value, DigitBounds digits) {
+        long textUpper = Math.max(
+                javaBigDecimalTextBytes(value.signum(), value.scale(), digits.lower()),
+                javaBigDecimalTextBytes(value.signum(), value.scale(), digits.upper()));
+        long transitionPrecision = (long) value.scale() - 5;
+        if (transitionPrecision >= digits.lower() && transitionPrecision <= digits.upper()) {
+            textUpper = Math.max(textUpper,
+                    javaBigDecimalTextBytes(value.signum(), value.scale(), transitionPrecision));
+            if (transitionPrecision > digits.lower()) {
+                textUpper = Math.max(textUpper,
+                        javaBigDecimalTextBytes(
+                                value.signum(), value.scale(), transitionPrecision - 1));
+            }
+        }
+        return Math.max(textUpper, digits.upper());
+    }
+
+    private static long javaBigDecimalTextBytes(int signum, int scale, long precision) {
+        long sign = signum < 0 ? 1 : 0;
+        long scaleOffset = -((long) scale) - 1;
+        long adjustedExponent = scaleOffset >= 0
+                ? saturatedAdd(precision, scaleOffset)
+                : precision + scaleOffset;
+        if (scale >= 0 && adjustedExponent >= -6) {
+            return saturatedAdd(sign, plainDecimalBytes(precision, scale));
+        }
+        long mantissa = saturatedAdd(precision, precision > 1 ? 1 : 0);
+        long exponentDigits = decimalDigits(Math.abs(adjustedExponent));
+        return saturatedAdd(sign, saturatedAdd(mantissa, saturatedAdd(2, exponentDigits)));
     }
 
     /** Computes Fastjson2's default BigDecimal text length without materializing plain decimal text. */
@@ -303,15 +453,7 @@ public final class JsonValues {
 
     private static long javaBigDecimalTextBytes(BigDecimal value) {
         long precision = value.precision();
-        long sign = value.signum() < 0 ? 1 : 0;
-        int scale = value.scale();
-        long adjustedExponent = -((long) scale) + precision - 1;
-        if (scale >= 0 && adjustedExponent >= -6) {
-            return saturatedAdd(sign, plainDecimalBytes(precision, scale));
-        }
-        long mantissa = saturatedAdd(precision, precision > 1 ? 1 : 0);
-        long exponentDigits = decimalDigits(Math.abs(adjustedExponent));
-        return saturatedAdd(sign, saturatedAdd(mantissa, saturatedAdd(2, exponentDigits)));
+        return javaBigDecimalTextBytes(value.signum(), value.scale(), precision);
     }
 
     private static long plainDecimalBytes(long precision, long scale) {
@@ -342,12 +484,15 @@ public final class JsonValues {
         }
     }
 
-    /** Exact resource usage for all measured roots. */
+    /** Conservative admission resource usage for all measured roots. */
     public record JsonResourceUsage(long encodedBytes, int nodes) {
     }
 
     /** Exact JSON string content resources across one or more concatenated source parts. */
     public record JsonStringUsage(long contentBytes, long codePoints) {
+    }
+
+    private record DigitBounds(long lower, long upper) {
     }
 
     /** Stable limit failure which never embeds a JSON key or value. */
@@ -385,12 +530,7 @@ public final class JsonValues {
                 return;
             }
             if (value instanceof Number number) {
-                validateJsonNumber(number);
-                long lowerBound = numericLowerBound(number);
-                if (lowerBound > remainingBytes()) {
-                    rejectLimit();
-                }
-                addBytes(jsonEncodedNumberBytes(number));
+                addBytes(jsonEncodedNumberBytes(number, limits.maxEncodedBytes()));
                 return;
             }
             if (value instanceof Map<?, ?> map) {
@@ -399,10 +539,6 @@ public final class JsonValues {
                 for (Map.Entry<?, ?> entry : map.entrySet()) {
                     if (!(entry.getKey() instanceof String key)) {
                         throw new IllegalArgumentException("JSON object keys must be strings");
-                    }
-                    if (entry.getValue() == null) {
-                        visitOmittedNull(depth + 1);
-                        continue;
                     }
                     if (!first) {
                         addBytes(1);
@@ -427,12 +563,6 @@ public final class JsonValues {
             throw new IllegalArgumentException("value must contain JSON-compatible values");
         }
 
-        private void visitOmittedNull(int depth) {
-            if (depth > limits.maxDepth() || ++nodes > limits.maxNodes()) {
-                rejectLimit();
-            }
-        }
-
         private void addString(String value) {
             long bytes = jsonEncodedStringBytes(value);
             if (bytes > limits.maxEncodedStringBytes()) {
@@ -446,20 +576,6 @@ public final class JsonValues {
             if (encodedBytes > limits.maxEncodedBytes()) {
                 rejectLimit();
             }
-        }
-
-        private long remainingBytes() {
-            return Math.max(0, limits.maxEncodedBytes() - encodedBytes);
-        }
-
-        private static long numericLowerBound(Number number) {
-            if (number instanceof BigInteger integer) {
-                return Math.max(1, ((long) Math.max(0, integer.bitLength() - 1) * 3) / 10 + 1);
-            }
-            if (number instanceof BigDecimal decimal) {
-                return Math.max(1, decimal.precision());
-            }
-            return 1;
         }
 
         private static void rejectLimit() {

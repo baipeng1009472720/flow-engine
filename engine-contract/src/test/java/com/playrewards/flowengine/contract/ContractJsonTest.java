@@ -23,6 +23,7 @@ import com.playrewards.flowengine.contract.execution.ExecutionPurpose;
 import com.playrewards.flowengine.contract.execution.ExecutionRequest;
 import com.playrewards.flowengine.contract.execution.ExecutionResult;
 import com.playrewards.flowengine.contract.execution.ExecutionStatus;
+import java.lang.management.ManagementFactory;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import com.playrewards.flowengine.contract.flow.FlowDefinition;
@@ -294,13 +295,72 @@ class ContractJsonTest {
         assertThrows(JsonValues.JsonResourceLimitException.class,
                 () -> JsonValues.measureJsonResources(List.of(hugePlain),
                         new JsonValues.JsonResourceLimits(1_000_001, 8, 1, 1)));
+    }
 
+    @Test
+    void admission_resource_walker_counts_every_null_map_key_separator_and_value() {
         Map<String, Object> nullable = new LinkedHashMap<>();
-        nullable.put("omitted", null);
-        nullable.put("kept", 1);
-        assertEquals(JSON.toJSONBytes(nullable).length,
-                JsonValues.measureJsonResources(List.of(nullable),
-                        new JsonValues.JsonResourceLimits(1_024, 1_024, 2, 3)).encodedBytes());
+        nullable.put("a", null);
+        nullable.put("bbbb", null);
+        long admittedBytes = 22;
+
+        JsonValues.JsonResourceUsage usage = JsonValues.measureJsonResources(List.of(nullable),
+                new JsonValues.JsonResourceLimits(admittedBytes, 8, 2, 3));
+
+        assertEquals(admittedBytes, usage.encodedBytes());
+        assertEquals(3, usage.nodes());
+        assertThrows(JsonValues.JsonResourceLimitException.class,
+                () -> JsonValues.measureJsonResources(List.of(nullable),
+                        new JsonValues.JsonResourceLimits(admittedBytes - 1, 8, 2, 3)));
+
+        Map<String, Object> longNullKey = new LinkedHashMap<>();
+        longNullKey.put("1234567", null);
+        assertThrows(JsonValues.JsonResourceLimitException.class,
+                () -> JsonValues.measureJsonResources(List.of(longNullKey),
+                        new JsonValues.JsonResourceLimits(64, 8, 2, 2)));
+    }
+
+    @Test
+    void rejects_uncached_inflated_numbers_before_large_precision_or_text_workspace_allocation() {
+        BigInteger inflatedInteger = BigInteger.ONE.shiftLeft(2_000_000).subtract(BigInteger.ONE);
+        BigDecimal uncachedPrecision = new BigDecimal(inflatedInteger, 0);
+        com.sun.management.ThreadMXBean memory =
+                (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+        assertTrue(memory.isThreadAllocatedMemorySupported());
+        memory.setThreadAllocatedMemoryEnabled(true);
+        JsonValues.measureJsonResources(List.of(BigInteger.ONE),
+                new JsonValues.JsonResourceLimits(64, 8, 1, 1));
+
+        long before = memory.getThreadAllocatedBytes(Thread.currentThread().threadId());
+        assertThrows(JsonValues.JsonResourceLimitException.class,
+                () -> JsonValues.measureJsonResources(List.of(uncachedPrecision),
+                        new JsonValues.JsonResourceLimits(64, 8, 1, 1)));
+        long allocated = memory.getThreadAllocatedBytes(Thread.currentThread().threadId()) - before;
+
+        assertTrue(allocated < 131_072,
+                () -> "number preflight allocated " + allocated + " bytes before rejection");
+    }
+
+    @Test
+    void big_integer_admission_preserves_a_proven_near_boundary() {
+        BigInteger oneThousandDigits = BigInteger.TEN.pow(999);
+        BigInteger uncertainOneByteBoundary = BigInteger.valueOf(512);
+
+        assertEquals(1_000, JsonValues.measureJsonResources(List.of(oneThousandDigits),
+                new JsonValues.JsonResourceLimits(1_000, 8, 1, 1)).encodedBytes());
+        assertThrows(JsonValues.JsonResourceLimitException.class,
+                () -> JsonValues.measureJsonResources(List.of(oneThousandDigits),
+                        new JsonValues.JsonResourceLimits(999, 8, 1, 1)));
+        assertEquals(3, JsonValues.measureJsonResources(List.of(uncertainOneByteBoundary),
+                new JsonValues.JsonResourceLimits(3, 8, 1, 1)).encodedBytes());
+    }
+
+    @Test
+    void exact_number_sizing_absolute_workspace_limit_cannot_be_overridden_by_a_caller() {
+        BigDecimal excessiveWorkspace = new BigDecimal(BigInteger.ONE, 5_000_000);
+
+        assertThrows(JsonValues.JsonResourceLimitException.class,
+                () -> JsonValues.jsonEncodedNumberBytes(excessiveWorkspace, Long.MAX_VALUE));
     }
 
     @Test
