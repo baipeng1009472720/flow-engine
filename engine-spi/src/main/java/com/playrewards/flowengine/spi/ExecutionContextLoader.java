@@ -1,22 +1,20 @@
 package com.playrewards.flowengine.spi;
 
-import com.playrewards.flowengine.contract.execution.ExecutionRequest;
-
 /**
  * Resolves trusted external read-only scopes for a request carrying a context reference.
  *
- * <p>The Core must not call this port when {@link ExecutionRequest#contextReference()} is absent.
- * Implementations may authorize the reference using request tenant data, but never expose a mutable
- * host object to a component.</p>
+ * <p>The Core constructs the narrow {@link ContextLoadRequest} only when an execution request has a
+ * context reference. Implementations authorize it by tenant identity, but never expose a mutable host
+ * object to a component.</p>
  */
 public interface ExecutionContextLoader {
 
     /**
-     * Loads immutable external scopes for a request with a non-null context reference.
+     * Loads immutable external scopes from stable context identity only.
      *
-     * @param request execution request containing a context reference
+     * @param request non-null context reference and tenant identity
      * @return immutable external scopes
-     * @throws IllegalArgumentException when the request has no context reference or it cannot be resolved
+     * @throws IllegalArgumentException when the identity cannot be resolved
      */
-    ReadOnlyExecutionContext load(ExecutionRequest request);
+    ReadOnlyExecutionContext load(ContextLoadRequest request);
 }

@@ -35,18 +35,39 @@ public record ComponentInvocation(CompletionStage<ComponentOutputs> completion,
         @Override
         public void subscribe(Flow.Subscriber<? super ContentChunk> subscriber) {
             Objects.requireNonNull(subscriber, "content subscriber must not be null");
-            subscriber.onSubscribe(new Flow.Subscription() {
-                @Override
-                public void request(long count) {
-                    // This publisher has no values and therefore no demand to satisfy.
-                }
+            subscriber.onSubscribe(new EmptyContentSubscription(subscriber));
+        }
+    }
 
-                @Override
-                public void cancel() {
-                    // There is no producer resource to release.
-                }
-            });
-            subscriber.onComplete();
+    /** Per-subscription state machine that terminates only after demand or a demand violation. */
+    private static final class EmptyContentSubscription implements Flow.Subscription {
+
+        private final Flow.Subscriber<? super ContentChunk> subscriber;
+        private boolean cancelled;
+        private boolean terminated;
+
+        private EmptyContentSubscription(Flow.Subscriber<? super ContentChunk> subscriber) {
+            this.subscriber = subscriber;
+        }
+
+        @Override
+        public synchronized void request(long count) {
+            if (cancelled || terminated) {
+                return;
+            }
+            terminated = true;
+            if (count <= 0) {
+                subscriber.onError(new IllegalArgumentException("content demand must be positive"));
+            } else {
+                subscriber.onComplete();
+            }
+        }
+
+        @Override
+        public synchronized void cancel() {
+            if (!terminated) {
+                cancelled = true;
+            }
         }
     }
 }
