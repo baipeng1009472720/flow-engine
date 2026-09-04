@@ -216,11 +216,11 @@ public final class DagScheduler implements AutoCloseable {
                     controller.set(Thread.currentThread());
                     try {
                         ExecutionResult executionResult =
-                                run(executionId, plan, request, context, cancellation, runningNodes);
+                                run(executionId, plan, request, context, cancellation, registration, runningNodes);
                         lifecycleObserver.beforeResultPublication(cancellation.reason());
-                        registration.publish(executionResult);
+                        registration.publishFromController(executionResult);
                     } catch (Throwable failure) {
-                        registration.publishExceptionally(failure);
+                        registration.publishUnexpectedControllerFailure();
                     } finally {
                         controllerRegistration.close();
                         controller.set(null);
@@ -232,9 +232,9 @@ public final class DagScheduler implements AutoCloseable {
                 registration.controllerFuture(controllerFuture);
             } catch (RejectedExecutionException failure) {
                 controllerRegistration.close();
-                cancellation.cancelForFailure();
+                registration.selectReason(CancellationHandle.Reason.FAILURE);
                 registration.finishBeforeStart();
-                registration.publish(result(executionId, ExecutionStatus.FAILED, null,
+                registration.publishFromController(result(executionId, ExecutionStatus.FAILED, null,
                         "EXECUTION_SCHEDULING_REJECTED", "execution scheduling was rejected", scheduledAt));
             } catch (RuntimeException failure) {
                 controllerRegistration.close();
@@ -246,18 +246,19 @@ public final class DagScheduler implements AutoCloseable {
     }
 
     private ExecutionResult run(String executionId, ExecutionPlan plan, ExecutionRequest request,
-            ExecutionContext context, CancellationHandle cancellation,
+            ExecutionContext context, CancellationHandle cancellation, ExecutionRegistration registration,
             Map<Future<NodeCompletion>, AdmissionLease> runningNodes) {
         Instant startedAt = clock.instant();
         try {
             validateExecutionBoundary(plan, request);
             checkStop(request, cancellation);
             NodeResult.TerminalOutcome outcome = executeGraph(
-                    executionId, plan, request, context, cancellation, runningNodes);
+                    executionId, plan, request, context, cancellation, registration, runningNodes);
             return result(executionId, outcome.status(), outcome.result(), outcome.errorCode(),
                     outcome.errorMessage(), startedAt);
         } catch (ExecutionDeadlineExceededException exception) {
-            cancellation.cancelForDeadline();
+            lifecycleObserver.beforeControllerReasonSelection(CancellationHandle.Reason.DEADLINE);
+            registration.selectReason(CancellationHandle.Reason.DEADLINE);
             return result(executionId, ExecutionStatus.FAILED, null, "EXECUTION_DEADLINE_EXCEEDED",
                     exception.getMessage(), startedAt);
         } catch (CancellationException exception) {
@@ -276,11 +277,13 @@ public final class DagScheduler implements AutoCloseable {
             return result(executionId, ExecutionStatus.CANCELLED, null, "EXECUTION_CANCELLED",
                     "execution was cancelled", startedAt);
         } catch (NodeExecutionException exception) {
-            cancellation.cancelForFailure();
+            lifecycleObserver.beforeControllerReasonSelection(CancellationHandle.Reason.FAILURE);
+            registration.selectReason(CancellationHandle.Reason.FAILURE);
             return result(executionId, ExecutionStatus.FAILED, null,
                     exception.code(), exception.getMessage(), startedAt);
         } catch (RuntimeException exception) {
-            cancellation.cancelForFailure();
+            lifecycleObserver.beforeControllerReasonSelection(CancellationHandle.Reason.FAILURE);
+            registration.selectReason(CancellationHandle.Reason.FAILURE);
             return result(executionId, ExecutionStatus.FAILED, null, "NODE_EXECUTION_FAILED",
                     "node execution failed", startedAt);
         }
@@ -288,6 +291,7 @@ public final class DagScheduler implements AutoCloseable {
 
     private NodeResult.TerminalOutcome executeGraph(String executionId, ExecutionPlan plan,
             ExecutionRequest request, ExecutionContext context, CancellationHandle cancellation,
+            ExecutionRegistration registration,
             Map<Future<NodeCompletion>, AdmissionLease> runningNodes) throws InterruptedException {
         Map<String, Readiness> readiness = new HashMap<>();
         PriorityQueue<String> ready = new PriorityQueue<>();
@@ -345,7 +349,7 @@ public final class DagScheduler implements AutoCloseable {
             completed.result().outputs().forEach((key, value) ->
                     context.writeOnce(node.node().nodeCode(), ScopePath.root(), key, value));
             if (completed.result().terminalOutcome() != null) {
-                if (cancellation.cancelForTerminal()
+                if (registration.selectReason(CancellationHandle.Reason.TERMINAL)
                         || cancellation.reason() == CancellationHandle.Reason.TERMINAL) {
                     return completed.result().terminalOutcome();
                 }
@@ -653,7 +657,11 @@ public final class DagScheduler implements AutoCloseable {
         virtualThreads.shutdownNow();
     }
 
-    /** Owns one controller admission across submit, start, close and completion races. */
+    /**
+     * Owns one controller admission and one terminal decision across submit, close and completion races.
+     * Reason selection and winning-result selection share {@code terminalMonitor}; actual future completion
+     * stays outside that monitor because dependent user callbacks may execute inline and re-enter the engine.
+     */
     private final class ExecutionRegistration {
 
         private static final int SUBMITTED = 0;
@@ -665,7 +673,9 @@ public final class DagScheduler implements AutoCloseable {
         private final CancellationHandle cancellation;
         private final CompletableFuture<ExecutionResult> completion;
         private final AtomicInteger state = new AtomicInteger(SUBMITTED);
+        private final Object terminalMonitor = new Object();
         private final AtomicBoolean resultPublished = new AtomicBoolean();
+        private ExecutionResult winningResult;
         private volatile Future<?> controllerFuture;
 
         private ExecutionRegistration(String executionId, Instant scheduledAt,
@@ -685,29 +695,94 @@ public final class DagScheduler implements AutoCloseable {
         }
 
         private void cancelFromClose() {
-            boolean closeWon = cancellation.cancel();
-            CancellationHandle.Reason reason = cancellation.reason();
-            if (!closeWon && reason != CancellationHandle.Reason.USER) {
-                return;
+            ExecutionResult selectedResult;
+            Future<?> future;
+            CancellationHandle.Reason reason;
+            synchronized (terminalMonitor) {
+                if (winningResult != null) {
+                    return;
+                }
+                boolean closeWon = selectReasonLocked(CancellationHandle.Reason.USER);
+                reason = cancellation.reason();
+                if (!closeWon && reason != CancellationHandle.Reason.USER) {
+                    return;
+                }
+                winningResult = cancelledResult();
+                selectedResult = winningResult;
+                future = controllerFuture;
             }
-            Future<?> future = controllerFuture;
+            lifecycleObserver.afterCloseReasonSelection(reason);
             if (future != null) {
                 future.cancel(true);
             }
             finishBeforeStart();
-            publish(result(executionId, ExecutionStatus.CANCELLED, null,
-                    "EXECUTION_CANCELLED", "execution was cancelled", scheduledAt));
+            completeSelectedResult(selectedResult);
         }
 
-        private void publish(ExecutionResult result) {
-            if (resultPublished.compareAndSet(false, true)) {
-                completion.complete(result);
+        private boolean selectReason(CancellationHandle.Reason requestedReason) {
+            synchronized (terminalMonitor) {
+                return selectReasonLocked(requestedReason);
             }
         }
 
-        private void publishExceptionally(Throwable failure) {
+        private boolean selectReasonLocked(CancellationHandle.Reason requestedReason) {
+            return switch (requestedReason) {
+                case USER -> cancellation.cancel();
+                case DEADLINE -> cancellation.cancelForDeadline();
+                case FAILURE -> cancellation.cancelForFailure();
+                case TERMINAL -> cancellation.cancelForTerminal();
+            };
+        }
+
+        private void publishFromController(ExecutionResult candidate) {
+            ExecutionResult selectedResult;
+            synchronized (terminalMonitor) {
+                if (winningResult == null) {
+                    winningResult = normalizeForWinningReason(candidate);
+                }
+                selectedResult = winningResult;
+            }
+            completeSelectedResult(selectedResult);
+        }
+
+        private void publishUnexpectedControllerFailure() {
+            ExecutionResult selectedResult;
+            synchronized (terminalMonitor) {
+                if (winningResult == null) {
+                    if (cancellation.reason() == null) {
+                        selectReasonLocked(CancellationHandle.Reason.FAILURE);
+                    }
+                    ExecutionResult safeFailure = result(executionId, ExecutionStatus.FAILED, null,
+                            "NODE_EXECUTION_FAILED", "node execution failed", scheduledAt);
+                    winningResult = normalizeForWinningReason(safeFailure);
+                }
+                selectedResult = winningResult;
+            }
+            completeSelectedResult(selectedResult);
+        }
+
+        private ExecutionResult normalizeForWinningReason(ExecutionResult candidate) {
+            return switch (cancellation.reason()) {
+                case USER -> cancelledResult();
+                case DEADLINE -> result(executionId, ExecutionStatus.FAILED, null,
+                        "EXECUTION_DEADLINE_EXCEEDED", "execution deadline exceeded", scheduledAt);
+                case FAILURE -> candidate.status() == ExecutionStatus.FAILED
+                        ? candidate
+                        : result(executionId, ExecutionStatus.FAILED, null,
+                                "NODE_EXECUTION_FAILED", "node execution failed", scheduledAt);
+                case TERMINAL -> candidate;
+                case null -> candidate;
+            };
+        }
+
+        private ExecutionResult cancelledResult() {
+            return result(executionId, ExecutionStatus.CANCELLED, null,
+                    "EXECUTION_CANCELLED", "execution was cancelled", scheduledAt);
+        }
+
+        private void completeSelectedResult(ExecutionResult selectedResult) {
             if (resultPublished.compareAndSet(false, true)) {
-                completion.completeExceptionally(failure);
+                completion.complete(selectedResult);
             }
         }
 

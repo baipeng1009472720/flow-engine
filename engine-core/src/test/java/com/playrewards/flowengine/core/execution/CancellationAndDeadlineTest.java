@@ -233,6 +233,44 @@ class CancellationAndDeadlineTest {
     }
 
     @Test
+    void close_user_winner_normalizes_a_later_node_failure_to_cancelled() throws Exception {
+        CloseWinsBeforeControllerReasonObserver observer =
+                new CloseWinsBeforeControllerReasonObserver(CancellationHandle.Reason.FAILURE);
+        NodeExecutor failing = new NodeExecutor() {
+            @Override
+            public ComponentType supports() {
+                return ComponentType.SCRIPT;
+            }
+
+            @Override
+            public NodeInvocation execute(NodeExecutionContext context) {
+                throw new NodeExecutionException("LATE_NODE_FAILURE", "late node failure");
+            }
+        };
+
+        assertCloseUserWinnerProducesCancellation(failing, observer);
+    }
+
+    @Test
+    void close_user_winner_normalizes_a_later_deadline_failure_to_cancelled() throws Exception {
+        CloseWinsBeforeControllerReasonObserver observer =
+                new CloseWinsBeforeControllerReasonObserver(CancellationHandle.Reason.DEADLINE);
+        NodeExecutor deadlineFailure = new NodeExecutor() {
+            @Override
+            public ComponentType supports() {
+                return ComponentType.SCRIPT;
+            }
+
+            @Override
+            public NodeInvocation execute(NodeExecutionContext context) {
+                throw new ExecutionDeadlineExceededException("late deadline failure");
+            }
+        };
+
+        assertCloseUserWinnerProducesCancellation(deadlineFailure, observer);
+    }
+
+    @Test
     void concurrent_schedule_and_close_always_returns_a_terminal_handle() throws Exception {
         ExecutionPlan plan = compile(
                 List.of(node("race-start", "builtin.start", "raceStart", Map.of()),
@@ -818,6 +856,32 @@ class CancellationAndDeadlineTest {
         return new DagScheduler(registry, ConcurrencyGovernor.defaults(), clock, 8, 8, observer);
     }
 
+    private static void assertCloseUserWinnerProducesCancellation(NodeExecutor executor,
+            CloseWinsBeforeControllerReasonObserver observer) throws Exception {
+        DagScheduler scheduler = observedScheduler(
+                NodeExecutorRegistry.withBuiltIns(List.of(executor)), Clock.systemUTC(), observer);
+        CompletableFuture<Void> closing = null;
+        try {
+            ExecutionHandle handle = scheduler.schedule(blockingPlan(), request(Map.of()));
+            assertTrue(observer.controllerReadyToChooseReason.await(2, TimeUnit.SECONDS));
+
+            closing = CompletableFuture.runAsync(scheduler::close);
+            assertTrue(observer.closeSelectedUser.await(2, TimeUnit.SECONDS));
+            observer.allowControllerReasonAttempt.countDown();
+
+            ExecutionResult result = await(handle);
+            assertEquals(ExecutionStatus.CANCELLED, result.status());
+            assertEquals("EXECUTION_CANCELLED", result.errorCode());
+        } finally {
+            observer.allowControllerReasonAttempt.countDown();
+            observer.allowClosePublication.countDown();
+            if (closing != null) {
+                closing.get(2, TimeUnit.SECONDS);
+            }
+            scheduler.close();
+        }
+    }
+
     private static ExecutionPlan twoInvocationPlan(String suffix, String componentCode) {
         FlowNode start = node("start-" + suffix, "builtin.start", "start" + suffix, Map.of());
         FlowNode work = node("work-" + suffix, componentCode, "work" + suffix, Map.of());
@@ -1133,6 +1197,50 @@ class CancellationAndDeadlineTest {
         @Override
         public void afterExecutionAdmissionReleased() {
             executionAdmissionReleased.countDown();
+        }
+    }
+
+    private static final class CloseWinsBeforeControllerReasonObserver implements ExecutionLifecycleObserver {
+
+        private final CancellationHandle.Reason expectedControllerReason;
+        private final CountDownLatch controllerReadyToChooseReason = new CountDownLatch(1);
+        private final CountDownLatch allowControllerReasonAttempt = new CountDownLatch(1);
+        private final CountDownLatch closeSelectedUser = new CountDownLatch(1);
+        private final CountDownLatch allowClosePublication = new CountDownLatch(1);
+
+        private CloseWinsBeforeControllerReasonObserver(CancellationHandle.Reason expectedControllerReason) {
+            this.expectedControllerReason = expectedControllerReason;
+        }
+
+        @Override
+        public void beforeControllerReasonSelection(CancellationHandle.Reason requestedReason) {
+            if (requestedReason != expectedControllerReason) {
+                return;
+            }
+            controllerReadyToChooseReason.countDown();
+            awaitIgnoringInterrupt(allowControllerReasonAttempt);
+        }
+
+        @Override
+        public void afterCloseReasonSelection(CancellationHandle.Reason selectedReason) {
+            assertEquals(CancellationHandle.Reason.USER, selectedReason);
+            closeSelectedUser.countDown();
+            awaitIgnoringInterrupt(allowClosePublication);
+        }
+
+        private static void awaitIgnoringInterrupt(CountDownLatch latch) {
+            boolean interrupted = false;
+            while (true) {
+                try {
+                    latch.await();
+                    break;
+                } catch (InterruptedException exception) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 

@@ -15,6 +15,22 @@ interface ExecutionLifecycleObserver {
     }
 
     /**
+     * Observes a controller immediately before it attempts to select a failure reason.
+     *
+     * @param requestedReason failure or deadline reason the controller is about to select
+     */
+    default void beforeControllerReasonSelection(CancellationHandle.Reason requestedReason) {
+    }
+
+    /**
+     * Observes close after it has selected USER cancellation and before publishing the result.
+     *
+     * @param selectedReason winning USER cancellation reason
+     */
+    default void afterCloseReasonSelection(CancellationHandle.Reason selectedReason) {
+    }
+
+    /**
      * Observes the winning cancellation reason immediately before its result is published.
      *
      * @param reason winning execution reason, or null for a non-cancelling completion
