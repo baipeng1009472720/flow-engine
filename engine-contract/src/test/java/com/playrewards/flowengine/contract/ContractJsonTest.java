@@ -21,6 +21,8 @@ import com.playrewards.flowengine.contract.component.ComponentType;
 import com.playrewards.flowengine.contract.execution.ExecutionMode;
 import com.playrewards.flowengine.contract.execution.ExecutionPurpose;
 import com.playrewards.flowengine.contract.execution.ExecutionRequest;
+import com.playrewards.flowengine.contract.execution.ExecutionResult;
+import com.playrewards.flowengine.contract.execution.ExecutionStatus;
 import com.playrewards.flowengine.contract.flow.FlowDefinition;
 import com.playrewards.flowengine.contract.flow.FlowNode;
 import com.playrewards.flowengine.contract.json.ContractJson;
@@ -163,6 +165,28 @@ class ContractJsonTest {
         assertFalse(rendered.contains("top-secret"));
         assertFalse(rendered.contains("scope-secret"));
         assertFalse(rendered.contains("vault:context"));
+    }
+
+    @Test
+    void execution_result_carries_optional_error_message_without_rendering_it() {
+        Instant startedAt = Instant.parse("2026-09-04T00:00:00Z");
+        ExecutionResult result = new ExecutionResult("execution", ExecutionStatus.FAILED, null,
+                "DECLINED", "sensitive business reason", "error-id", startedAt, startedAt.plusSeconds(1));
+        ExecutionResult decoded = JSON.parseObject(JSON.toJSONString(result), ExecutionResult.class);
+
+        assertEquals("sensitive business reason", result.errorMessage());
+        assertEquals(result, decoded);
+        assertFalse(result.toString().contains("sensitive business reason"));
+        assertTrue(result.toString().contains("errorMessagePresent=true"));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ExecutionResult("execution", ExecutionStatus.FAILED, null,
+                        "DECLINED", "  ", "error-id", startedAt, startedAt.plusSeconds(1)));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ExecutionResult("execution", ExecutionStatus.SUCCEEDED, "result",
+                        "ERROR", null, "error-id", startedAt, startedAt.plusSeconds(1)));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ExecutionResult("execution", ExecutionStatus.FAILED, "forbidden-result",
+                        "DECLINED", null, "error-id", startedAt, startedAt.plusSeconds(1)));
     }
 
     @Test
