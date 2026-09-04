@@ -27,8 +27,9 @@ public final class JsonValueValidator {
         JSONSchema schema = JSONSchema.of(schemaObject);
         ValidateResult result = schema.validate(JSON.toJSON(value));
         if (!result.isSuccess()) {
-            throw new NodeExecutionException(errorCode,
-                    field + " does not satisfy protocol " + protocol.code() + ": " + result.getMessage());
+            // Fastjson diagnostics may embed the rejected value. Public execution errors expose only
+            // the stable field path; this module has no access-controlled raw diagnostic channel.
+            throw new NodeExecutionException(errorCode, field + " failed declared JSON Schema validation");
         }
     }
 }

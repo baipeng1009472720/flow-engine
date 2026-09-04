@@ -14,6 +14,11 @@ public record ExecutionResult(String executionId, ExecutionStatus status, Object
     public ExecutionResult {
         executionId = JsonValues.requireText(executionId, "executionId");
         Objects.requireNonNull(status, "status must not be null");
+        if (status != ExecutionStatus.SUCCEEDED
+                && status != ExecutionStatus.FAILED
+                && status != ExecutionStatus.CANCELLED) {
+            throw new IllegalArgumentException("execution result status must be terminal");
+        }
         result = JsonValues.copyValue(result, "result");
         if (errorCode != null) {
             errorCode = JsonValues.requireText(errorCode, "errorCode");
@@ -28,10 +33,12 @@ public record ExecutionResult(String executionId, ExecutionStatus status, Object
                 && (errorCode != null || errorMessage != null || errorId != null)) {
             throw new IllegalArgumentException("successful execution must not carry error fields");
         }
-        if (status == ExecutionStatus.FAILED) {
-            errorCode = JsonValues.requireText(errorCode, "failed execution errorCode");
+        if (status == ExecutionStatus.FAILED || status == ExecutionStatus.CANCELLED) {
+            if (errorCode == null) {
+                throw new IllegalArgumentException("unsuccessful execution errorCode must not be null");
+            }
             if (result != null) {
-                throw new IllegalArgumentException("failed execution must not carry business result");
+                throw new IllegalArgumentException("unsuccessful execution must not carry business result");
             }
         }
         Objects.requireNonNull(startedAt, "startedAt must not be null");

@@ -26,6 +26,8 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class ConcurrencyGovernor {
 
     private static final long CANCELLATION_POLL_MILLIS = 25;
+    private static final ConcurrencyGovernor PROCESS_DEFAULT =
+            new ConcurrencyGovernor(1024, 256, 256, 128, 64, Clock.systemUTC());
 
     private final Semaphore global;
     private final Clock clock;
@@ -34,9 +36,13 @@ public final class ConcurrencyGovernor {
     private final KeyedPermitPool components;
     private final KeyedPermitPool resources;
 
-    /** Creates the default finite limits used by an embedded engine. */
+    /**
+     * Returns the process-shared finite governor used by default engine and scheduler wiring.
+     *
+     * @return JVM-wide default governor; callers needing intentional isolation must use the public constructor
+     */
     public static ConcurrencyGovernor defaults() {
-        return new ConcurrencyGovernor(1024, 256, 256, 128, 64, Clock.systemUTC());
+        return PROCESS_DEFAULT;
     }
 
     /**

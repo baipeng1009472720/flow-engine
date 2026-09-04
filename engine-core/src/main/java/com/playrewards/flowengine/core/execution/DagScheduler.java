@@ -33,6 +33,7 @@ import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionService;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
@@ -58,6 +59,10 @@ public final class DagScheduler implements AutoCloseable {
     private static final int DEFAULT_MAX_IN_FLIGHT_NODE_TASKS = 1024;
     private static final int DEFAULT_MAX_IN_FLIGHT_EXECUTIONS = 1024;
     private static final long ADMISSION_POLL_MILLIS = 25;
+    private static final Semaphore PROCESS_NODE_TASK_ADMISSION =
+            new Semaphore(DEFAULT_MAX_IN_FLIGHT_NODE_TASKS, true);
+    private static final Semaphore PROCESS_EXECUTION_ADMISSION =
+            new Semaphore(DEFAULT_MAX_IN_FLIGHT_EXECUTIONS, true);
 
     private final NodeExecutorRegistry executors;
     private final ConcurrencyGovernor governor;
@@ -67,22 +72,22 @@ public final class DagScheduler implements AutoCloseable {
     private final ExecutorService virtualThreads = Executors.newVirtualThreadPerTaskExecutor();
 
     /**
-     * Creates a scheduler using a shared virtual-thread executor and immutable registries.
+     * Creates a scheduler using process-shared finite admissions and immutable registries.
      *
      * @param executors startup executor registry
      * @param governor shared hierarchical concurrency gate
      * @param clock deadline and result timestamp source
      */
     public DagScheduler(NodeExecutorRegistry executors, ConcurrencyGovernor governor, Clock clock) {
-        this(executors, governor, clock,
-                DEFAULT_MAX_IN_FLIGHT_NODE_TASKS, DEFAULT_MAX_IN_FLIGHT_EXECUTIONS);
+        this(executors, governor, clock, PROCESS_NODE_TASK_ADMISSION, PROCESS_EXECUTION_ADMISSION);
     }
 
     /**
-     * Creates a scheduler with an explicit bound on submitted node tasks.
+     * Creates a scheduler with an isolated explicit bound on submitted node tasks.
      *
      * <p>The bound is acquired before virtual-thread submission, preventing a wide DAG or a burst
-     * of executions from accumulating an unbounded number of parked node tasks.</p>
+     * of executions from accumulating an unbounded number of parked node tasks. This advanced
+     * constructor intentionally does not share admissions with other scheduler instances.</p>
      *
      * @param executors startup executor registry
      * @param governor shared hierarchical concurrency gate
@@ -97,6 +102,9 @@ public final class DagScheduler implements AutoCloseable {
     /**
      * Creates a scheduler with explicit finite execution and node-task admissions.
      *
+     * <p>This advanced path intentionally isolates admission accounting from other scheduler
+     * instances. The supplied governor separately defines whether component permits are shared.</p>
+     *
      * @param executors startup executor registry
      * @param governor shared hierarchical concurrency gate
      * @param clock deadline and result timestamp source
@@ -105,17 +113,26 @@ public final class DagScheduler implements AutoCloseable {
      */
     public DagScheduler(NodeExecutorRegistry executors, ConcurrencyGovernor governor, Clock clock,
             int maxInFlightNodeTasks, int maxInFlightExecutions) {
+        this(executors, governor, clock,
+                new Semaphore(positive(maxInFlightNodeTasks, "maxInFlightNodeTasks"), true),
+                new Semaphore(positive(maxInFlightExecutions, "maxInFlightExecutions"), true));
+    }
+
+    private DagScheduler(NodeExecutorRegistry executors, ConcurrencyGovernor governor, Clock clock,
+            Semaphore nodeTaskAdmission, Semaphore executionAdmission) {
         this.executors = Objects.requireNonNull(executors, "executors must not be null");
         this.governor = Objects.requireNonNull(governor, "governor must not be null");
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
-        if (maxInFlightNodeTasks < 1) {
-            throw new IllegalArgumentException("maxInFlightNodeTasks must be at least one");
+        this.nodeTaskAdmission = Objects.requireNonNull(nodeTaskAdmission, "nodeTaskAdmission must not be null");
+        this.executionAdmission = Objects.requireNonNull(
+                executionAdmission, "executionAdmission must not be null");
+    }
+
+    private static int positive(int value, String name) {
+        if (value < 1) {
+            throw new IllegalArgumentException(name + " must be at least one");
         }
-        if (maxInFlightExecutions < 1) {
-            throw new IllegalArgumentException("maxInFlightExecutions must be at least one");
-        }
-        this.nodeTaskAdmission = new Semaphore(maxInFlightNodeTasks, true);
-        this.executionAdmission = new Semaphore(maxInFlightExecutions, true);
+        return value;
     }
 
     /**
@@ -300,7 +317,7 @@ public final class DagScheduler implements AutoCloseable {
             Future<NodeCompletion> future = completions.submit(() -> {
                 admissionLease.started();
                 try {
-                    return invokeNode(executionId, plan, nodeId, request, context, cancellation);
+                    return invokeNode(executionId, plan, nodeId, request, context, cancellation, admissionLease);
                 } finally {
                     admissionLease.releaseAfterRun();
                 }
@@ -335,7 +352,9 @@ public final class DagScheduler implements AutoCloseable {
     }
 
     private NodeCompletion invokeNode(String executionId, ExecutionPlan plan, String nodeId,
-            ExecutionRequest request, ExecutionContext context, CancellationHandle cancellation) {
+            ExecutionRequest request, ExecutionContext context, CancellationHandle cancellation,
+            AdmissionLease admissionLease) {
+        ConcurrencyGovernor.Permit permit = null;
         try {
             checkStop(request, cancellation);
             CompiledNode node = plan.nodesById().get(nodeId);
@@ -346,23 +365,26 @@ public final class DagScheduler implements AutoCloseable {
             ConcurrencyGovernor.PermitRequest permitRequest = new ConcurrencyGovernor.PermitRequest(
                     request.tenantId(), plan.flowIdentity().flowId(), node.node().componentCode(), resourceKey,
                     node.componentContract().capabilities().maxConcurrency());
-            try (ConcurrencyGovernor.Permit ignored = governor.acquire(
-                    permitRequest, cancellation, request.deadline())) {
-                nodeContext.throwIfStopped();
-                NodeExecutor executor = executors.required(node.componentContract().componentType(),
-                        node.node().nodeCode());
-                NodeInvocation invocation = Objects.requireNonNull(executor.execute(nodeContext),
-                        "node invocation must not be null");
-                StageAwaiter awaiter = bridge(invocation.completion());
-                try (CancellationHandle.CancellationRegistration ignoredRegistration =
-                        cancellation.onCancellation(awaiter::cancel)) {
-                    NodeResult result = awaitNode(awaiter, request, cancellation);
-                    validateOutputs(node, result);
-                    return NodeCompletion.success(nodeId, result);
-                }
+            permit = governor.acquire(permitRequest, cancellation, request.deadline());
+            nodeContext.throwIfStopped();
+            NodeExecutor executor = executors.required(node.componentContract().componentType(),
+                    node.node().nodeCode());
+            NodeInvocation invocation = Objects.requireNonNull(executor.execute(nodeContext),
+                    "node invocation must not be null");
+            StageAwaiter awaiter = bridge(invocation.completion(), permit, admissionLease);
+            permit = null; // The source lifecycle now owns both concurrency leases.
+            try (CancellationHandle.CancellationRegistration ignoredRegistration =
+                    cancellation.onCancellation(awaiter::cancel)) {
+                NodeResult result = awaitNode(awaiter, request, cancellation);
+                validateOutputs(node, result);
+                return NodeCompletion.success(nodeId, result);
             }
         } catch (Throwable failure) {
             return NodeCompletion.failure(nodeId, failure);
+        } finally {
+            if (permit != null) {
+                permit.close();
+            }
         }
     }
 
@@ -375,6 +397,8 @@ public final class DagScheduler implements AutoCloseable {
         }
         try {
             return awaiter.completion().get(remainingNanos, TimeUnit.NANOSECONDS);
+        } catch (CancellationException exception) {
+            throw completionCancellation(exception, cancellation);
         } catch (InterruptedException exception) {
             awaiter.cancel();
             throw exception;
@@ -383,20 +407,52 @@ public final class DagScheduler implements AutoCloseable {
             cancellation.cancelForDeadline();
             throw new ExecutionDeadlineExceededException("execution deadline exceeded", exception);
         } catch (ExecutionException exception) {
-            throw propagate(exception.getCause());
+            Throwable failure = unwrapCompletionFailure(exception.getCause());
+            if (failure instanceof CancellationException cancelled) {
+                throw completionCancellation(cancelled, cancellation);
+            }
+            throw propagate(failure);
         }
     }
 
-    private static StageAwaiter bridge(CompletionStage<NodeResult> source) {
+    private static RuntimeException completionCancellation(CancellationException sourceFailure,
+            CancellationHandle cancellation) {
+        if (cancellation.isCancellationRequested()) {
+            return sourceFailure;
+        }
+        return new NodeExecutionException("NODE_COMPLETION_CANCELLED", "node completion was cancelled");
+    }
+
+    private static Throwable unwrapCompletionFailure(Throwable failure) {
+        Throwable current = failure;
+        while (current instanceof CompletionException && current.getCause() != null) {
+            current = current.getCause();
+        }
+        return current;
+    }
+
+    private static StageAwaiter bridge(CompletionStage<NodeResult> source,
+            ConcurrencyGovernor.Permit permit, AdmissionLease admissionLease) {
         Objects.requireNonNull(source, "node completion must not be null");
         CompletableFuture<NodeResult> completion = new CompletableFuture<>();
-        source.whenComplete((result, failure) -> {
-            if (failure == null) {
-                completion.complete(result);
-            } else {
-                completion.completeExceptionally(failure);
-            }
-        });
+        SourceLifecycle lifecycle = new SourceLifecycle(permit, admissionLease);
+        lifecycle.arm();
+        try {
+            source.whenComplete((result, failure) -> {
+                try {
+                    if (failure == null) {
+                        completion.complete(result);
+                    } else {
+                        completion.completeExceptionally(failure);
+                    }
+                } finally {
+                    lifecycle.close();
+                }
+            });
+        } catch (Throwable failure) {
+            lifecycle.close();
+            throw failure;
+        }
         return new StageAwaiter(completion, source instanceof Future<?> future ? future : null);
     }
 
@@ -575,12 +631,42 @@ public final class DagScheduler implements AutoCloseable {
         }
     }
 
-    /** Releases admission on pre-start cancellation or after a started task exits, never both. */
+    /** Holds component and node admission until the adapter's actual source stage has completed. */
+    private static final class SourceLifecycle implements AutoCloseable {
+
+        private final ConcurrencyGovernor.Permit permit;
+        private final AdmissionLease admissionLease;
+        private final java.util.concurrent.atomic.AtomicBoolean open =
+                new java.util.concurrent.atomic.AtomicBoolean(true);
+
+        private SourceLifecycle(ConcurrencyGovernor.Permit permit, AdmissionLease admissionLease) {
+            this.permit = Objects.requireNonNull(permit, "permit must not be null");
+            this.admissionLease = Objects.requireNonNull(admissionLease, "admissionLease must not be null");
+        }
+
+        private void arm() {
+            admissionLease.deferToSource();
+        }
+
+        @Override
+        public void close() {
+            if (open.compareAndSet(true, false)) {
+                try {
+                    permit.close();
+                } finally {
+                    admissionLease.releaseAfterSource();
+                }
+            }
+        }
+    }
+
+    /** Releases admission before start, after synchronous work, or after a deferred source exactly once. */
     private static final class AdmissionLease {
 
         private static final int NEW = 0;
         private static final int RUNNING = 1;
-        private static final int RELEASED = 2;
+        private static final int DEFERRED = 2;
+        private static final int RELEASED = 3;
 
         private final Semaphore admission;
         private final AtomicInteger state = new AtomicInteger(NEW);
@@ -603,6 +689,18 @@ public final class DagScheduler implements AutoCloseable {
 
         private void releaseAfterRun() {
             if (state.compareAndSet(RUNNING, RELEASED)) {
+                admission.release();
+            }
+        }
+
+        private void deferToSource() {
+            if (!state.compareAndSet(RUNNING, DEFERRED)) {
+                throw new IllegalStateException("node admission cannot be transferred after release");
+            }
+        }
+
+        private void releaseAfterSource() {
+            if (state.compareAndSet(DEFERRED, RELEASED)) {
                 admission.release();
             }
         }

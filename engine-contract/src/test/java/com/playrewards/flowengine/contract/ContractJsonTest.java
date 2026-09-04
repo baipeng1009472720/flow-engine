@@ -190,6 +190,40 @@ class ContractJsonTest {
     }
 
     @Test
+    void execution_result_accepts_only_terminal_statuses_and_requires_safe_failure_shapes() {
+        Instant now = Instant.parse("2026-09-04T00:00:00Z");
+        for (ExecutionStatus status : ExecutionStatus.values()) {
+            if (status != ExecutionStatus.SUCCEEDED
+                    && status != ExecutionStatus.FAILED
+                    && status != ExecutionStatus.CANCELLED) {
+                assertThrows(IllegalArgumentException.class,
+                        () -> new ExecutionResult("execution", status, null,
+                                "NOT_TERMINAL", null, null, now, now));
+            }
+        }
+
+        assertThrows(IllegalArgumentException.class,
+                () -> new ExecutionResult("execution", ExecutionStatus.CANCELLED,
+                        Map.of("secret", "value"), "EXECUTION_CANCELLED", null, null, now, now));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ExecutionResult("execution", ExecutionStatus.CANCELLED,
+                        null, null, "cancelled", null, now, now));
+        assertThrows(RuntimeException.class, () -> JSON.parseObject("""
+                {"executionId":"execution","status":"RUNNING","errorCode":"NOT_TERMINAL",
+                 "startedAt":"2026-09-04T00:00:00Z","finishedAt":"2026-09-04T00:00:00Z"}
+                """, ExecutionResult.class));
+        assertThrows(RuntimeException.class, () -> JSON.parseObject("""
+                {"executionId":"execution","status":"CANCELLED","result":{"secret":"value"},
+                 "errorCode":"EXECUTION_CANCELLED","startedAt":"2026-09-04T00:00:00Z",
+                 "finishedAt":"2026-09-04T00:00:00Z"}
+                """, ExecutionResult.class));
+
+        ExecutionResult cancelled = new ExecutionResult("execution", ExecutionStatus.CANCELLED,
+                null, "EXECUTION_CANCELLED", "cancelled", null, now, now);
+        assertEquals(cancelled, JSON.parseObject(JSON.toJSONString(cancelled), ExecutionResult.class));
+    }
+
+    @Test
     void rejects_non_finite_float_and_double_values_before_json_serialization_or_hashing() {
         assertNonFiniteNumberRejected(Double.NaN, "Double");
         assertNonFiniteNumberRejected(Double.POSITIVE_INFINITY, "Double");

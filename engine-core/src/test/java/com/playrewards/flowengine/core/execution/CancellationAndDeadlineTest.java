@@ -7,10 +7,13 @@ import static com.playrewards.flowengine.core.execution.EphemeralExecutionTest.e
 import static com.playrewards.flowengine.core.execution.EphemeralExecutionTest.node;
 import static com.playrewards.flowengine.core.execution.EphemeralExecutionTest.request;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.playrewards.flowengine.contract.bundle.CompiledComponentContract;
+import com.playrewards.flowengine.contract.component.ComponentCapabilities;
+import com.playrewards.flowengine.contract.component.ComponentEffect;
 import com.playrewards.flowengine.contract.component.ComponentType;
 import com.playrewards.flowengine.contract.execution.ExecutionResult;
 import com.playrewards.flowengine.contract.execution.ExecutionStatus;
@@ -22,13 +25,20 @@ import com.playrewards.flowengine.core.node.NodeExecutor;
 import com.playrewards.flowengine.core.node.NodeExecutorRegistry;
 import com.playrewards.flowengine.core.node.NodeInvocation;
 import com.playrewards.flowengine.core.node.NodeResult;
+import com.playrewards.flowengine.spi.CancellationToken;
+import com.playrewards.flowengine.spi.ComponentInvocation;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -246,6 +256,358 @@ class CancellationAndDeadlineTest {
         }
     }
 
+    @Test
+    void non_future_stage_retains_component_capacity_after_end_until_the_source_really_completes()
+            throws Exception {
+        DeferredStageExecutor deferred = new DeferredStageExecutor();
+        AtomicInteger lateSideEffects = new AtomicInteger();
+        NodeExecutor gate = new NodeExecutor() {
+            @Override
+            public ComponentType supports() {
+                return ComponentType.BUSINESS;
+            }
+
+            @Override
+            public NodeInvocation execute(NodeExecutionContext context) {
+                try {
+                    if (!deferred.firstEntered.await(2, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("deferred sibling did not start");
+                    }
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(exception);
+                }
+                return NodeInvocation.completed(NodeResult.continueWith(Map.of(), java.util.Set.of("NEXT")));
+            }
+        };
+        NodeExecutor lateSideEffect = new NodeExecutor() {
+            @Override
+            public ComponentType supports() {
+                return ComponentType.HTTP;
+            }
+
+            @Override
+            public NodeInvocation execute(NodeExecutionContext context) {
+                lateSideEffects.incrementAndGet();
+                return NodeInvocation.completed(NodeResult.continueWith(Map.of(), java.util.Set.of("NEXT")));
+            }
+        };
+        Map<String, CompiledComponentContract> contracts = Map.of(
+                "builtin.start", contract("builtin.start", ComponentType.START, Map.of(), Map.of()),
+                "test.deferred", contract("test.deferred", ComponentType.SCRIPT, Map.of(), Map.of(), 1),
+                "test.gate", new CompiledComponentContract(
+                        "test.gate", ComponentType.BUSINESS, "gateExecutor", Map.of(), Map.of(), Map.of(),
+                        new ComponentCapabilities(ComponentEffect.PURE, true, false, false, 16)),
+                "test.late-side-effect", contract(
+                        "test.late-side-effect", ComponentType.HTTP, Map.of(), Map.of()),
+                "builtin.end", contract("builtin.end", ComponentType.END, Map.of(), Map.of()));
+        FlowNode firstStart = node("start", "builtin.start", "start", Map.of());
+        FlowNode firstDeferred = node("deferred", "test.deferred", "deferred", Map.of());
+        FlowNode firstGate = node("gate", "test.gate", "gate", Map.of());
+        FlowNode firstLate = node("late", "test.late-side-effect", "late", Map.of());
+        FlowNode firstEnd = node("end", "builtin.end", "end", Map.of("resultStatus", "SUCCESS"));
+        ExecutionPlan terminalSiblingPlan = compile(
+                List.of(firstStart, firstDeferred, firstGate, firstLate, firstEnd), List.of(
+                        edge("e1", "start", "deferred", "NEXT", "IN"),
+                        edge("e2", "start", "gate", "NEXT", "IN"),
+                        edge("e3", "gate", "end", "NEXT", "IN"),
+                        edge("e-late", "deferred", "late", "NEXT", "IN")), contracts);
+        FlowNode secondStart = node("start-2", "builtin.start", "start2", Map.of());
+        FlowNode secondDeferred = node("deferred-2", "test.deferred", "deferred2", Map.of());
+        FlowNode secondEnd = node("end-2", "builtin.end", "end2", Map.of("resultStatus", "SUCCESS"));
+        ExecutionPlan linearPlan = compile(List.of(secondStart, secondDeferred, secondEnd), List.of(
+                edge("e4", "start-2", "deferred-2", "NEXT", "IN"),
+                edge("e5", "deferred-2", "end-2", "NEXT", "IN")), contracts);
+        NodeExecutorRegistry registry = NodeExecutorRegistry.withBuiltIns(List.of(deferred, gate, lateSideEffect));
+        ConcurrencyGovernor governor = new ConcurrencyGovernor(16, 16, 16, 16, 16, Clock.systemUTC());
+
+        try (DagScheduler scheduler = new DagScheduler(registry, governor, Clock.systemUTC(), 16, 16)) {
+            ExecutionResult firstResult = await(scheduler.schedule(terminalSiblingPlan, request(Map.of())));
+            assertEquals(ExecutionStatus.SUCCEEDED, firstResult.status());
+            assertTrue(deferred.firstToken.isCancellationRequested());
+
+            ExecutionHandle second = scheduler.schedule(linearPlan, request(Map.of()));
+            boolean enteredBeforeSourceCompletion = deferred.secondEntered.await(200, TimeUnit.MILLISECONDS);
+            deferred.firstCompletion.complete(
+                    NodeResult.continueWith(Map.of(), java.util.Set.of("NEXT")));
+
+            assertFalse(enteredBeforeSourceCompletion);
+            assertEquals(ExecutionStatus.SUCCEEDED, await(second).status());
+            assertTrue(deferred.secondEntered.await(2, TimeUnit.SECONDS));
+            assertEquals(0, lateSideEffects.get());
+        }
+    }
+
+    @Test
+    void non_future_stage_retains_node_admission_after_cancellation_until_source_completion()
+            throws Exception {
+        DeferredStageExecutor deferred = new DeferredStageExecutor();
+        Map<String, CompiledComponentContract> contracts = Map.of(
+                "builtin.start", contract("builtin.start", ComponentType.START, Map.of(), Map.of()),
+                "test.first-deferred", contract(
+                        "test.first-deferred", ComponentType.SCRIPT, Map.of(), Map.of(), 8),
+                "test.second-deferred", contract(
+                        "test.second-deferred", ComponentType.SCRIPT, Map.of(), Map.of(), 8),
+                "builtin.end", contract("builtin.end", ComponentType.END, Map.of(), Map.of()));
+        ExecutionPlan firstPlan = compile(List.of(
+                        node("start-a", "builtin.start", "startA", Map.of()),
+                        node("deferred-a", "test.first-deferred", "deferredA", Map.of()),
+                        node("end-a", "builtin.end", "endA", Map.of("resultStatus", "SUCCESS"))),
+                List.of(edge("e1", "start-a", "deferred-a", "NEXT", "IN"),
+                        edge("e2", "deferred-a", "end-a", "NEXT", "IN")), contracts);
+        ExecutionPlan secondPlan = compile(List.of(
+                        node("start-b", "builtin.start", "startB", Map.of()),
+                        node("deferred-b", "test.second-deferred", "deferredB", Map.of()),
+                        node("end-b", "builtin.end", "endB", Map.of("resultStatus", "SUCCESS"))),
+                List.of(edge("e3", "start-b", "deferred-b", "NEXT", "IN"),
+                        edge("e4", "deferred-b", "end-b", "NEXT", "IN")), contracts);
+        NodeExecutorRegistry registry = NodeExecutorRegistry.withBuiltIns(List.of(deferred));
+
+        try (DagScheduler scheduler = new DagScheduler(
+                registry, ConcurrencyGovernor.defaults(), Clock.systemUTC(), 1, 16)) {
+            ExecutionHandle first = scheduler.schedule(firstPlan, request(Map.of()));
+            assertTrue(deferred.firstEntered.await(2, TimeUnit.SECONDS));
+            assertTrue(first.cancel());
+            assertEquals(ExecutionStatus.CANCELLED, await(first).status());
+
+            ExecutionHandle second = scheduler.schedule(secondPlan, request(Map.of()));
+            boolean enteredBeforeSourceCompletion = deferred.secondEntered.await(200, TimeUnit.MILLISECONDS);
+            deferred.firstCompletion.complete(
+                    NodeResult.continueWith(Map.of(), java.util.Set.of("NEXT")));
+
+            assertFalse(enteredBeforeSourceCompletion);
+            assertEquals(ExecutionStatus.SUCCEEDED, await(second).status());
+            assertTrue(deferred.secondEntered.await(2, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void non_future_stage_retains_component_capacity_after_deadline_until_source_completion()
+            throws Exception {
+        DeferredStageExecutor deferred = new DeferredStageExecutor();
+        FlowNode start = node("start", "builtin.start", "start", Map.of());
+        FlowNode delayed = node("delayed", "test.deadline-deferred", "delayed", Map.of());
+        FlowNode end = node("end", "builtin.end", "end", Map.of("resultStatus", "SUCCESS"));
+        ExecutionPlan plan = compile(List.of(start, delayed, end), List.of(
+                edge("e1", "start", "delayed", "NEXT", "IN"),
+                edge("e2", "delayed", "end", "NEXT", "IN")), Map.of(
+                        "builtin.start", contract("builtin.start", ComponentType.START, Map.of(), Map.of()),
+                        "test.deadline-deferred", contract(
+                                "test.deadline-deferred", ComponentType.SCRIPT, Map.of(), Map.of(), 1),
+                        "builtin.end", contract("builtin.end", ComponentType.END, Map.of(), Map.of())));
+        NodeExecutorRegistry registry = NodeExecutorRegistry.withBuiltIns(List.of(deferred));
+
+        try (DagScheduler scheduler = new DagScheduler(
+                registry, ConcurrencyGovernor.defaults(), Clock.systemUTC(), 16, 16)) {
+            ExecutionResult timedOut = await(scheduler.schedule(
+                    plan, request(Map.of(), Instant.now().plus(150, ChronoUnit.MILLIS))));
+            assertEquals(ExecutionStatus.FAILED, timedOut.status());
+            assertEquals("EXECUTION_DEADLINE_EXCEEDED", timedOut.errorCode());
+            assertTrue(deferred.firstToken.isCancellationRequested());
+
+            ExecutionHandle second = scheduler.schedule(plan, request(Map.of()));
+            boolean enteredBeforeSourceCompletion = deferred.secondEntered.await(200, TimeUnit.MILLISECONDS);
+            deferred.firstCompletion.complete(
+                    NodeResult.continueWith(Map.of(), java.util.Set.of("NEXT")));
+
+            assertFalse(enteredBeforeSourceCompletion);
+            assertEquals(ExecutionStatus.SUCCEEDED, await(second).status());
+            assertTrue(deferred.secondEntered.await(2, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void spontaneous_source_stage_cancellation_is_a_node_failure_and_cancels_siblings() throws Exception {
+        CountDownLatch siblingStarted = new CountDownLatch(1);
+        CountDownLatch siblingObservedCancellation = new CountDownLatch(1);
+        NodeExecutor executor = new NodeExecutor() {
+            @Override
+            public ComponentType supports() {
+                return ComponentType.SCRIPT;
+            }
+
+            @Override
+            public NodeInvocation execute(NodeExecutionContext context) {
+                if (context.node().node().nodeCode().equals("cancelledSource")) {
+                    try {
+                        if (!siblingStarted.await(2, TimeUnit.SECONDS)) {
+                            throw new IllegalStateException("sibling did not start");
+                        }
+                    } catch (InterruptedException exception) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException(exception);
+                    }
+                    CompletableFuture<NodeResult> cancelled = new CompletableFuture<>();
+                    cancelled.cancel(false);
+                    return new NodeInvocation(cancelled, ComponentInvocation.emptyContent());
+                }
+                siblingStarted.countDown();
+                try {
+                    while (true) {
+                        context.throwIfStopped();
+                        Thread.sleep(25);
+                    }
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    context.throwIfStopped();
+                    throw new IllegalStateException(exception);
+                } finally {
+                    if (context.cancellationToken().isCancellationRequested()) {
+                        siblingObservedCancellation.countDown();
+                    }
+                }
+            }
+        };
+        FlowNode start = node("start", "builtin.start", "start", Map.of());
+        FlowNode cancelled = node("cancelled", "test.cancelled", "cancelledSource", Map.of());
+        FlowNode sibling = node("sibling", "test.cancelled", "sibling", Map.of());
+        FlowNode end = node("end", "builtin.end", "end", Map.of("resultStatus", "SUCCESS"));
+        ExecutionPlan plan = compile(List.of(start, cancelled, sibling, end), List.of(
+                edge("e1", "start", "cancelled", "NEXT", "IN"),
+                edge("e2", "start", "sibling", "NEXT", "IN"),
+                edge("e3", "cancelled", "end", "NEXT", "IN"),
+                edge("e4", "sibling", "end", "NEXT", "IN")), Map.of(
+                        "builtin.start", contract("builtin.start", ComponentType.START, Map.of(), Map.of()),
+                        "test.cancelled", contract("test.cancelled", ComponentType.SCRIPT, Map.of(), Map.of()),
+                        "builtin.end", contract("builtin.end", ComponentType.END, Map.of(), Map.of())));
+        NodeExecutorRegistry registry = NodeExecutorRegistry.withBuiltIns(List.of(executor));
+
+        try (FlowEngine engine = new FlowEngine(registry, ConcurrencyGovernor.defaults(), Clock.systemUTC())) {
+            ExecutionResult result = await(engine.execute(plan, request(Map.of())));
+            assertEquals(ExecutionStatus.FAILED, result.status());
+            assertEquals("NODE_COMPLETION_CANCELLED", result.errorCode());
+            assertEquals("node completion was cancelled", result.errorMessage());
+            assertTrue(siblingObservedCancellation.await(2, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void default_runtime_resources_enforce_component_limits_across_engine_instances() throws Exception {
+        SharedLimitExecutor shared = new SharedLimitExecutor();
+        NodeExecutorRegistry registry = NodeExecutorRegistry.withBuiltIns(List.of(shared));
+        ExecutionPlan plan = sharedLimitPlan();
+
+        try (FlowEngine firstEngine = new FlowEngine(registry);
+                FlowEngine secondEngine = new FlowEngine(registry)) {
+            ExecutionHandle first = firstEngine.execute(plan, request(Map.of()));
+            assertTrue(shared.firstEntered.await(2, TimeUnit.SECONDS));
+            ExecutionHandle second = secondEngine.execute(plan, request(Map.of()));
+            boolean concurrentEntry = shared.secondEntered.await(200, TimeUnit.MILLISECONDS);
+            shared.releaseFirst.countDown();
+
+            assertFalse(concurrentEntry);
+            assertEquals(ExecutionStatus.SUCCEEDED, await(first).status());
+            assertEquals(ExecutionStatus.SUCCEEDED, await(second).status());
+            assertTrue(shared.secondEntered.await(2, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void default_scheduler_governor_is_shared_across_instances() throws Exception {
+        SharedLimitExecutor shared = new SharedLimitExecutor();
+        NodeExecutorRegistry registry = NodeExecutorRegistry.withBuiltIns(List.of(shared));
+        ExecutionPlan plan = sharedLimitPlan();
+
+        try (DagScheduler firstScheduler = new DagScheduler(
+                        registry, ConcurrencyGovernor.defaults(), Clock.systemUTC());
+                DagScheduler secondScheduler = new DagScheduler(
+                        registry, ConcurrencyGovernor.defaults(), Clock.systemUTC())) {
+            ExecutionHandle first = firstScheduler.schedule(plan, request(Map.of()));
+            assertTrue(shared.firstEntered.await(2, TimeUnit.SECONDS));
+            ExecutionHandle second = secondScheduler.schedule(plan, request(Map.of()));
+            boolean concurrentEntry = shared.secondEntered.await(200, TimeUnit.MILLISECONDS);
+            shared.releaseFirst.countDown();
+
+            assertFalse(concurrentEntry);
+            assertEquals(ExecutionStatus.SUCCEEDED, await(first).status());
+            assertEquals(ExecutionStatus.SUCCEEDED, await(second).status());
+            assertTrue(shared.secondEntered.await(2, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void default_engines_share_the_process_execution_admission_limit() throws Exception {
+        HoldingExecutor holding = new HoldingExecutor(0);
+        NodeExecutorRegistry registry = NodeExecutorRegistry.withBuiltIns(List.of(holding));
+        ExecutionPlan plan = blockingPlan();
+        List<ExecutionHandle> admitted = new ArrayList<>(1024);
+
+        try (FlowEngine firstEngine = new FlowEngine(registry);
+                FlowEngine secondEngine = new FlowEngine(registry)) {
+            for (int index = 0; index < 1024; index++) {
+                FlowEngine engine = index % 2 == 0 ? firstEngine : secondEngine;
+                admitted.add(engine.execute(plan, request(Map.of())));
+            }
+
+            ExecutionResult excess = await(firstEngine.execute(plan, request(Map.of())));
+            assertEquals(ExecutionStatus.FAILED, excess.status());
+            assertEquals("EXECUTION_CAPACITY_EXCEEDED", excess.errorCode());
+
+            admitted.forEach(ExecutionHandle::cancel);
+            for (ExecutionHandle handle : admitted) {
+                assertEquals(ExecutionStatus.CANCELLED, await(handle).status());
+            }
+        }
+    }
+
+    @Test
+    void default_engine_node_admission_is_bounded_across_instances() throws Exception {
+        HoldingExecutor holding = new HoldingExecutor(1024);
+        NodeExecutorRegistry registry = NodeExecutorRegistry.withBuiltIns(List.of(holding));
+        ExecutionPlan plan = wideHoldingPlan(600);
+        ConcurrencyGovernor firstGovernor = new ConcurrencyGovernor(
+                2048, 2048, 2048, 2048, 2048, Clock.systemUTC());
+        ConcurrencyGovernor secondGovernor = new ConcurrencyGovernor(
+                2048, 2048, 2048, 2048, 2048, Clock.systemUTC());
+
+        try (FlowEngine firstEngine = new FlowEngine(registry, firstGovernor, Clock.systemUTC());
+                FlowEngine secondEngine = new FlowEngine(registry, secondGovernor, Clock.systemUTC())) {
+            ExecutionHandle first = firstEngine.execute(plan, request(Map.of()));
+            ExecutionHandle second = secondEngine.execute(plan, request(Map.of()));
+            assertTrue(holding.expectedEntries.await(5, TimeUnit.SECONDS));
+            Thread.sleep(200);
+
+            assertEquals(1024, holding.entered.get());
+            assertTrue(first.cancel());
+            assertTrue(second.cancel());
+            assertEquals(ExecutionStatus.CANCELLED, await(first).status());
+            assertEquals(ExecutionStatus.CANCELLED, await(second).status());
+        }
+    }
+
+    private static ExecutionPlan sharedLimitPlan() {
+        FlowNode start = node("start", "builtin.start", "start", Map.of());
+        FlowNode limited = node("limited", "test.shared-limit", "limited", Map.of());
+        FlowNode end = node("end", "builtin.end", "end", Map.of("resultStatus", "SUCCESS"));
+        return compile(List.of(start, limited, end), List.of(
+                edge("e1", "start", "limited", "NEXT", "IN"),
+                edge("e2", "limited", "end", "NEXT", "IN")), Map.of(
+                        "builtin.start", contract("builtin.start", ComponentType.START, Map.of(), Map.of()),
+                        "test.shared-limit", contract(
+                                "test.shared-limit", ComponentType.SCRIPT, Map.of(), Map.of(), 1),
+                        "builtin.end", contract("builtin.end", ComponentType.END, Map.of(), Map.of())));
+    }
+
+    private static ExecutionPlan wideHoldingPlan(int width) {
+        List<FlowNode> nodes = new ArrayList<>(width + 2);
+        List<FlowEdge> edges = new ArrayList<>(width * 2);
+        FlowNode start = node("wide-start", "builtin.start", "wideStart", Map.of());
+        FlowNode end = node("wide-end", "builtin.end", "wideEnd", Map.of("resultStatus", "SUCCESS"));
+        nodes.add(start);
+        for (int index = 0; index < width; index++) {
+            String nodeId = "hold-" + index;
+            nodes.add(node(nodeId, "test.node-admission", nodeId, Map.of()));
+            edges.add(edge("start-" + index, start.id(), nodeId, "NEXT", "IN"));
+            edges.add(edge("end-" + index, nodeId, end.id(), "NEXT", "IN"));
+        }
+        nodes.add(end);
+        return compile(nodes, edges, Map.of(
+                "builtin.start", contract("builtin.start", ComponentType.START, Map.of(), Map.of()),
+                "test.node-admission", contract(
+                        "test.node-admission", ComponentType.SCRIPT, Map.of(), Map.of(), 2048),
+                "builtin.end", contract("builtin.end", ComponentType.END, Map.of(), Map.of())));
+    }
+
     private static ExecutionPlan blockingPlan() {
         FlowNode start = node("start", "builtin.start", "start", Map.of());
         FlowNode blocking = node("blocking", "test.blocking", "blocking", Map.of());
@@ -311,6 +673,100 @@ class CancellationAndDeadlineTest {
             return new NodeInvocation(completion,
                     com.playrewards.flowengine.spi.ComponentInvocation.emptyContent());
         }
+    }
+
+    private static final class DeferredStageExecutor implements NodeExecutor {
+
+        private final AtomicInteger invocations = new AtomicInteger();
+        private final CountDownLatch firstEntered = new CountDownLatch(1);
+        private final CountDownLatch secondEntered = new CountDownLatch(1);
+        private final CompletableFuture<NodeResult> firstCompletion = new CompletableFuture<>();
+        private volatile CancellationToken firstToken;
+
+        @Override
+        public ComponentType supports() {
+            return ComponentType.SCRIPT;
+        }
+
+        @Override
+        public NodeInvocation execute(NodeExecutionContext context) {
+            if (invocations.incrementAndGet() == 1) {
+                firstToken = context.cancellationToken();
+                firstEntered.countDown();
+                CompletionStage<NodeResult> stage = nonFutureStage(firstCompletion);
+                assertFalse(stage instanceof Future<?>);
+                return new NodeInvocation(stage, ComponentInvocation.emptyContent());
+            }
+            secondEntered.countDown();
+            return NodeInvocation.completed(NodeResult.continueWith(Map.of(), java.util.Set.of("NEXT")));
+        }
+    }
+
+    private static final class SharedLimitExecutor implements NodeExecutor {
+
+        private final AtomicInteger invocations = new AtomicInteger();
+        private final CountDownLatch firstEntered = new CountDownLatch(1);
+        private final CountDownLatch secondEntered = new CountDownLatch(1);
+        private final CountDownLatch releaseFirst = new CountDownLatch(1);
+
+        @Override
+        public ComponentType supports() {
+            return ComponentType.SCRIPT;
+        }
+
+        @Override
+        public NodeInvocation execute(NodeExecutionContext context) {
+            if (invocations.incrementAndGet() == 1) {
+                firstEntered.countDown();
+                try {
+                    if (!releaseFirst.await(2, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("first execution was not released");
+                    }
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(exception);
+                }
+            } else {
+                secondEntered.countDown();
+            }
+            return NodeInvocation.completed(NodeResult.continueWith(Map.of(), java.util.Set.of("NEXT")));
+        }
+    }
+
+    private static final class HoldingExecutor implements NodeExecutor {
+
+        private final AtomicInteger entered = new AtomicInteger();
+        private final CountDownLatch expectedEntries;
+
+        private HoldingExecutor(int expectedEntries) {
+            this.expectedEntries = new CountDownLatch(expectedEntries);
+        }
+
+        @Override
+        public ComponentType supports() {
+            return ComponentType.SCRIPT;
+        }
+
+        @Override
+        public NodeInvocation execute(NodeExecutionContext context) {
+            entered.incrementAndGet();
+            expectedEntries.countDown();
+            return new NodeInvocation(new CompletableFuture<>(), ComponentInvocation.emptyContent());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> CompletionStage<T> nonFutureStage(CompletableFuture<T> delegate) {
+        return (CompletionStage<T>) Proxy.newProxyInstance(
+                CancellationAndDeadlineTest.class.getClassLoader(),
+                new Class<?>[] {CompletionStage.class},
+                (proxy, method, arguments) -> {
+                    try {
+                        return method.invoke(delegate, arguments);
+                    } catch (InvocationTargetException exception) {
+                        throw exception.getCause();
+                    }
+                });
     }
 
     /** Legal CompletionStage whose optional conversion method is deliberately unavailable. */

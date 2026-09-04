@@ -54,8 +54,9 @@ public final class StartNodeExecutor implements NodeExecutor {
 
     private static Map<String, Declaration> declarations(NodeExecutionContext context,
             Map<String, OutputSlotContract> outputs) {
-        Object raw = context.node().node().config().get("inputProtocols");
-        if (raw == null) {
+        Map<String, Object> config = context.node().node().config();
+        Object raw = config.get("inputProtocols");
+        if (!config.containsKey("inputProtocols")) {
             Object legacy = legacyInputProtocols(context.node().componentContract().configSchema());
             if (legacy != null) {
                 return parseDeclarations(legacy, outputs, "legacy input protocol");

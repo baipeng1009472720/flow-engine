@@ -25,6 +25,7 @@ import com.playrewards.flowengine.contract.flow.FlowEdge;
 import com.playrewards.flowengine.contract.flow.FlowNode;
 import com.playrewards.flowengine.contract.protocol.ProtocolSchema;
 import com.playrewards.flowengine.core.compile.ExecutionPlan;
+import com.playrewards.flowengine.core.compile.FlowCompilationException;
 import com.playrewards.flowengine.core.compile.FlowCompiler;
 import com.playrewards.flowengine.core.node.NodeExecutionContext;
 import com.playrewards.flowengine.core.node.NodeExecutor;
@@ -154,6 +155,50 @@ class EphemeralExecutionTest {
             ExecutionResult unexpected = await(engine.execute(emptyPlan, request(Map.of("extra", "value"))));
             assertEquals(ExecutionStatus.FAILED, unexpected.status());
             assertEquals("START_INPUT_UNKNOWN", unexpected.errorCode());
+        }
+    }
+
+    @Test
+    void rejects_explicit_null_start_contract_without_using_legacy_fallback() throws Exception {
+        Map<String, Object> config = new LinkedHashMap<>();
+        config.put("inputProtocols", null);
+        FlowNode start = node("start", "builtin.start", "start", config);
+        FlowNode end = node("end", "builtin.end", "end", Map.of("resultStatus", "SUCCESS"));
+        ExecutionPlan plan = compile(List.of(start, end),
+                List.of(edge("e1", "start", "end", "NEXT", "IN")), Map.of(
+                        "builtin.start", contract("builtin.start", ComponentType.START, Map.of(), Map.of()),
+                        "builtin.end", contract("builtin.end", ComponentType.END, Map.of(), Map.of())));
+
+        try (FlowEngine engine = new FlowEngine()) {
+            ExecutionResult result = await(engine.execute(plan, request(Map.of())));
+            assertEquals(ExecutionStatus.FAILED, result.status());
+            assertEquals("START_CONFIG_INVALID", result.errorCode());
+        }
+    }
+
+    @Test
+    void schema_validation_failure_does_not_expose_the_rejected_value() throws Exception {
+        ProtocolSchema password = protocol("password", Map.of(
+                "type", "string", "enum", List.of("allowed")));
+        FlowNode start = node("start", "builtin.start", "start", Map.of(
+                "inputProtocols", List.of(inputProtocol("password", true, password))));
+        FlowNode end = node("end", "builtin.end", "end", Map.of("resultStatus", "SUCCESS"));
+        ExecutionPlan plan = compile(List.of(start, end),
+                List.of(edge("e1", "start", "end", "NEXT", "IN")), Map.of(
+                        "builtin.start", contract("builtin.start", ComponentType.START, Map.of(),
+                                Map.of("password", output(password))),
+                        "builtin.end", contract("builtin.end", ComponentType.END, Map.of(), Map.of())));
+
+        try (FlowEngine engine = new FlowEngine()) {
+            ExecutionResult result = await(engine.execute(
+                    plan, request(Map.of("password", "password=top-secret"))));
+            String json = JSON.toJSONString(result);
+
+            assertEquals(ExecutionStatus.FAILED, result.status());
+            assertEquals("START_INPUT_INVALID", result.errorCode());
+            assertEquals("startInputs.password failed declared JSON Schema validation", result.errorMessage());
+            assertFalse(json.contains("top-secret"));
+            assertFalse(result.toString().contains("top-secret"));
         }
     }
 
@@ -299,7 +344,7 @@ class EphemeralExecutionTest {
     }
 
     @Test
-    void variable_rejects_a_source_schema_that_is_not_assignable_to_its_output() throws Exception {
+    void compiler_rejects_a_variable_source_schema_that_is_not_assignable_to_its_output() {
         ProtocolSchema booleanAlias = protocol("boolean-alias", Map.of("type", "boolean"));
         ProtocolSchema stringValue = protocol("text", Map.of("type", "string"));
         FlowNode start = node("start", "builtin.start", "start", Map.of(
@@ -310,21 +355,19 @@ class EphemeralExecutionTest {
                 "valueMode", "FIXED", "valueSources", List.of(
                         source("start", "flag"), source("start", "text"))));
         FlowNode end = node("end", "builtin.end", "end", Map.of("resultStatus", "SUCCESS"));
-        ExecutionPlan plan = compile(List.of(start, variable, end), List.of(
-                edge("e1", "start", "variable", "NEXT", "IN"),
-                edge("e2", "variable", "end", "NEXT", "IN")), Map.of(
-                        "builtin.start", contract("builtin.start", ComponentType.START, Map.of(),
-                                Map.of("flag", output(booleanAlias), "text", output(stringValue))),
-                        "builtin.variable", contract("builtin.variable", ComponentType.VARIABLE, Map.of(),
-                                Map.of("value", output(BOOLEAN))),
-                        "builtin.end", contract("builtin.end", ComponentType.END, Map.of(), Map.of())));
+        FlowCompilationException failure = assertThrows(FlowCompilationException.class, () -> compile(
+                List.of(start, variable, end), List.of(
+                        edge("e1", "start", "variable", "NEXT", "IN"),
+                        edge("e2", "variable", "end", "NEXT", "IN")), Map.of(
+                                "builtin.start", contract("builtin.start", ComponentType.START, Map.of(),
+                                        Map.of("flag", output(booleanAlias), "text", output(stringValue))),
+                                "builtin.variable", contract("builtin.variable", ComponentType.VARIABLE, Map.of(),
+                                        Map.of("value", output(BOOLEAN))),
+                                "builtin.end", contract("builtin.end", ComponentType.END, Map.of(), Map.of()))));
 
-        try (FlowEngine engine = new FlowEngine()) {
-            ExecutionResult result = await(engine.execute(plan, request(Map.of("flag", true, "text", "later"))));
-            assertEquals(ExecutionStatus.FAILED, result.status());
-            assertEquals("VARIABLE_SOURCE_PROTOCOL_MISMATCH", result.errorCode());
-            assertTrue(result.errorMessage().contains("start.text"));
-        }
+        assertTrue(failure.issues().stream().anyMatch(
+                issue -> "FLOW_VARIABLE_SOURCE_SCHEMA_MISMATCH".equals(issue.code())
+                        && "config.valueSources.1".equals(issue.path())));
     }
 
     @Test
@@ -609,8 +652,14 @@ class EphemeralExecutionTest {
 
     static CompiledComponentContract contract(String code, ComponentType type,
             Map<String, InputSlotContract> inputs, Map<String, OutputSlotContract> outputs) {
+        return contract(code, type, inputs, outputs, 1024);
+    }
+
+    static CompiledComponentContract contract(String code, ComponentType type,
+            Map<String, InputSlotContract> inputs, Map<String, OutputSlotContract> outputs,
+            int maxConcurrency) {
         return new CompiledComponentContract(code, type, null, Map.of(), inputs, outputs,
-                new ComponentCapabilities(ComponentEffect.PURE, true, false, false, 1024));
+                new ComponentCapabilities(ComponentEffect.PURE, true, false, false, maxConcurrency));
     }
 
     static OutputSlotContract output(ProtocolSchema protocol) {

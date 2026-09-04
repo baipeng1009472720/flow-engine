@@ -99,6 +99,7 @@ public final class FlowCompiler {
         validateBranchStructures(nodesById, contractsByNode, graph, issues);
         validateLoopStructure(nodesById, contractsByNode, graph, loopPairs, issues);
         Map<String, String> lockPairs = validateLockStructure(nodesById, contractsByNode, graph, issues);
+        validateConfiguredBindings(nodesById, contractsByNode, graph, issues);
 
         Map<String, Map<String, InputBinding>> bindingsByNode = parseAndValidateBindings(
                 nodesById, contractsByNode, graph, issues);
@@ -530,6 +531,130 @@ public final class FlowCompiler {
         return result;
     }
 
+    private void validateConfiguredBindings(Map<String, FlowNode> nodes,
+            Map<String, CompiledComponentContract> contracts, Graph graph,
+            List<CompilationIssue> issues) {
+        for (FlowNode target : nodes.values()) {
+            ComponentType componentType = type(target, contracts);
+            if (componentType == ComponentType.IF && target.config().containsKey("conditionBinding")) {
+                validateIfConditionBinding(target, nodes, contracts, graph, issues);
+            } else if (componentType == ComponentType.END && target.config().containsKey("returnBinding")) {
+                validateEndReturnBinding(target, nodes, contracts, graph, issues);
+            } else if (componentType == ComponentType.VARIABLE && target.config().containsKey("valueSources")) {
+                validateVariableSources(target, nodes, contracts, graph, issues);
+            }
+        }
+    }
+
+    private void validateIfConditionBinding(FlowNode target, Map<String, FlowNode> nodes,
+            Map<String, CompiledComponentContract> contracts, Graph graph,
+            List<CompilationIssue> issues) {
+        String path = "config.conditionBinding";
+        ConfiguredSource source = parseConfiguredSource(target.config().get("conditionBinding"), target,
+                path, "FLOW_IF_CONDITION_BINDING_INVALID", issues);
+        OutputSlotContract output = validateConfiguredSource(source, target, nodes, contracts, graph, path,
+                "FLOW_IF_CONDITION_SOURCE_NOT_FOUND",
+                "FLOW_IF_CONDITION_SOURCE_OUTPUT_NOT_FOUND",
+                "FLOW_IF_CONDITION_SOURCE_NOT_UPSTREAM", issues);
+        if (output != null && !schemaCompatibility.isAssignable(
+                output.protocol().schema(), Map.of("type", "boolean"))) {
+            issues.add(issue("FLOW_IF_CONDITION_SCHEMA_MISMATCH", target.id(), path,
+                    "IF 条件来源输出必须可赋值为 boolean"));
+        }
+    }
+
+    private static void validateEndReturnBinding(FlowNode target, Map<String, FlowNode> nodes,
+            Map<String, CompiledComponentContract> contracts, Graph graph,
+            List<CompilationIssue> issues) {
+        String path = "config.returnBinding";
+        ConfiguredSource source = parseConfiguredSource(target.config().get("returnBinding"), target,
+                path, "FLOW_END_RETURN_BINDING_INVALID", issues);
+        validateConfiguredSource(source, target, nodes, contracts, graph, path,
+                "FLOW_END_RETURN_SOURCE_NOT_FOUND",
+                "FLOW_END_RETURN_SOURCE_OUTPUT_NOT_FOUND",
+                "FLOW_END_RETURN_SOURCE_NOT_UPSTREAM", issues);
+    }
+
+    private void validateVariableSources(FlowNode target, Map<String, FlowNode> nodes,
+            Map<String, CompiledComponentContract> contracts, Graph graph,
+            List<CompilationIssue> issues) {
+        Object raw = target.config().get("valueSources");
+        if (!(raw instanceof List<?> values)) {
+            issues.add(issue("FLOW_VARIABLE_VALUE_SOURCES_INVALID", target.id(), "config.valueSources",
+                    "VARIABLE valueSources 必须是数组"));
+            return;
+        }
+        if (values.isEmpty()) {
+            issues.add(issue("FLOW_VARIABLE_VALUE_SOURCES_INVALID", target.id(), "config.valueSources",
+                    "VARIABLE valueSources 至少需要一个来源"));
+        }
+        CompiledComponentContract targetContract = contracts.get(target.id());
+        OutputSlotContract targetOutput = null;
+        if (targetContract != null && targetContract.outputSlots().size() == 1) {
+            targetOutput = targetContract.outputSlots().values().iterator().next();
+        } else {
+            issues.add(issue("FLOW_VARIABLE_OUTPUT_INVALID", target.id(), "componentCode.outputSlots",
+                    "VARIABLE 组件必须声明唯一输出槽位"));
+        }
+        for (int index = 0; index < values.size(); index++) {
+            String path = "config.valueSources." + index;
+            ConfiguredSource source = parseConfiguredSource(values.get(index), target, path,
+                    "FLOW_VARIABLE_VALUE_SOURCES_INVALID", issues);
+            OutputSlotContract sourceOutput = validateConfiguredSource(source, target, nodes, contracts, graph, path,
+                    "FLOW_VARIABLE_SOURCE_NOT_FOUND",
+                    "FLOW_VARIABLE_SOURCE_OUTPUT_NOT_FOUND",
+                    "FLOW_VARIABLE_SOURCE_NOT_UPSTREAM", issues);
+            if (sourceOutput != null && targetOutput != null && !schemaCompatibility.isAssignable(
+                    sourceOutput.protocol().schema(), targetOutput.protocol().schema())) {
+                issues.add(issue("FLOW_VARIABLE_SOURCE_SCHEMA_MISMATCH", target.id(), path,
+                        "VARIABLE 来源 Schema 不能安全赋值给目标输出"));
+            }
+        }
+    }
+
+    private static OutputSlotContract validateConfiguredSource(ConfiguredSource binding, FlowNode target,
+            Map<String, FlowNode> nodes, Map<String, CompiledComponentContract> contracts,
+            Graph graph, String path, String missingNodeCode, String missingOutputCode,
+            String notUpstreamCode, List<CompilationIssue> issues) {
+        if (binding == null) {
+            return null;
+        }
+        FlowNode source = nodes.get(binding.sourceNodeId());
+        if (source == null) {
+            issues.add(issue(missingNodeCode, target.id(), path, "配置绑定的来源节点不存在"));
+            return null;
+        }
+        CompiledComponentContract sourceContract = contracts.get(source.id());
+        OutputSlotContract output = sourceContract == null
+                ? null : sourceContract.outputSlots().get(binding.sourceOutputKey());
+        if (output == null) {
+            issues.add(issue(missingOutputCode, target.id(), path, "配置绑定的来源输出不存在"));
+        }
+        if (source.id().equals(target.id())
+                || !reachable(source.id(), graph.controlForward()).contains(target.id())) {
+            issues.add(issue(notUpstreamCode, target.id(), path,
+                    "配置绑定来源必须是控制图中可到达目标的上游节点"));
+        }
+        return output;
+    }
+
+    private static ConfiguredSource parseConfiguredSource(Object raw, FlowNode target, String path,
+            String invalidCode, List<CompilationIssue> issues) {
+        if (!(raw instanceof Map<?, ?> value)) {
+            issues.add(issue(invalidCode, target.id(), path,
+                    "配置绑定必须是包含 sourceNodeId 和 sourceOutputKey 的对象"));
+            return null;
+        }
+        String sourceNodeId = text(value.get("sourceNodeId"));
+        String sourceOutputKey = text(value.get("sourceOutputKey"));
+        if (sourceNodeId == null || sourceOutputKey == null) {
+            issues.add(issue(invalidCode, target.id(), path,
+                    "配置绑定必须包含非空 sourceNodeId 和 sourceOutputKey"));
+            return null;
+        }
+        return new ConfiguredSource(sourceNodeId, sourceOutputKey);
+    }
+
     private static Map<String, InputBinding> parseBindings(FlowNode node, List<CompilationIssue> issues) {
         Object raw = node.config().get("inputBindings");
         if (raw == null) {
@@ -798,6 +923,9 @@ public final class FlowCompiler {
     }
 
     private record NodePorts(Set<String> inputs, Set<String> outputs) {
+    }
+
+    private record ConfiguredSource(String sourceNodeId, String sourceOutputKey) {
     }
 
     private record Graph(

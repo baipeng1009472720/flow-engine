@@ -9,15 +9,30 @@ import java.util.Objects;
 /** Public embedded entry point for asynchronous EPHEMERAL flow execution. */
 public final class FlowEngine implements AutoCloseable {
 
+    private static final ConcurrencyGovernor PROCESS_GOVERNOR = ConcurrencyGovernor.defaults();
+
     private final DagScheduler scheduler;
 
-    /** Creates an engine containing the Task 5 built-in node executors and finite default permits. */
+    /** Creates an engine containing built-ins and process-shared finite concurrency resources. */
     public FlowEngine() {
-        this(NodeExecutorRegistry.builtIns(), ConcurrencyGovernor.defaults(), Clock.systemUTC());
+        this(NodeExecutorRegistry.builtIns());
+    }
+
+    /**
+     * Creates an engine with custom executors and process-shared finite concurrency resources.
+     *
+     * @param executors immutable component-type registry
+     */
+    public FlowEngine(NodeExecutorRegistry executors) {
+        this(executors, PROCESS_GOVERNOR, Clock.systemUTC());
     }
 
     /**
      * Creates an engine with explicit startup dependencies.
+     *
+     * <p>The supplied governor defines the sharing boundary. Production hosts must share one
+     * governor across engine instances; supplying independent governors deliberately isolates
+     * concurrency accounting and is intended only for controlled embedding or tests.</p>
      *
      * @param executors immutable component-type registry
      * @param governor hierarchical concurrency gate
