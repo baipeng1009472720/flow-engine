@@ -51,6 +51,7 @@ import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.ClassCodeExpressionTransformer;
 import org.codehaus.groovy.ast.ClassHelper;
 import org.codehaus.groovy.ast.ClassNode;
+import org.codehaus.groovy.ast.DynamicVariable;
 import org.codehaus.groovy.ast.expr.ArgumentListExpression;
 import org.codehaus.groovy.ast.expr.AttributeExpression;
 import org.codehaus.groovy.ast.expr.BinaryExpression;
@@ -61,6 +62,7 @@ import org.codehaus.groovy.ast.expr.DeclarationExpression;
 import org.codehaus.groovy.ast.expr.ElvisOperatorExpression;
 import org.codehaus.groovy.ast.expr.EmptyExpression;
 import org.codehaus.groovy.ast.expr.Expression;
+import org.codehaus.groovy.ast.expr.GStringExpression;
 import org.codehaus.groovy.ast.expr.ListExpression;
 import org.codehaus.groovy.ast.expr.MapEntryExpression;
 import org.codehaus.groovy.ast.expr.MapExpression;
@@ -122,16 +124,19 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
     private static final int MAX_RESULT_DEPTH = 32;
     private static final int MAX_RESULT_NODES = 10_000;
     private static final long STOP_POLL_MILLIS = 10;
+    private static final String INTERNAL_JSON_ROOTS = "__flowJsonRoots";
     private static final Set<String> ALLOWED_METHODS = Set.of(
-            "abs", "contains", "containsKey", "containsValue", "endsWith", "get", "isEmpty",
-            "length", "max", "min", "size", "startsWith", "strip",
-            "substring", "toLowerCase", "toUpperCase", "trim");
+            "contains", "containsKey", "containsValue", "endsWith", "get", "isEmpty",
+            "length", "max", "min", "size", "startsWith");
     private static final Set<String> ALLOWED_COLLECTION_METHODS = Set.of(
             "any", "collect", "every", "find", "findAll");
-    private static final Set<String> BUDGETED_STRING_METHODS = Set.of("toLowerCase", "toUpperCase");
+    private static final Set<String> BUDGETED_STRING_METHODS = Set.of(
+            "strip", "substring", "toLowerCase", "toUpperCase", "trim");
+    private static final Set<String> BUDGETED_NUMERIC_METHODS = Set.of("abs");
     private static final Set<String> LOG_METHODS = Set.of("print", "println");
     private static final Set<String> RESERVED_VARIABLES = Set.of(
-            "this", "super", "owner", "delegate", "binding", "out", "metaClass");
+            "this", "super", "owner", "delegate", "binding", "out", "metaClass",
+            INTERNAL_JSON_ROOTS);
     private static final Set<String> RESERVED_PROPERTIES = Set.of(
             "class", "metaClass", "classLoader", "declaredFields", "declaredMethods",
             "fields", "methods", "protectionDomain", "binding", "properties",
@@ -144,6 +149,8 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
             Types.LOGICAL_AND, Types.LOGICAL_OR,
             Types.PLUS, Types.MINUS, Types.MULTIPLY, Types.DIVIDE, Types.INTDIV, Types.MOD,
             Types.LEFT_SQUARE_BRACKET);
+    private static final Set<Integer> BUDGETED_BINARY_TOKENS = Set.of(
+            Types.PLUS, Types.MINUS, Types.MULTIPLY, Types.DIVIDE, Types.INTDIV, Types.MOD);
     private static final ThreadLocal<OperationBudget> ACTIVE_OPERATION_BUDGET = new ThreadLocal<>();
 
     private final Duration timeout;
@@ -270,9 +277,12 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
             control.throwIfStopped();
             output = new LoggingWriter(invocation.logger(), maxLogLineBytes,
                     maxLogTotalBytes, maxLogEntries);
-            Map<String, Object> variables = new LinkedHashMap<>(invocation.externalScopes());
-            variables.put("ctx", invocation.ctx());
-            Script script = InvokerHelper.createScript(compiled.scriptClass(), new Binding(variables));
+            Map<String, Object> jsonRoots = new LinkedHashMap<>(invocation.externalScopes());
+            jsonRoots.put("ctx", invocation.ctx());
+            Map<String, Object> bindings = new LinkedHashMap<>();
+            bindings.put(INTERNAL_JSON_ROOTS, Collections.unmodifiableMap(jsonRoots));
+            Script script = InvokerHelper.createScript(compiled.scriptClass(),
+                    new Binding(bindings));
             script.setProperty("out", new PrintWriter(output, true));
             Object rawResult;
             ACTIVE_OPERATION_BUDGET.set(new OperationBudget(
@@ -447,10 +457,54 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
         return map.get(key);
     }
 
+    /** Resolves a script root only from the adapter-injected JSON map, never Script properties. */
+    public static Object readExternalJsonRoot(Object receiver, String name) {
+        operationBudget().consume(1);
+        if (!(receiver instanceof Map<?, ?> roots) || !roots.containsKey(name)) {
+            throw new SecurityException("script sandbox JSON root is unavailable");
+        }
+        return roots.get(name);
+    }
+
+    /** Reads only an exact JSON object key or JSON array index, without Groovy getAt dispatch. */
+    public static Object readJsonIndex(Object receiver, Object index) {
+        operationBudget().consume(1);
+        if (receiver instanceof Map<?, ?> map) {
+            if (!(index instanceof String key)) {
+                throw new SecurityException("script sandbox JSON object index must be a string");
+            }
+            return map.get(key);
+        }
+        if (receiver instanceof List<?> list) {
+            int position = exactListIndex(index);
+            if (position < 0 || position >= list.size()) {
+                throw new SecurityException("script sandbox JSON array index is outside the list");
+            }
+            return list.get(position);
+        }
+        throw new SecurityException("script sandbox bracket receiver must be a JSON object or array");
+    }
+
+    private static int exactListIndex(Object value) {
+        long index;
+        if (value instanceof Byte || value instanceof Short || value instanceof Integer
+                || value instanceof Long) {
+            index = ((Number) value).longValue();
+        } else if (value instanceof BigInteger integer && integer.bitLength() < 63) {
+            index = integer.longValue();
+        } else {
+            throw new SecurityException("script sandbox JSON array index must be an integer");
+        }
+        if (index < Integer.MIN_VALUE || index > Integer.MAX_VALUE) {
+            throw new SecurityException("script sandbox JSON array index is outside the list");
+        }
+        return (int) index;
+    }
+
     /**
-     * Executes the two growth-capable binary operators after reserving their output budget.
+     * Executes every allocation-capable binary operator after reserving its output budget.
      *
-     * @param operator Groovy token; only plus and multiply are generated by the trusted transformer
+     * @param operator Groovy numeric/text/list token generated by the trusted transformer
      * @param left copied JSON operand
      * @param right copied JSON operand
      * @return bounded JSON scalar or list result
@@ -459,8 +513,25 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
         OperationBudget budget = operationBudget();
         return switch (operator) {
             case Types.PLUS -> budgetedPlus(left, right, budget);
+            case Types.MINUS, Types.DIVIDE, Types.INTDIV, Types.MOD ->
+                    budgetedNumeric(operator, left, right, budget);
             case Types.MULTIPLY -> budgetedMultiply(left, right, budget);
             default -> throw new SecurityException("script sandbox binary operator is not generated");
+        };
+    }
+
+    /** Executes unary numeric allocation only after reserving its projected result. */
+    public static Object applyBudgetedUnary(int operator, Object value) {
+        if (!(value instanceof Number number)) {
+            throw new SecurityException("script sandbox unary operand must be a JSON number");
+        }
+        OperationBudget budget = operationBudget();
+        long digits = numericAllocationBytes(number);
+        budget.reserveNumber(saturatedAdd(digits, 1), digits);
+        return switch (operator) {
+            case Types.PLUS -> NumberMath.unaryPlus(number);
+            case Types.MINUS -> NumberMath.unaryMinus(number);
+            default -> throw new SecurityException("script sandbox unary operator is not generated");
         };
     }
 
@@ -489,24 +560,100 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
     }
 
     /**
-     * Performs a case conversion only after reserving its Unicode worst-case expansion.
+     * Performs an allocation-capable string operation only after reserving a safe projection.
      *
-     * @param method compiler-approved zero-argument conversion
+     * @param method compiler-approved string operation
      * @param receiver copied JSON string
      * @return converted text using stable locale-independent rules
      */
-    public static Object applyBudgetedStringMethod(String method, Object receiver) {
+    public static Object applyBudgetedStringMethod(String method, Object receiver, Object... arguments) {
         if (!(receiver instanceof String text)) {
             throw new SecurityException("script sandbox string method requires a JSON string");
         }
         OperationBudget budget = operationBudget();
-        budget.consume(text.length());
-        budget.reserveString(saturatedMultiply(jsonStringPayloadBytes(text), 3));
+        long inputBytes = JsonValues.jsonStringContentBytes(text);
+        budget.consume(text.codePointCount(0, text.length()));
         return switch (method) {
-            case "toLowerCase" -> text.toLowerCase(Locale.ROOT);
-            case "toUpperCase" -> text.toUpperCase(Locale.ROOT);
+            case "toLowerCase" -> {
+                requireArity(method, arguments, 0, 0);
+                budget.reserveString(saturatedMultiply(inputBytes, 3));
+                yield text.toLowerCase(Locale.ROOT);
+            }
+            case "toUpperCase" -> {
+                requireArity(method, arguments, 0, 0);
+                budget.reserveString(saturatedMultiply(inputBytes, 3));
+                yield text.toUpperCase(Locale.ROOT);
+            }
+            case "trim" -> {
+                requireArity(method, arguments, 0, 0);
+                budget.reserveString(inputBytes);
+                yield text.trim();
+            }
+            case "strip" -> {
+                requireArity(method, arguments, 0, 0);
+                budget.reserveString(inputBytes);
+                yield text.strip();
+            }
+            case "substring" -> {
+                requireArity(method, arguments, 1, 2);
+                int begin = exactStringIndex(arguments[0]);
+                int end = arguments.length == 2 ? exactStringIndex(arguments[1]) : text.length();
+                if (begin < 0 || end < begin || end > text.length()) {
+                    throw new SecurityException("script sandbox substring indexes are outside the string");
+                }
+                // The full source bound is reserved before substring can allocate its copy.
+                budget.reserveString(inputBytes);
+                yield text.substring(begin, end);
+            }
             default -> throw new SecurityException("script sandbox string method is not generated");
         };
+    }
+
+    /** Executes an allowlisted numeric method after reserving its projected result. */
+    public static Object applyBudgetedNumericMethod(String method, Object receiver, Object... arguments) {
+        if (!(receiver instanceof Number number)) {
+            throw new SecurityException("script sandbox numeric method requires a JSON number");
+        }
+        requireArity(method, arguments, 0, 0);
+        long digits = numericAllocationBytes(number);
+        operationBudget().reserveNumber(saturatedAdd(digits, 1), digits);
+        if ("abs".equals(method)) {
+            return NumberMath.abs(number);
+        }
+        throw new SecurityException("script sandbox numeric method is not generated");
+    }
+
+    /** Builds one scalar-only interpolated string after all output resources are reserved. */
+    public static Object applyBudgetedGString(Object... parts) {
+        if (parts.length == 0 || (parts.length & 1) == 0) {
+            throw new SecurityException("script sandbox interpolation shape is invalid");
+        }
+        for (int index = 0; index < parts.length; index++) {
+            if ((index & 1) == 0 && !(parts[index] instanceof String)) {
+                throw new SecurityException("script sandbox interpolation segment must be text");
+            }
+        }
+        TextEstimate estimate = estimateScalarText(parts);
+        OperationBudget budget = operationBudget();
+        reserveTextEstimate(budget, estimate, true);
+        StringBuilder result = new StringBuilder();
+        for (Object part : parts) {
+            result.append(part instanceof String text ? text : scalarText(part));
+        }
+        return result.toString();
+    }
+
+    private static void requireArity(String method, Object[] arguments, int minimum, int maximum) {
+        if (arguments.length < minimum || arguments.length > maximum) {
+            throw new SecurityException("script sandbox " + method + " argument count is invalid");
+        }
+    }
+
+    private static int exactStringIndex(Object value) {
+        if (value instanceof Byte || value instanceof Short || value instanceof Integer) {
+            return ((Number) value).intValue();
+        }
+        throw new SecurityException("script sandbox substring indexes must be integers");
     }
 
     /** Builds a JSON list literal only after every referenced value fits the invocation budget. */
@@ -544,8 +691,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
     private static Object budgetedPlus(Object left, Object right, OperationBudget budget) {
         budget.consume(1);
         if (left instanceof Number leftNumber && right instanceof Number rightNumber) {
-            budget.ensureNumericGrowth(leftNumber, rightNumber, false);
-            return NumberMath.add(leftNumber, rightNumber);
+            return budgetedNumeric(Types.PLUS, leftNumber, rightNumber, budget);
         }
         if (left instanceof List<?> leftList && right instanceof List<?> rightList) {
             budget.reserveCombinedLists(leftList, rightList);
@@ -555,8 +701,8 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
             return Collections.unmodifiableList(result);
         }
         if (isTextScalar(left) || isTextScalar(right)) {
-            budget.reserveString(saturatedAdd(
-                    scalarTextJsonPayloadBytes(left), scalarTextJsonPayloadBytes(right)));
+            TextEstimate estimate = estimateScalarText(left, right);
+            reserveTextEstimate(budget, estimate, false);
             String leftText = scalarText(left);
             String rightText = scalarText(right);
             return leftText + rightText;
@@ -567,12 +713,11 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
     private static Object budgetedMultiply(Object left, Object right, OperationBudget budget) {
         budget.consume(1);
         if (left instanceof Number leftNumber && right instanceof Number rightNumber) {
-            budget.ensureNumericGrowth(leftNumber, rightNumber, true);
-            return NumberMath.multiply(leftNumber, rightNumber);
+            return budgetedNumeric(Types.MULTIPLY, leftNumber, rightNumber, budget);
         }
         int repetitions = exactRepetitions(right);
         if (left instanceof String text) {
-            budget.reserveString(saturatedMultiply(jsonStringPayloadBytes(text), repetitions));
+            budget.reserveString(JsonValues.jsonRepeatedStringContentBytes(text, repetitions));
             return text.repeat(repetitions);
         }
         if (left instanceof List<?> values) {
@@ -584,6 +729,38 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
             return Collections.unmodifiableList(result);
         }
         throw new SecurityException("script sandbox multiply operands must be JSON numbers, text or lists");
+    }
+
+    private static Object budgetedNumeric(int operator, Object left, Object right, OperationBudget budget) {
+        if (!(left instanceof Number leftNumber) || !(right instanceof Number rightNumber)) {
+            throw new SecurityException("script sandbox numeric operator requires JSON numbers");
+        }
+        long leftDigits = numericAllocationBytes(leftNumber);
+        long rightDigits = numericAllocationBytes(rightNumber);
+        long projected = switch (operator) {
+            case Types.PLUS, Types.MINUS ->
+                    saturatedAdd(saturatedAdd(leftDigits, rightDigits), 1);
+            case Types.MULTIPLY -> saturatedAdd(leftDigits, rightDigits);
+            case Types.DIVIDE -> saturatedAdd(saturatedAdd(leftDigits, rightDigits), 32);
+            case Types.INTDIV -> saturatedAdd(leftDigits, 1);
+            case Types.MOD -> saturatedAdd(Math.max(leftDigits, rightDigits), 1);
+            default -> throw new SecurityException("script sandbox numeric operator is not generated");
+        };
+        long complexity = switch (operator) {
+            case Types.MULTIPLY, Types.DIVIDE, Types.INTDIV, Types.MOD ->
+                    saturatedMultiply(leftDigits, rightDigits);
+            default -> saturatedAdd(leftDigits, rightDigits);
+        };
+        budget.reserveNumber(projected, complexity);
+        return switch (operator) {
+            case Types.PLUS -> NumberMath.add(leftNumber, rightNumber);
+            case Types.MINUS -> NumberMath.subtract(leftNumber, rightNumber);
+            case Types.MULTIPLY -> NumberMath.multiply(leftNumber, rightNumber);
+            case Types.DIVIDE -> NumberMath.divide(leftNumber, rightNumber);
+            case Types.INTDIV -> NumberMath.intdiv(leftNumber, rightNumber);
+            case Types.MOD -> NumberMath.mod(leftNumber, rightNumber);
+            default -> throw new SecurityException("script sandbox numeric operator is not generated");
+        };
     }
 
     private static int exactRepetitions(Object value) {
@@ -604,34 +781,80 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
     }
 
     private static boolean isTextScalar(Object value) {
-        return value instanceof String || value instanceof Character;
+        return value instanceof String;
     }
 
     private static String scalarText(Object value) {
-        if (value == null || value instanceof String || value instanceof Character
-                || value instanceof Number || value instanceof Boolean) {
+        if (value == null || value instanceof String || value instanceof Number || value instanceof Boolean) {
             return String.valueOf(value);
         }
         throw new SecurityException("script sandbox string concatenation accepts JSON scalars only");
     }
 
-    private static long scalarTextJsonPayloadBytes(Object value) {
-        if (value == null) {
-            return 4;
+    /** Estimates every string allocation before any scalar is rendered to text. */
+    private static TextEstimate estimateScalarText(Object... values) {
+        long bytes = 0;
+        long codePoints = 0;
+        List<Long> scalarAllocations = new ArrayList<>();
+        List<CharSequence> textRun = new ArrayList<>();
+        for (Object value : values) {
+            if (value instanceof String text) {
+                textRun.add(text);
+            } else {
+                if (!textRun.isEmpty()) {
+                    JsonValues.JsonStringUsage usage = JsonValues.measureJsonString(textRun);
+                    bytes = saturatedAdd(bytes, usage.contentBytes());
+                    codePoints = saturatedAdd(codePoints, usage.codePoints());
+                    textRun.clear();
+                }
+                if (value == null) {
+                    bytes = saturatedAdd(bytes, 4);
+                    codePoints = saturatedAdd(codePoints, 4);
+                } else if (value instanceof Number number) {
+                    long upperBound = JsonValues.javaNumberTextUpperBoundBytes(number);
+                    bytes = saturatedAdd(bytes, upperBound);
+                    codePoints = saturatedAdd(codePoints, upperBound);
+                    scalarAllocations.add(upperBound);
+                } else if (value instanceof Boolean bool) {
+                    long length = bool ? 4 : 5;
+                    bytes = saturatedAdd(bytes, length);
+                    codePoints = saturatedAdd(codePoints, length);
+                } else {
+                    throw new SecurityException(
+                            "script sandbox string concatenation accepts JSON scalars only");
+                }
+            }
         }
-        if (value instanceof String text) {
-            return jsonStringPayloadBytes(text);
+        if (!textRun.isEmpty()) {
+            JsonValues.JsonStringUsage usage = JsonValues.measureJsonString(textRun);
+            bytes = saturatedAdd(bytes, usage.contentBytes());
+            codePoints = saturatedAdd(codePoints, usage.codePoints());
         }
-        if (value instanceof Character character) {
-            return jsonStringPayloadBytes(character.toString());
+        return new TextEstimate(bytes, codePoints, List.copyOf(scalarAllocations));
+    }
+
+    private static void reserveTextEstimate(
+            OperationBudget budget, TextEstimate estimate, boolean consumeCodePoints) {
+        if (consumeCodePoints) {
+            budget.consume(estimate.codePoints());
         }
-        if (value instanceof Number number) {
-            return JsonMeasure.numberBytes(number);
+        for (long allocation : estimate.scalarAllocations()) {
+            budget.reserveString(allocation);
         }
-        if (value instanceof Boolean) {
-            return 5;
+        budget.reserveString(estimate.contentBytes());
+    }
+
+    /** Upper-bounds the digits a numeric operation may need without materializing numeric text. */
+    private static long numericAllocationBytes(Number value) {
+        if (value instanceof BigDecimal decimal) {
+            long scaleMagnitude = Math.abs((long) decimal.scale());
+            return saturatedAdd(saturatedAdd(decimal.precision(), scaleMagnitude), 3);
         }
-        throw new SecurityException("script sandbox string concatenation accepts JSON scalars only");
+        return JsonValues.javaNumberTextUpperBoundBytes(value);
+    }
+
+    /** Allocation and Unicode work reserved before scalar text construction. */
+    private record TextEstimate(long contentBytes, long codePoints, List<Long> scalarAllocations) {
     }
 
     private static Object find(List<?> values, Closure<?> closure, OperationBudget budget) {
@@ -662,7 +885,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
         budget.reserveCollectionStart();
         for (Object value : values) {
             budget.consume(1);
-            Object mapped = scalarClosureResult(closure.call(value), budget);
+            Object mapped = jsonClosureResult(closure.call(value), budget);
             budget.reserveCollectionElement(mapped);
             result.add(mapped);
         }
@@ -702,6 +925,12 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
         return value;
     }
 
+    private static Object jsonClosureResult(Object value, OperationBudget budget) {
+        JsonMeasure.of(value);
+        budget.observeJson(value);
+        return value;
+    }
+
     private static OperationBudget operationBudget() {
         OperationBudget budget = ACTIVE_OPERATION_BUDGET.get();
         if (budget == null) {
@@ -718,10 +947,14 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
     }
 
     private void validateInvocationInputs(ScriptInvocation invocation) {
-        InputResourceCounter counter = new InputResourceCounter(
-                maxInputBytes, maxInputStringBytes, maxInputDepth, maxInputNodes);
-        counter.visit(invocation.externalScopes(), 0);
-        counter.visit(invocation.ctx(), 0);
+        try {
+            JsonValues.measureJsonResources(List.of(invocation.externalScopes(), invocation.ctx()),
+                    new JsonValues.JsonResourceLimits(
+                            maxInputBytes, maxInputStringBytes, maxInputDepth, maxInputNodes));
+        } catch (JsonValues.JsonResourceLimitException failure) {
+            throw new ScriptExecutionException(
+                    "SCRIPT_INPUT_TOO_LARGE", "script input exceeds the configured resource limits");
+        }
     }
 
     private static Object normalize(Object value, int depth, ResultCounter counter) {
@@ -770,34 +1003,6 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
             offset += Character.charCount(codePoint);
         }
         return length;
-    }
-
-    /** Returns bytes inside JSON quotes, including escape expansion but excluding the quotes. */
-    private static long jsonStringPayloadBytes(String value) {
-        long bytes = 0;
-        for (int offset = 0; offset < value.length();) {
-            char unit = value.charAt(offset);
-            int codePoint = value.codePointAt(offset);
-            boolean validSurrogatePair = Character.isHighSurrogate(unit)
-                    && offset + 1 < value.length()
-                    && Character.isLowSurrogate(value.charAt(offset + 1));
-            if (codePoint == '"' || codePoint == '\\'
-                    || codePoint == '\b' || codePoint == '\f' || codePoint == '\n'
-                    || codePoint == '\r' || codePoint == '\t') {
-                bytes = saturatedAdd(bytes, 2);
-            } else if (codePoint < 0x20 || (Character.isSurrogate(unit) && !validSurrogatePair)) {
-                bytes = saturatedAdd(bytes, 6);
-            } else {
-                bytes = saturatedAdd(bytes, codePoint <= 0x7f ? 1
-                        : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4);
-            }
-            offset += validSurrogatePair ? 2 : 1;
-        }
-        return bytes;
-    }
-
-    private static long jsonEncodedStringBytes(String value) {
-        return saturatedAdd(jsonStringPayloadBytes(value), 2);
     }
 
     /** @return current cache size without exposing sources; package-local for runtime metrics/tests */
@@ -1100,85 +1305,6 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
         private int value;
     }
 
-    /** Counts copied input shape before any Groovy code or admission is reached. */
-    private static final class InputResourceCounter {
-
-        private final long maxBytes;
-        private final int maxStringBytes;
-        private final int maxDepth;
-        private final int maxNodes;
-        private long bytes;
-        private int nodes;
-
-        private InputResourceCounter(long maxBytes, int maxStringBytes, int maxDepth, int maxNodes) {
-            this.maxBytes = maxBytes;
-            this.maxStringBytes = maxStringBytes;
-            this.maxDepth = maxDepth;
-            this.maxNodes = maxNodes;
-        }
-
-        private void visit(Object value, int depth) {
-            if (depth > maxDepth || ++nodes > maxNodes) {
-                reject();
-            }
-            if (value == null) {
-                addBytes(4);
-                return;
-            }
-            if (value instanceof String text) {
-                int length = utf8Length(text);
-                if (length > maxStringBytes) {
-                    reject();
-                }
-                addBytes((long) length + 2);
-                return;
-            }
-            if (value instanceof Map<?, ?> map) {
-                addBytes(2L + map.size());
-                map.forEach((key, child) -> {
-                    if (key instanceof String text) {
-                        int length = utf8Length(text);
-                        if (length > maxStringBytes) {
-                            reject();
-                        }
-                        addBytes((long) length + 3);
-                    }
-                    visit(child, depth + 1);
-                });
-                return;
-            }
-            if (value instanceof Iterable<?> iterable) {
-                addBytes(2);
-                for (Object child : iterable) {
-                    addBytes(1);
-                    visit(child, depth + 1);
-                }
-                return;
-            }
-            if (value instanceof Number number) {
-                addBytes(JsonMeasure.numberBytes(number));
-                return;
-            }
-            if (value instanceof Boolean) {
-                addBytes(5);
-                return;
-            }
-            reject();
-        }
-
-        private void addBytes(long amount) {
-            bytes = saturatedAdd(bytes, amount);
-            if (bytes > maxBytes) {
-                reject();
-            }
-        }
-
-        private static void reject() {
-            throw new ScriptExecutionException(
-                    "SCRIPT_INPUT_TOO_LARGE", "script input exceeds the configured resource limits");
-        }
-    }
-
     /** Measures the raw result before normalization or allocating a complete JSON byte buffer. */
     private static final class ResultResourceCounter {
 
@@ -1203,15 +1329,15 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                 return;
             }
             if (value instanceof String text) {
-                addBytes(jsonEncodedStringBytes(text));
+                addBytes(JsonValues.jsonEncodedStringBytes(text));
                 return;
             }
             if (value instanceof Character character) {
-                addBytes(jsonEncodedStringBytes(character.toString()));
+                addBytes(JsonValues.jsonEncodedStringBytes(character.toString()));
                 return;
             }
             if (value instanceof CharSequence text) {
-                addBytes(jsonEncodedStringBytes(text.toString()));
+                addBytes(JsonValues.jsonEncodedStringBytes(text.toString()));
                 return;
             }
             if (value instanceof Boolean bool) {
@@ -1219,7 +1345,10 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                 return;
             }
             if (value instanceof Number number) {
-                addBytes(JsonMeasure.numberBytes(number));
+                if (numericAllocationBytes(number) > maxBytes) {
+                    tooLarge("script result exceeds the configured numeric workspace limit");
+                }
+                addBytes(JsonValues.jsonEncodedNumberBytes(number));
                 return;
             }
             if (value instanceof Map<?, ?> map) {
@@ -1234,7 +1363,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                         addBytes(1);
                     }
                     first = false;
-                    addBytes(saturatedAdd(jsonEncodedStringBytes(key), 1));
+                    addBytes(saturatedAdd(JsonValues.jsonEncodedStringBytes(key), 1));
                     visit(entry.getValue(), depth + 1);
                 }
                 return;
@@ -1322,7 +1451,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
 
         private void reserveObjectEntry(String key, Object value) {
             JsonMeasure measure = JsonMeasure.of(value);
-            reserve(saturatedAdd(saturatedAdd(jsonStringPayloadBytes(key), 4), measure.bytes()),
+            reserve(saturatedAdd(saturatedAdd(JsonValues.jsonStringContentBytes(key), 4), measure.bytes()),
                     measure.nodes());
         }
 
@@ -1341,15 +1470,9 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
             reserve(projectedBytes, projectedNodes);
         }
 
-        private void ensureNumericGrowth(Number left, Number right, boolean multiply) {
-            long leftBytes = JsonMeasure.numberBytes(left);
-            long rightBytes = JsonMeasure.numberBytes(right);
-            long projected = multiply
-                    ? saturatedAdd(leftBytes, rightBytes)
-                    : saturatedAdd(Math.max(leftBytes, rightBytes), 1);
-            if (projected > maxValueBytes) {
-                throw exhausted();
-            }
+        private void reserveNumber(long bytes, long complexity) {
+            consume(complexity);
+            reserve(bytes, 1);
         }
 
         private void observeJson(Object value) {
@@ -1392,13 +1515,13 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                 return new JsonMeasure(4, 1);
             }
             if (value instanceof String text) {
-                return new JsonMeasure(jsonEncodedStringBytes(text), 1);
+                return new JsonMeasure(JsonValues.jsonEncodedStringBytes(text), 1);
             }
             if (value instanceof Boolean) {
                 return new JsonMeasure(5, 1);
             }
             if (value instanceof Number number) {
-                return new JsonMeasure(numberBytes(number), 1);
+                return new JsonMeasure(numericAllocationBytes(number), 1);
             }
             if (value instanceof Map<?, ?> map) {
                 long bytes = 2;
@@ -1409,7 +1532,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                     }
                     JsonMeasure child = measure(entry.getValue(), depth + 1, counter);
                     bytes = saturatedAdd(bytes,
-                            saturatedAdd(jsonStringPayloadBytes(key) + 4L, child.bytes()));
+                            saturatedAdd(JsonValues.jsonStringContentBytes(key) + 4L, child.bytes()));
                     nodes = saturatedAdd(nodes, child.nodes());
                 }
                 return new JsonMeasure(bytes, nodes);
@@ -1427,17 +1550,6 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
             throw new SecurityException("script operation produced a non-JSON value");
         }
 
-        private static long numberBytes(Number value) {
-            if (value instanceof BigInteger integer) {
-                return Math.max(1, (long) Math.ceil(integer.bitLength() * 0.30103)) + 1;
-            }
-            if (value instanceof BigDecimal decimal) {
-                return (long) decimal.precision() + Math.abs((long) decimal.scale()) + 3;
-            }
-            // Primitive numeric text is bounded to a few dozen ASCII bytes, so this exact
-            // conversion cannot create the large intermediate value the budget prevents.
-            return value.toString().length();
-        }
     }
 
     private static long saturatedAdd(long left, long right) {
@@ -1595,6 +1707,34 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
 
                 @Override
                 public Expression transform(Expression expression) {
+                    if (expression instanceof GStringExpression interpolated) {
+                        ArgumentListExpression arguments = new ArgumentListExpression();
+                        List<ConstantExpression> strings = interpolated.getStrings();
+                        List<Expression> values = interpolated.getValues();
+                        for (int index = 0; index < strings.size(); index++) {
+                            arguments.addExpression(transform(strings.get(index)));
+                            if (index < values.size()) {
+                                arguments.addExpression(transform(values.get(index)));
+                            }
+                        }
+                        StaticMethodCallExpression rewritten = new StaticMethodCallExpression(
+                                ClassHelper.make(SandboxedGroovyRuntime.class),
+                                "applyBudgetedGString", arguments);
+                        rewritten.setSourcePosition(interpolated);
+                        return rewritten;
+                    }
+                    if (expression instanceof VariableExpression variable
+                            && variable.getAccessedVariable() instanceof DynamicVariable) {
+                        StaticMethodCallExpression rewritten = new StaticMethodCallExpression(
+                                ClassHelper.make(SandboxedGroovyRuntime.class),
+                                "readExternalJsonRoot",
+                                new ArgumentListExpression(
+                                        new VariableExpression(
+                                                new DynamicVariable(INTERNAL_JSON_ROOTS, false)),
+                                        new ConstantExpression(variable.getName())));
+                        rewritten.setSourcePosition(variable);
+                        return rewritten;
+                    }
                     if (expression instanceof PropertyExpression property
                             && !(property instanceof AttributeExpression)) {
                         String name = property.getPropertyAsString();
@@ -1612,8 +1752,18 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                         return rewritten;
                     }
                     if (expression instanceof BinaryExpression binary
-                            && (binary.getOperation().getType() == Types.PLUS
-                                    || binary.getOperation().getType() == Types.MULTIPLY)) {
+                            && binary.getOperation().getType() == Types.LEFT_SQUARE_BRACKET) {
+                        StaticMethodCallExpression rewritten = new StaticMethodCallExpression(
+                                ClassHelper.make(SandboxedGroovyRuntime.class),
+                                "readJsonIndex",
+                                new ArgumentListExpression(
+                                        transform(binary.getLeftExpression()),
+                                        transform(binary.getRightExpression())));
+                        rewritten.setSourcePosition(binary);
+                        return rewritten;
+                    }
+                    if (expression instanceof BinaryExpression binary
+                            && BUDGETED_BINARY_TOKENS.contains(binary.getOperation().getType())) {
                         StaticMethodCallExpression rewritten = new StaticMethodCallExpression(
                                 ClassHelper.make(SandboxedGroovyRuntime.class),
                                 "applyBudgetedBinary",
@@ -1623,6 +1773,12 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                                         transform(binary.getRightExpression())));
                         rewritten.setSourcePosition(binary);
                         return rewritten;
+                    }
+                    if (expression instanceof UnaryMinusExpression unary) {
+                        return budgetedUnary(unary, Types.MINUS, unary.getExpression());
+                    }
+                    if (expression instanceof UnaryPlusExpression unary) {
+                        return budgetedUnary(unary, Types.PLUS, unary.getExpression());
                     }
                     if (expression instanceof ListExpression list) {
                         ArgumentListExpression arguments = new ArgumentListExpression();
@@ -1649,28 +1805,61 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                     if (expression instanceof MethodCallExpression call
                             && ALLOWED_COLLECTION_METHODS.contains(call.getMethodAsString())) {
                         ArgumentListExpression arguments = (ArgumentListExpression) call.getArguments();
+                        ClosureExpression closure = (ClosureExpression) arguments.getExpression(0);
+                        // The general expression transformer does not descend into closure code when
+                        // the enclosing method call is replaced, so rewrite the validated body first.
+                        closure.getCode().visit(this);
                         StaticMethodCallExpression rewritten = new StaticMethodCallExpression(
                                 ClassHelper.make(SandboxedGroovyRuntime.class),
                                 "applyBudgetedCollection",
                                 new ArgumentListExpression(
                                         new ConstantExpression(call.getMethodAsString()),
                                         transform(call.getObjectExpression()),
-                                        transform(arguments.getExpression(0))));
+                                        closure));
                         rewritten.setSourcePosition(call);
                         return rewritten;
                     }
                     if (expression instanceof MethodCallExpression call
                             && BUDGETED_STRING_METHODS.contains(call.getMethodAsString())) {
+                        ArgumentListExpression sourceArguments =
+                                (ArgumentListExpression) call.getArguments();
+                        ArgumentListExpression arguments = new ArgumentListExpression(
+                                new ConstantExpression(call.getMethodAsString()),
+                                transform(call.getObjectExpression()));
+                        sourceArguments.getExpressions().forEach(
+                                argument -> arguments.addExpression(transform(argument)));
                         StaticMethodCallExpression rewritten = new StaticMethodCallExpression(
                                 ClassHelper.make(SandboxedGroovyRuntime.class),
-                                "applyBudgetedStringMethod",
-                                new ArgumentListExpression(
-                                        new ConstantExpression(call.getMethodAsString()),
-                                        transform(call.getObjectExpression())));
+                                "applyBudgetedStringMethod", arguments);
+                        rewritten.setSourcePosition(call);
+                        return rewritten;
+                    }
+                    if (expression instanceof MethodCallExpression call
+                            && BUDGETED_NUMERIC_METHODS.contains(call.getMethodAsString())) {
+                        ArgumentListExpression sourceArguments =
+                                (ArgumentListExpression) call.getArguments();
+                        ArgumentListExpression arguments = new ArgumentListExpression(
+                                new ConstantExpression(call.getMethodAsString()),
+                                transform(call.getObjectExpression()));
+                        sourceArguments.getExpressions().forEach(
+                                argument -> arguments.addExpression(transform(argument)));
+                        StaticMethodCallExpression rewritten = new StaticMethodCallExpression(
+                                ClassHelper.make(SandboxedGroovyRuntime.class),
+                                "applyBudgetedNumericMethod", arguments);
                         rewritten.setSourcePosition(call);
                         return rewritten;
                     }
                     return super.transform(expression);
+                }
+
+                private Expression budgetedUnary(ASTNode sourceNode, int operator, Expression operand) {
+                    StaticMethodCallExpression rewritten = new StaticMethodCallExpression(
+                            ClassHelper.make(SandboxedGroovyRuntime.class),
+                            "applyBudgetedUnary",
+                            new ArgumentListExpression(
+                                    new ConstantExpression(operator), transform(operand)));
+                    rewritten.setSourcePosition(sourceNode);
+                    return rewritten;
                 }
             });
         }
@@ -1699,16 +1888,21 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
         private static final class AllowedScriptAst {
 
             private final Set<String> localVariables = new HashSet<>();
+            private final Set<String> assignedLocalVariables = new HashSet<>();
+            private final Set<String> capturedLocalVariables = new HashSet<>();
             private final boolean closureMode;
             private final Set<String> closureParameters;
+            private final AllowedScriptAst outerScope;
 
             private AllowedScriptAst() {
-                this(false, Set.of());
+                this(false, Set.of(), null);
             }
 
-            private AllowedScriptAst(boolean closureMode, Set<String> closureParameters) {
+            private AllowedScriptAst(boolean closureMode, Set<String> closureParameters,
+                    AllowedScriptAst outerScope) {
                 this.closureMode = closureMode;
                 this.closureParameters = closureParameters;
+                this.outerScope = outerScope;
             }
 
             private void validateStatement(Statement statement) {
@@ -1759,6 +1953,10 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                             && !(value instanceof Number)) {
                         reject(expression, "constant type is outside the JSON allowlist");
                     }
+                    return;
+                }
+                if (expression instanceof GStringExpression interpolated) {
+                    interpolated.getValues().forEach(this::validateExpression);
                     return;
                 }
                 if (expression instanceof VariableExpression variable) {
@@ -1812,16 +2010,10 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                     return;
                 }
                 if (expression instanceof ListExpression list) {
-                    if (closureMode) {
-                        reject(list, "collection closures may not construct collections");
-                    }
                     list.getExpressions().forEach(this::validateExpression);
                     return;
                 }
                 if (expression instanceof MapExpression map) {
-                    if (closureMode) {
-                        reject(map, "collection closures may not construct objects");
-                    }
                     map.getMapEntryExpressions().forEach(this::validateExpression);
                     return;
                 }
@@ -1858,8 +2050,23 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                     reject(variable, "typed variables are outside the allowed AST");
                 }
                 if (closureMode && !closureParameters.contains(variable.getName())) {
-                    reject(variable, "collection closures may only read their element parameter");
+                    AllowedScriptAst declaredScope = findDeclaringOuterScope(variable.getName());
+                    if (declaredScope != null) {
+                        if (declaredScope.assignedLocalVariables.contains(variable.getName())) {
+                            reject(variable, "collection closures may only capture immutable local values");
+                        }
+                        declaredScope.capturedLocalVariables.add(variable.getName());
+                    }
                 }
+            }
+
+            private AllowedScriptAst findDeclaringOuterScope(String name) {
+                for (AllowedScriptAst scope = outerScope; scope != null; scope = scope.outerScope) {
+                    if (scope.localVariables.contains(name)) {
+                        return scope;
+                    }
+                }
+                return null;
             }
 
             private void validateBinary(BinaryExpression binary) {
@@ -1874,6 +2081,10 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                     if (!(binary.getLeftExpression() instanceof VariableExpression variable)
                             || !localVariables.contains(variable.getName())) {
                         reject(binary, "assignment targets must be declared local variables");
+                    } else if (capturedLocalVariables.contains(variable.getName())) {
+                        reject(binary, "captured local variables must remain immutable");
+                    } else {
+                        assignedLocalVariables.add(variable.getName());
                     }
                 }
                 validateExpression(binary.getLeftExpression());
@@ -1900,12 +2111,13 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
 
             private boolean isExternalJsonPath(Expression expression) {
                 if (expression instanceof VariableExpression variable) {
-                    return (closureMode
+                    boolean readable = closureMode
                             ? closureParameters.contains(variable.getName())
-                            : !localVariables.contains(variable.getName()))
-                            && !RESERVED_VARIABLES.contains(variable.getName())
-                            && !variable.isThisExpression()
-                            && !variable.isSuperExpression();
+                                    || findDeclaringOuterScope(variable.getName()) != null
+                                    || !localVariables.contains(variable.getName())
+                            : !localVariables.contains(variable.getName());
+                    return readable && !RESERVED_VARIABLES.contains(variable.getName())
+                            && !variable.isThisExpression() && !variable.isSuperExpression();
                 }
                 if (expression instanceof PropertyExpression property) {
                     String name = property.getPropertyAsString();
@@ -1941,6 +2153,10 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                     validateBudgetedStringCall(call);
                     return;
                 }
+                if (BUDGETED_NUMERIC_METHODS.contains(method)) {
+                    validateBudgetedNumericCall(call);
+                    return;
+                }
                 if (call.isImplicitThis()) {
                     if (closureMode || !LOG_METHODS.contains(method)) {
                         reject(call, "implicit host dispatch is outside the method allowlist");
@@ -1956,9 +2172,25 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
 
             private void validateBudgetedStringCall(MethodCallExpression call) {
                 if (call.isImplicitThis()
+                        || !(call.getArguments() instanceof ArgumentListExpression arguments)) {
+                    reject(call, "string operations require an explicit receiver");
+                    return;
+                }
+                String method = call.getMethodAsString();
+                int size = arguments.getExpressions().size();
+                if (("substring".equals(method) && (size < 1 || size > 2))
+                        || (!"substring".equals(method) && size != 0)) {
+                    reject(call, "string operation argument count is outside the allowlist");
+                }
+                validateReceiver(call.getObjectExpression());
+                validateExpression(arguments);
+            }
+
+            private void validateBudgetedNumericCall(MethodCallExpression call) {
+                if (call.isImplicitThis()
                         || !(call.getArguments() instanceof ArgumentListExpression arguments)
                         || !arguments.getExpressions().isEmpty()) {
-                    reject(call, "case conversion requires an explicit receiver and no arguments");
+                    reject(call, "numeric operations require an explicit receiver and no arguments");
                 }
                 validateReceiver(call.getObjectExpression());
             }
@@ -1995,7 +2227,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                     reject(closure, "collection closures accept one untyped element parameter");
                     return;
                 }
-                AllowedScriptAst body = new AllowedScriptAst(true, Set.of(parameterName));
+                AllowedScriptAst body = new AllowedScriptAst(true, Set.of(parameterName), this);
                 body.validateClosureBody(closure.getCode());
             }
 
@@ -2026,6 +2258,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                         && !(receiver instanceof BinaryExpression)
                         && !(receiver instanceof ListExpression)
                         && !(receiver instanceof MapExpression)
+                        && !(receiver instanceof GStringExpression)
                         && !(receiver instanceof TernaryExpression)
                         && !(receiver instanceof UnaryMinusExpression)
                         && !(receiver instanceof UnaryPlusExpression)) {

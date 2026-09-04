@@ -121,19 +121,234 @@ class SandboxedGroovyRuntimeTest {
     }
 
     @Test
+    void collection_closures_capture_read_only_json_and_project_nested_json_values() throws Exception {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            Object result = await(runtime.execute(invocation("""
+                    def offset = ctx.offset
+                    def expectedCategory = play.category
+                    def selected = play.items.findAll { item ->
+                        ctx.enabled && item.category == expectedCategory && item.score >= ctx.minimum
+                    }
+                    def mapped = selected.collect { item ->
+                        [id: item.id, adjusted: item.score + offset, details: item.details]
+                    }
+                    def nested = selected.collect { it.details }
+                    def any = play.items.any { item -> item.score >= ctx.minimum }
+                    def every = selected.every { item -> item.category == expectedCategory }
+                    return [mapped: mapped, nested: nested, any: any, every: every]
+                    """, Map.of("play", Map.of(
+                            "category", "vip",
+                            "items", List.of(
+                                    Map.of("id", 1, "category", "standard", "score", 3,
+                                            "details", Map.of("label", "one")),
+                                    Map.of("id", 2, "category", "vip", "score", 8,
+                                            "details", Map.of("label", "two")),
+                                    Map.of("id", 3, "category", "vip", "score", 12,
+                                            "details", Map.of("label", "three"))))),
+                    Map.of("enabled", true, "minimum", 5, "offset", 10),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(2))));
+
+            assertEquals(Map.of(
+                    "mapped", List.of(
+                            Map.of("id", 2, "adjusted", 18, "details", Map.of("label", "two")),
+                            Map.of("id", 3, "adjusted", 22, "details", Map.of("label", "three"))),
+                    "nested", List.of(Map.of("label", "two"), Map.of("label", "three")),
+                    "any", true,
+                    "every", true), result);
+        }
+    }
+
+    @Test
     void rejects_collection_closure_capture_nesting_side_effects_and_non_list_receivers() {
         try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
             for (String script : List.of(
-                    "return [1, 2].collect { item -> ctx.safe }",
                     "return [1, 2].collect { item -> println(item); item }",
                     "return [[1]].collect { item -> item.collect { it } }",
-                    "return [[1]].collect { item -> item }",
+                    "def offset = 1; offset = 2; return [1].collect { it + offset }",
+                    "def offset = 1; def result = [1].collect { it + offset }; offset = 2; return result",
+                    "def offset = 1; return [1].collect { item -> offset = item }",
                     "def helper = { it + 1 }; return helper(1)",
                     "return play.object.collect { it }")) {
                 assertScriptCode(runtime, script, "SCRIPT_SECURITY_VIOLATION",
                         Map.of("play", Map.of("object", Map.of("value", 1))),
                         Map.of("safe", true));
             }
+        }
+    }
+
+    @Test
+    void unknown_dynamic_variables_never_fall_back_to_script_host_properties() {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            assertScriptCode(runtime,
+                    "return [binding: properties.containsKey('binding'), clazz: properties.containsKey('class')]",
+                    "SCRIPT_SECURITY_VIOLATION");
+            assertScriptCode(runtime,
+                    "return [1].collect { item -> properties.containsKey('binding') }",
+                    "SCRIPT_SECURITY_VIOLATION");
+        }
+    }
+
+    @Test
+    void bracket_reads_are_limited_to_json_maps_and_lists() throws Exception {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            assertScriptCode(runtime, "return 1['class']['name']", "SCRIPT_SECURITY_VIOLATION");
+
+            Object result = await(runtime.execute(invocation(
+                    "return [mapped: ctx.object['key'], indexed: ctx.items[1]]",
+                    Map.of(), Map.of("object", Map.of("key", "value"), "items", List.of(3, 5)),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(1))));
+            assertEquals(Map.of("mapped", "value", "indexed", 5), result);
+        }
+    }
+
+    @Test
+    void cumulative_numeric_and_allocating_string_operations_exhaust_budget_and_runtime_reuses()
+            throws Exception {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 64, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+            assertScriptCode(runtime, """
+                    def value = play.value
+                    value = value + 1
+                    value = value - 1
+                    value = value * 1
+                    value = -value
+                    value = +value
+                    return value
+                    """, "SCRIPT_OPERATION_LIMIT_EXCEEDED",
+                    Map.of("play", Map.of("value", new java.math.BigInteger("12345678901234567890"))),
+                    Map.of());
+            assertScriptCode(runtime, """
+                    def value = play.value
+                    value = value.abs()
+                    value = value.abs()
+                    value = value.abs()
+                    value = value.abs()
+                    return value
+                    """, "SCRIPT_OPERATION_LIMIT_EXCEEDED",
+                    Map.of("play", Map.of("value", new java.math.BigInteger("12345678901234567890"))),
+                    Map.of());
+            assertScriptCode(runtime, """
+                    def value = play.value
+                    value = value.trim()
+                    value = value.strip()
+                    value = value.substring(0)
+                    value = value.trim()
+                    return value
+                    """, "SCRIPT_OPERATION_LIMIT_EXCEEDED",
+                    Map.of("play", Map.of("value", " 12345678901234567890 ")), Map.of());
+            assertScriptCode(runtime, "return play.value % 100", "SCRIPT_OPERATION_LIMIT_EXCEEDED",
+                    Map.of("play", Map.of("value",
+                            new java.math.BigDecimal("1." + "0".repeat(100)))), Map.of());
+            assertEquals(17, await(runtime.execute(invocation("return 17", Map.of(), Map.of(),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+        }
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 32, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+            assertScriptCode(runtime, "return play.left + play.right",
+                    "SCRIPT_OPERATION_LIMIT_EXCEEDED", Map.of("play", Map.of(
+                            "left", new java.math.BigDecimal("1E+20"),
+                            "right", new java.math.BigDecimal("1E-20"))), Map.of());
+        }
+    }
+
+    @Test
+    void supports_budgeted_numeric_operator_results() throws Exception {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> result = (Map<String, Object>) await(runtime.execute(invocation("""
+                    return [add: 7 + 3, subtract: 7 - 3, multiply: 7 * 3,
+                            divide: 7 / 2, modulo: 7 % 3, absolute: (-7).abs()]
+                    """, Map.of(), Map.of(), entry -> { }, () -> false,
+                    Instant.now().plusSeconds(2))));
+
+            assertEquals(10, ((Number) result.get("add")).intValue());
+            assertEquals(4, ((Number) result.get("subtract")).intValue());
+            assertEquals(21, ((Number) result.get("multiply")).intValue());
+            assertEquals(3.5d, ((Number) result.get("divide")).doubleValue());
+            assertEquals(1, ((Number) result.get("modulo")).intValue());
+            assertEquals(7, ((Number) result.get("absolute")).intValue());
+        }
+    }
+
+    @Test
+    void gstring_interpolation_accepts_only_budgeted_json_scalars() throws Exception {
+        String suffix = "quote=\" slash=\\ line=\n emoji=😀";
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            Object result = await(runtime.execute(invocation(
+                    "def suffix = ctx.suffix; return \"id=${play.id}; ok=${ctx.ok}; ${suffix}\"",
+                    Map.of("play", Map.of("id", 7)), Map.of("ok", true, "suffix", suffix),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(2))));
+            assertEquals("id=7; ok=true; " + suffix, result);
+
+            try (SandboxedGroovyRuntime exactRuntime = new SandboxedGroovyRuntime(
+                    Duration.ofSeconds(1), 10_000, 6, 8,
+                    Duration.ofMinutes(1), Clock.systemUTC())) {
+                assertEquals("true", await(exactRuntime.execute(invocation(
+                        "return \"${true}\"", Map.of(), Map.of(), entry -> { }, () -> false,
+                        Instant.now().plusSeconds(1)))));
+            }
+            try (SandboxedGroovyRuntime exactRuntime = new SandboxedGroovyRuntime(
+                    Duration.ofSeconds(1), 10_000, 22, 8,
+                    Duration.ofMinutes(1), Clock.systemUTC())) {
+                assertEquals("1E+100000", await(exactRuntime.execute(invocation(
+                        "return \"${play.amount}\"", Map.of("play", Map.of("amount",
+                                new java.math.BigDecimal(java.math.BigInteger.ONE, -100_000))),
+                        Map.of(), entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+            }
+            try (SandboxedGroovyRuntime exactRuntime = new SandboxedGroovyRuntime(
+                    Duration.ofSeconds(1), 10_000, 12, 8,
+                    Duration.ofMinutes(1), Clock.systemUTC())) {
+                assertEquals("1E-7", await(exactRuntime.execute(invocation(
+                        "return \"${play.amount}\"", Map.of("play", Map.of("amount",
+                                new java.math.BigDecimal("1E-7"))),
+                        Map.of(), entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+            }
+
+            assertScriptCode(runtime, "return \"bad=${play.object}\"", "SCRIPT_SECURITY_VIOLATION",
+                    Map.of("play", Map.of("object", Map.of("id", 1))), Map.of());
+        }
+    }
+
+    @Test
+    void gstring_reserves_escaped_bytes_before_allocation_and_runtime_reuses() throws Exception {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 64, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+            assertScriptCode(runtime, "return \"${play.value}\"", "SCRIPT_OPERATION_LIMIT_EXCEEDED",
+                    Map.of("play", Map.of("value", "\n\"\\😀".repeat(20))), Map.of());
+            assertEquals(19, await(runtime.execute(invocation("return 19", Map.of(), Map.of(),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+        }
+    }
+
+    @Test
+    void string_growth_counts_surrogate_pairs_formed_across_value_boundaries_before_allocation()
+            throws Exception {
+        Map<String, Map<String, Object>> scopes = Map.of(
+                "play", Map.of("high", "\ud83d", "low", "\ude00"));
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 4, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+            assertScriptCode(runtime, "return play.high + play.low",
+                    "SCRIPT_OPERATION_LIMIT_EXCEEDED", scopes, Map.of());
+            assertScriptCode(runtime, "return \"${play.high}${play.low}\"",
+                    "SCRIPT_OPERATION_LIMIT_EXCEEDED", scopes, Map.of());
+            assertEquals(true, await(runtime.execute(invocation("return true", Map.of(), Map.of(),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+        }
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 6, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+            assertScriptCode(runtime, "return play.boundary * 2",
+                    "SCRIPT_OPERATION_LIMIT_EXCEEDED",
+                    Map.of("play", Map.of("boundary", "\ude00\ud83d")), Map.of());
+        }
+        String high = "a".repeat(24_997) + "\ud83d";
+        String low = "\ude00" + "a".repeat(24_997);
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 60_000, 8,
+                Duration.ofMinutes(1), Clock.systemUTC())) {
+            assertEquals("a".repeat(24_997) + "😀" + "a".repeat(24_997),
+                    await(runtime.execute(invocation("return \"${play.high}${play.low}\"",
+                            Map.of("play", Map.of("high", high, "low", low)), Map.of(),
+                            entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
         }
     }
 
@@ -297,6 +512,72 @@ class SandboxedGroovyRuntimeTest {
                         ((ScriptExecutionException) failure.getCause()).code());
                 assertFalse(failure.getCause().toString().contains(marker));
             }
+        }
+    }
+
+    @Test
+    void adapter_input_limits_use_encoded_json_bytes_for_escaped_tokens() throws Exception {
+        String exactToken = "\n".repeat(131_071);
+        String overToken = exactToken + "\n";
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            assertEquals(true, await(runtime.execute(invocation("return true",
+                    Map.of("play", Map.of("exact", exactToken)), Map.of(),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(2)))));
+            assertScriptCode(runtime, "return true", "SCRIPT_INPUT_TOO_LARGE",
+                    Map.of("play", Map.of("over", overToken)), Map.of());
+        }
+    }
+
+    @Test
+    void adapter_rejects_fastjson_plain_big_decimal_before_groovy_invocation() {
+        java.math.BigDecimal hugePlain = new java.math.BigDecimal(
+                java.math.BigInteger.ONE, 1_048_576);
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            assertScriptCode(runtime, "return true", "SCRIPT_INPUT_TOO_LARGE",
+                    Map.of("play", Map.of("amount", hugePlain)), Map.of());
+        }
+    }
+
+    @Test
+    void result_rejects_big_decimal_serializer_workspace_before_fastjson_allocation() throws Exception {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 64, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+            assertScriptCode(runtime, "return play.amount", "SCRIPT_RESULT_TOO_LARGE",
+                    Map.of("play", Map.of("amount",
+                            new java.math.BigDecimal(java.math.BigInteger.ONE, -1_000))), Map.of());
+            assertEquals(23, await(runtime.execute(invocation("return 23", Map.of(), Map.of(),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+        }
+    }
+
+    @Test
+    void large_big_integer_operations_preflight_before_rendering_decimal_text() throws Exception {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 64, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+            java.math.BigInteger value = new java.math.BigInteger("9".repeat(100_000));
+            for (String script : List.of(
+                    "return \"${play.value}\"",
+                    "return '' + play.value",
+                    "return [play.value]")) {
+                ScriptInvocation invocation = invocation(script, Map.of("play", Map.of("value", value)),
+                        Map.of(), entry -> { }, () -> false, Instant.now().plusSeconds(2));
+
+                CompletionException failure = assertThrows(CompletionException.class,
+                        () -> runtime.execute(invocation).toCompletableFuture().join());
+
+                assertEquals("SCRIPT_OPERATION_LIMIT_EXCEEDED",
+                        ((ScriptExecutionException) failure.getCause()).code());
+            }
+
+            ScriptInvocation invocation = invocation("return play.items.collect { it }",
+                    Map.of("play", Map.of("items", List.of(value))), Map.of(),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(2));
+            CompletionException failure = assertThrows(CompletionException.class,
+                    () -> runtime.execute(invocation).toCompletableFuture().join());
+            assertEquals("SCRIPT_OPERATION_LIMIT_EXCEEDED",
+                    ((ScriptExecutionException) failure.getCause()).code());
+            assertEquals(29, await(runtime.execute(invocation("return 29", Map.of(), Map.of(),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
         }
     }
 

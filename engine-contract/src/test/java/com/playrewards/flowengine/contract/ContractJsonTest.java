@@ -23,9 +23,12 @@ import com.playrewards.flowengine.contract.execution.ExecutionPurpose;
 import com.playrewards.flowengine.contract.execution.ExecutionRequest;
 import com.playrewards.flowengine.contract.execution.ExecutionResult;
 import com.playrewards.flowengine.contract.execution.ExecutionStatus;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import com.playrewards.flowengine.contract.flow.FlowDefinition;
 import com.playrewards.flowengine.contract.flow.FlowNode;
 import com.playrewards.flowengine.contract.json.ContractJson;
+import com.playrewards.flowengine.contract.json.JsonValues;
 import com.playrewards.flowengine.contract.protocol.ProtocolSchema;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -237,6 +240,85 @@ class ContractJsonTest {
     }
 
     @Test
+    void shared_resource_walker_matches_fastjson_for_escaped_strings_keys_and_unicode() {
+        List<Object> roots = List.of(
+                "\n", "\"", "\\", "😀", "\ud800",
+                Map.of("key\n\"\\😀\ud800",
+                        java.util.Arrays.asList("value\n\"\\😀\ud800", true, null)));
+        long expectedBytes = roots.stream().mapToLong(value -> JSON.toJSONBytes(value).length).sum();
+        JsonValues.JsonResourceLimits limits = new JsonValues.JsonResourceLimits(
+                expectedBytes, 1_024, 16, 100);
+
+        JsonValues.JsonResourceUsage usage = JsonValues.measureJsonResources(roots, limits);
+
+        assertEquals(expectedBytes, usage.encodedBytes());
+        assertEquals(10, usage.nodes());
+        for (String value : List.of("\n", "\"", "\\", "😀", "\ud800")) {
+            assertEquals(JSON.toJSONBytes(value).length, JsonValues.jsonEncodedStringBytes(value));
+        }
+        assertEquals(JSON.toJSONBytes("😀").length - 2,
+                JsonValues.jsonStringContentBytes(List.of("\ud83d", "\ude00")));
+        assertEquals(1, JsonValues.measureJsonString(List.of("\ud83d", "\ude00")).codePoints());
+        assertEquals(JSON.toJSONBytes("\ude00\ud83d\ude00\ud83d").length - 2,
+                JsonValues.jsonRepeatedStringContentBytes("\ude00\ud83d", 2));
+    }
+
+    @Test
+    void shared_resource_walker_accepts_exact_boundaries_and_rejects_one_byte_beyond_them() {
+        Object value = Map.of("escaped", "\n".repeat(10), "emoji", "😀");
+        long exactBytes = JSON.toJSONBytes(value).length;
+        long exactStringBytes = JSON.toJSONBytes("\n".repeat(10)).length;
+
+        assertEquals(exactBytes, JsonValues.measureJsonResources(List.of(value),
+                new JsonValues.JsonResourceLimits(exactBytes, exactStringBytes, 4, 3)).encodedBytes());
+        assertThrows(JsonValues.JsonResourceLimitException.class,
+                () -> JsonValues.measureJsonResources(List.of(value),
+                        new JsonValues.JsonResourceLimits(exactBytes - 1, exactStringBytes, 4, 3)));
+        assertThrows(JsonValues.JsonResourceLimitException.class,
+                () -> JsonValues.measureJsonResources(List.of(value),
+                        new JsonValues.JsonResourceLimits(exactBytes, exactStringBytes - 1, 4, 3)));
+    }
+
+    @Test
+    void shared_resource_walker_matches_fastjson_big_decimal_encoding_without_plain_text_allocation() {
+        for (java.math.BigDecimal value : List.of(
+                new java.math.BigDecimal("0.0000001"),
+                new java.math.BigDecimal("-0.00120"),
+                new java.math.BigDecimal("1E+7"),
+                new java.math.BigDecimal("1234567890123456789E-30"))) {
+            assertEquals(JSON.toJSONBytes(value).length, JsonValues.jsonEncodedNumberBytes(value));
+        }
+
+        java.math.BigDecimal hugePlain = new java.math.BigDecimal(java.math.BigInteger.ONE, 1_000_000);
+        assertEquals(1_000_002, JsonValues.jsonEncodedNumberBytes(hugePlain));
+        assertThrows(JsonValues.JsonResourceLimitException.class,
+                () -> JsonValues.measureJsonResources(List.of(hugePlain),
+                        new JsonValues.JsonResourceLimits(1_000_001, 8, 1, 1)));
+
+        Map<String, Object> nullable = new LinkedHashMap<>();
+        nullable.put("omitted", null);
+        nullable.put("kept", 1);
+        assertEquals(JSON.toJSONBytes(nullable).length,
+                JsonValues.measureJsonResources(List.of(nullable),
+                        new JsonValues.JsonResourceLimits(1_024, 1_024, 2, 3)).encodedBytes());
+    }
+
+    @Test
+    void number_text_preflight_is_allocation_free_for_big_integer_and_rejects_host_subclasses() {
+        BigInteger large = BigInteger.TEN.pow(100_000);
+        assertTrue(JsonValues.javaNumberTextUpperBoundBytes(large) >= large.toString().length());
+
+        for (Number hostNumber : List.of(new HostBigInteger("1"), new HostBigDecimal("1"))) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> JsonValues.copyValue(hostNumber, "value"));
+            assertThrows(IllegalArgumentException.class,
+                    () -> JsonValues.jsonEncodedNumberBytes(hostNumber));
+            assertThrows(IllegalArgumentException.class,
+                    () -> JsonValues.javaNumberTextUpperBoundBytes(hostNumber));
+        }
+    }
+
+    @Test
     void schema_non_blank_constraints_match_required_java_text_fields() throws IOException {
         JSONObject schema = JSON.parseObject(resource("schema/executable-flow-bundle-1.0.schema.json"));
         JSONObject definitions = schema.getJSONObject("$defs");
@@ -291,6 +373,20 @@ class ContractJsonTest {
                 () -> new FlowNode("n1", "builtin.script", "script", "脚本", Map.of("value", value)));
         assertTrue(failure.getMessage().contains("node config.value"));
         assertTrue(failure.getMessage().contains(valueType));
+    }
+
+    private static final class HostBigInteger extends BigInteger {
+
+        private HostBigInteger(String value) {
+            super(value);
+        }
+    }
+
+    private static final class HostBigDecimal extends BigDecimal {
+
+        private HostBigDecimal(String value) {
+            super(value);
+        }
     }
 
     private static String resource(String name) throws IOException {

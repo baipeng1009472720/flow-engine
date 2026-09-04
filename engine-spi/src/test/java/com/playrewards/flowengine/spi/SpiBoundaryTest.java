@@ -1,6 +1,7 @@
 package com.playrewards.flowengine.spi;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -201,6 +202,42 @@ class SpiBoundaryTest {
 
         IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
                 () -> new ScriptRuntime.ScriptInvocation("return true", scopes, Map.of(),
+                        ExecutionLogger.NOOP, () -> false, Instant.now().plusSeconds(1)));
+
+        assertEquals("script invocation context exceeds the hard resource limit", failure.getMessage());
+    }
+
+    @Test
+    void script_invocation_uses_encoded_json_bytes_before_copying_escaped_input() {
+        String exactToken = "\n".repeat(524_287);
+        assertDoesNotThrow(() -> new ScriptRuntime.ScriptInvocation("return true",
+                Map.of("play", Map.of("exact", exactToken)), Map.of(),
+                ExecutionLogger.NOOP, () -> false, Instant.now().plusSeconds(1)));
+
+        String overToken = exactToken + "\n";
+        IllegalArgumentException tokenFailure = assertThrows(IllegalArgumentException.class,
+                () -> new ScriptRuntime.ScriptInvocation("return true",
+                        Map.of("play", Map.of("over", overToken)), Map.of(),
+                        ExecutionLogger.NOOP, () -> false, Instant.now().plusSeconds(1)));
+        assertEquals("script invocation context exceeds the hard resource limit", tokenFailure.getMessage());
+
+        String repeated = "\n".repeat(500_000);
+        IllegalArgumentException totalFailure = assertThrows(IllegalArgumentException.class,
+                () -> new ScriptRuntime.ScriptInvocation("return true", Map.of("play", Map.of(
+                        "one", repeated, "two", repeated, "three", repeated,
+                        "four", repeated, "five", repeated)), Map.of(),
+                        ExecutionLogger.NOOP, () -> false, Instant.now().plusSeconds(1)));
+        assertEquals("script invocation context exceeds the hard resource limit", totalFailure.getMessage());
+    }
+
+    @Test
+    void script_invocation_rejects_fastjson_plain_big_decimal_before_copying() {
+        java.math.BigDecimal hugePlain = new java.math.BigDecimal(
+                java.math.BigInteger.ONE, 4_194_304);
+
+        IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
+                () -> new ScriptRuntime.ScriptInvocation("return true",
+                        Map.of("play", Map.of("amount", hugePlain)), Map.of(),
                         ExecutionLogger.NOOP, () -> false, Instant.now().plusSeconds(1)));
 
         assertEquals("script invocation context exceeds the hard resource limit", failure.getMessage());

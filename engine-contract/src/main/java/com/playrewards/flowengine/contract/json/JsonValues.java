@@ -60,8 +60,10 @@ public final class JsonValues {
             return floatValue;
         }
         if (value == null || value instanceof String || value instanceof Boolean || value instanceof Integer
-                || value instanceof Long || value instanceof Short || value instanceof Byte || value instanceof BigDecimal
-                || value instanceof BigInteger) {
+                || value instanceof Long || value instanceof Short || value instanceof Byte) {
+            return value;
+        }
+        if (value.getClass() == BigDecimal.class || value.getClass() == BigInteger.class) {
             return value;
         }
         if (value instanceof Map<?, ?> map) {
@@ -82,6 +84,401 @@ public final class JsonValues {
             return Collections.unmodifiableList(copied);
         }
         throw new IllegalArgumentException(fieldName + " must contain JSON-compatible values");
+    }
+
+    /**
+     * Measures several independent JSON roots without materializing their serialized byte arrays.
+     *
+     * <p>The encoded-byte calculation matches Fastjson2's default UTF-8 string escaping, including
+     * quotes, short control escapes, Unicode surrogate pairs and replacement of unmatched
+     * surrogates. Limits are checked incrementally with saturated arithmetic.</p>
+     *
+     * @param roots independent JSON-compatible values whose encoded sizes are added together
+     * @param limits finite byte, token, depth and node limits
+     * @return exact encoded bytes and visited value nodes
+     * @throws JsonResourceLimitException when any configured limit is exceeded
+     * @throws IllegalArgumentException when a root is not part of the supported JSON value subset
+     */
+    public static JsonResourceUsage measureJsonResources(
+            Iterable<?> roots, JsonResourceLimits limits) {
+        Objects.requireNonNull(roots, "JSON resource roots must not be null");
+        ResourceCounter counter = new ResourceCounter(
+                Objects.requireNonNull(limits, "JSON resource limits must not be null"));
+        for (Object root : roots) {
+            counter.visit(root, 0);
+        }
+        return new JsonResourceUsage(counter.encodedBytes, counter.nodes);
+    }
+
+    /**
+     * Returns the exact Fastjson2 default UTF-8 byte count for one encoded JSON string token.
+     *
+     * @param value source Java string
+     * @return bytes including opening/closing quotes and all escaping
+     */
+    public static long jsonEncodedStringBytes(String value) {
+        Objects.requireNonNull(value, "JSON string must not be null");
+        return saturatedAdd(jsonStringContentBytes(value), 2);
+    }
+
+    /**
+     * Returns JSON string content bytes without the surrounding quotes.
+     *
+     * @param value source Java string
+     * @return escaped UTF-8 bytes inside the quotes
+     */
+    public static long jsonStringContentBytes(String value) {
+        Objects.requireNonNull(value, "JSON string must not be null");
+        return jsonStringContentBytes(List.of(value));
+    }
+
+    /**
+     * Returns the encoded content bytes after concatenating several character sequences.
+     *
+     * <p>Surrogate halves at adjacent part boundaries are treated exactly as they would be in the
+     * resulting Java string, without first allocating that result.</p>
+     *
+     * @param parts character sequences in concatenation order
+     * @return escaped UTF-8 bytes inside the final JSON quotes
+     */
+    public static long jsonStringContentBytes(Iterable<? extends CharSequence> parts) {
+        return measureJsonString(parts).contentBytes();
+    }
+
+    /**
+     * Measures the final JSON content bytes and Unicode code points of concatenated text parts.
+     *
+     * @param parts character sequences in concatenation order
+     * @return exact content bytes and code points without constructing the concatenated string
+     */
+    public static JsonStringUsage measureJsonString(Iterable<? extends CharSequence> parts) {
+        Objects.requireNonNull(parts, "JSON string parts must not be null");
+        long bytes = 0;
+        long codePoints = 0;
+        boolean pendingHighSurrogate = false;
+        for (CharSequence part : parts) {
+            Objects.requireNonNull(part, "JSON string part must not be null");
+            for (int offset = 0; offset < part.length(); offset++) {
+                char unit = part.charAt(offset);
+                if (pendingHighSurrogate) {
+                    if (Character.isLowSurrogate(unit)) {
+                        bytes = saturatedAdd(bytes, 4);
+                        codePoints = saturatedAdd(codePoints, 1);
+                        pendingHighSurrogate = false;
+                        continue;
+                    }
+                    // Fastjson2 replaces an unmatched surrogate with '?'.
+                    bytes = saturatedAdd(bytes, 1);
+                    codePoints = saturatedAdd(codePoints, 1);
+                    pendingHighSurrogate = false;
+                }
+                if (Character.isHighSurrogate(unit)) {
+                    pendingHighSurrogate = true;
+                } else if (Character.isLowSurrogate(unit)) {
+                    bytes = saturatedAdd(bytes, 1);
+                } else if (unit == '"' || unit == '\\'
+                        || unit == '\b' || unit == '\f' || unit == '\n'
+                        || unit == '\r' || unit == '\t') {
+                    bytes = saturatedAdd(bytes, 2);
+                } else if (unit < 0x20) {
+                    bytes = saturatedAdd(bytes, 6);
+                } else {
+                    bytes = saturatedAdd(bytes, unit <= 0x7f ? 1 : unit <= 0x7ff ? 2 : 3);
+                }
+                if (!Character.isHighSurrogate(unit)) {
+                    codePoints = saturatedAdd(codePoints, 1);
+                }
+            }
+        }
+        if (pendingHighSurrogate) {
+            bytes = saturatedAdd(bytes, 1);
+            codePoints = saturatedAdd(codePoints, 1);
+        }
+        return new JsonStringUsage(bytes, codePoints);
+    }
+
+    /**
+     * Returns encoded content bytes for a repeated string without constructing the repeated value.
+     *
+     * @param value source sequence
+     * @param repetitions non-negative repetition count
+     * @return escaped UTF-8 bytes inside the final JSON quotes
+     */
+    public static long jsonRepeatedStringContentBytes(String value, long repetitions) {
+        Objects.requireNonNull(value, "JSON string must not be null");
+        if (repetitions < 0) {
+            throw new IllegalArgumentException("JSON string repetitions must not be negative");
+        }
+        if (repetitions == 0 || value.isEmpty()) {
+            return 0;
+        }
+        long bytes = saturatedMultiply(jsonStringContentBytes(value), repetitions);
+        if (Character.isLowSurrogate(value.charAt(0))
+                && Character.isHighSurrogate(value.charAt(value.length() - 1))) {
+            // Each internal boundary turns two '?' replacement bytes into one 4-byte code point.
+            bytes = saturatedAdd(bytes, saturatedMultiply(repetitions - 1, 2));
+        }
+        return bytes;
+    }
+
+    /**
+     * Returns the exact default JSON text byte count for a supported finite number.
+     *
+     * @param value JSON number
+     * @return ASCII bytes in its serialized representation
+     */
+    public static long jsonEncodedNumberBytes(Number value) {
+        validateJsonNumber(value);
+        if (value instanceof BigDecimal decimal) {
+            return fastjsonBigDecimalBytes(decimal);
+        }
+        return value.toString().length();
+    }
+
+    /**
+     * Returns the exact {@link String#valueOf(Object)} text length for a supported JSON number.
+     *
+     * <p>BigDecimal exponent/plain selection is calculated arithmetically so a large plain value is
+     * not materialized merely to decide whether a later string operation fits its budget.</p>
+     *
+     * @param value JSON number used as text
+     * @return ASCII bytes/code points in Java's canonical number text
+     */
+    public static long javaNumberTextBytes(Number value) {
+        validateJsonNumber(value);
+        if (value instanceof BigDecimal decimal) {
+            return javaBigDecimalTextBytes(decimal);
+        }
+        return value.toString().length();
+    }
+
+    /**
+     * Upper-bounds Java's canonical number text without materializing a large integer string.
+     *
+     * <p>The BigInteger estimate uses a rational upper bound for {@code log10(2)}. Callers can
+     * therefore reserve allocation budget before invoking {@code toString()}.</p>
+     *
+     * @param value supported JSON number
+     * @return ASCII bytes/code points sufficient for its canonical Java text
+     */
+    public static long javaNumberTextUpperBoundBytes(Number value) {
+        validateJsonNumber(value);
+        if (value instanceof BigInteger integer) {
+            long digits = saturatedAdd(saturatedMultiply(integer.bitLength(), 30_103L) / 100_000L, 1);
+            return saturatedAdd(digits, integer.signum() < 0 ? 1 : 0);
+        }
+        if (value instanceof BigDecimal decimal) {
+            return javaBigDecimalTextBytes(decimal);
+        }
+        return value.toString().length();
+    }
+
+    private static void validateJsonNumber(Number value) {
+        Objects.requireNonNull(value, "JSON number must not be null");
+        if (value instanceof Double doubleValue && !Double.isFinite(doubleValue)
+                || value instanceof Float floatValue && !Float.isFinite(floatValue)) {
+            throw new IllegalArgumentException("JSON number must be finite");
+        }
+        if (!(value instanceof Double) && !(value instanceof Float)
+                && !(value instanceof Integer) && !(value instanceof Long)
+                && !(value instanceof Short) && !(value instanceof Byte)
+                && value.getClass() != BigDecimal.class && value.getClass() != BigInteger.class) {
+            throw new IllegalArgumentException("number type is outside the JSON value subset");
+        }
+    }
+
+    /** Computes Fastjson2's default BigDecimal text length without materializing plain decimal text. */
+    private static long fastjsonBigDecimalBytes(BigDecimal value) {
+        long precision = value.precision();
+        long sign = value.signum() < 0 ? 1 : 0;
+        int scale = value.scale();
+        // JSONWriterUTF8 writes compact (<19 digit), non-negative-scale decimals through
+        // IOUtils.writeDecimal, whose representation is always plain even where BigDecimal.toString
+        // would switch to an exponent.
+        if (precision < 19 && scale >= 0) {
+            return saturatedAdd(sign, plainDecimalBytes(precision, scale));
+        }
+        return javaBigDecimalTextBytes(value);
+    }
+
+    private static long javaBigDecimalTextBytes(BigDecimal value) {
+        long precision = value.precision();
+        long sign = value.signum() < 0 ? 1 : 0;
+        int scale = value.scale();
+        long adjustedExponent = -((long) scale) + precision - 1;
+        if (scale >= 0 && adjustedExponent >= -6) {
+            return saturatedAdd(sign, plainDecimalBytes(precision, scale));
+        }
+        long mantissa = saturatedAdd(precision, precision > 1 ? 1 : 0);
+        long exponentDigits = decimalDigits(Math.abs(adjustedExponent));
+        return saturatedAdd(sign, saturatedAdd(mantissa, saturatedAdd(2, exponentDigits)));
+    }
+
+    private static long plainDecimalBytes(long precision, long scale) {
+        if (scale == 0) {
+            return precision;
+        }
+        return scale < precision ? saturatedAdd(precision, 1) : saturatedAdd(scale, 2);
+    }
+
+    private static int decimalDigits(long value) {
+        int digits = 1;
+        while (value >= 10) {
+            value /= 10;
+            digits++;
+        }
+        return digits;
+    }
+
+    /** Finite limits used by the allocation-free JSON resource walker. */
+    public record JsonResourceLimits(long maxEncodedBytes, long maxEncodedStringBytes,
+                                     int maxDepth, int maxNodes) {
+
+        public JsonResourceLimits {
+            if (maxEncodedBytes < 1 || maxEncodedStringBytes < 1
+                    || maxDepth < 0 || maxNodes < 1) {
+                throw new IllegalArgumentException("JSON resource limits must be positive");
+            }
+        }
+    }
+
+    /** Exact resource usage for all measured roots. */
+    public record JsonResourceUsage(long encodedBytes, int nodes) {
+    }
+
+    /** Exact JSON string content resources across one or more concatenated source parts. */
+    public record JsonStringUsage(long contentBytes, long codePoints) {
+    }
+
+    /** Stable limit failure which never embeds a JSON key or value. */
+    public static final class JsonResourceLimitException extends IllegalArgumentException {
+
+        private JsonResourceLimitException() {
+            super("JSON value exceeds the configured resource limits");
+        }
+    }
+
+    private static final class ResourceCounter {
+
+        private final JsonResourceLimits limits;
+        private long encodedBytes;
+        private int nodes;
+
+        private ResourceCounter(JsonResourceLimits limits) {
+            this.limits = limits;
+        }
+
+        private void visit(Object value, int depth) {
+            if (depth > limits.maxDepth() || ++nodes > limits.maxNodes()) {
+                rejectLimit();
+            }
+            if (value == null) {
+                addBytes(4);
+                return;
+            }
+            if (value instanceof String text) {
+                addString(text);
+                return;
+            }
+            if (value instanceof Boolean bool) {
+                addBytes(bool ? 4 : 5);
+                return;
+            }
+            if (value instanceof Number number) {
+                validateJsonNumber(number);
+                long lowerBound = numericLowerBound(number);
+                if (lowerBound > remainingBytes()) {
+                    rejectLimit();
+                }
+                addBytes(jsonEncodedNumberBytes(number));
+                return;
+            }
+            if (value instanceof Map<?, ?> map) {
+                addBytes(2);
+                boolean first = true;
+                for (Map.Entry<?, ?> entry : map.entrySet()) {
+                    if (!(entry.getKey() instanceof String key)) {
+                        throw new IllegalArgumentException("JSON object keys must be strings");
+                    }
+                    if (entry.getValue() == null) {
+                        visitOmittedNull(depth + 1);
+                        continue;
+                    }
+                    if (!first) {
+                        addBytes(1);
+                    }
+                    first = false;
+                    addString(key);
+                    addBytes(1);
+                    visit(entry.getValue(), depth + 1);
+                }
+                return;
+            }
+            if (value instanceof List<?> list) {
+                addBytes(2);
+                for (int index = 0; index < list.size(); index++) {
+                    if (index > 0) {
+                        addBytes(1);
+                    }
+                    visit(list.get(index), depth + 1);
+                }
+                return;
+            }
+            throw new IllegalArgumentException("value must contain JSON-compatible values");
+        }
+
+        private void visitOmittedNull(int depth) {
+            if (depth > limits.maxDepth() || ++nodes > limits.maxNodes()) {
+                rejectLimit();
+            }
+        }
+
+        private void addString(String value) {
+            long bytes = jsonEncodedStringBytes(value);
+            if (bytes > limits.maxEncodedStringBytes()) {
+                rejectLimit();
+            }
+            addBytes(bytes);
+        }
+
+        private void addBytes(long amount) {
+            encodedBytes = saturatedAdd(encodedBytes, amount);
+            if (encodedBytes > limits.maxEncodedBytes()) {
+                rejectLimit();
+            }
+        }
+
+        private long remainingBytes() {
+            return Math.max(0, limits.maxEncodedBytes() - encodedBytes);
+        }
+
+        private static long numericLowerBound(Number number) {
+            if (number instanceof BigInteger integer) {
+                return Math.max(1, ((long) Math.max(0, integer.bitLength() - 1) * 3) / 10 + 1);
+            }
+            if (number instanceof BigDecimal decimal) {
+                return Math.max(1, decimal.precision());
+            }
+            return 1;
+        }
+
+        private static void rejectLimit() {
+            throw new JsonResourceLimitException();
+        }
+    }
+
+    private static long saturatedAdd(long left, long right) {
+        if (right > 0 && left > Long.MAX_VALUE - right) {
+            return Long.MAX_VALUE;
+        }
+        return left + right;
+    }
+
+    private static long saturatedMultiply(long left, long right) {
+        if (left != 0 && right > Long.MAX_VALUE / left) {
+            return Long.MAX_VALUE;
+        }
+        return left * right;
     }
 
     /** Validates and normalizes a required textual identifier. */
