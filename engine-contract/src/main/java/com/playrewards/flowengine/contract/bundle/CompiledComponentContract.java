@@ -3,7 +3,6 @@ package com.playrewards.flowengine.contract.bundle;
 import com.playrewards.flowengine.contract.component.ComponentCapabilities;
 import com.playrewards.flowengine.contract.component.ComponentType;
 import com.playrewards.flowengine.contract.json.JsonValues;
-import com.playrewards.flowengine.contract.protocol.ProtocolSchema;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -16,8 +15,8 @@ import java.util.Objects;
  */
 public record CompiledComponentContract(String componentCode, ComponentType componentType,
                                         String executorRef, Map<String, Object> configSchema,
-                                        Map<String, ProtocolSchema> inputSlots,
-                                        Map<String, ProtocolSchema> outputSlots,
+                                        Map<String, InputSlotContract> inputSlots,
+                                        Map<String, OutputSlotContract> outputSlots,
                                         ComponentCapabilities capabilities) {
 
     public CompiledComponentContract {
@@ -27,16 +26,15 @@ public record CompiledComponentContract(String componentCode, ComponentType comp
             executorRef = JsonValues.requireText(executorRef, "executorRef");
         }
         configSchema = JsonValues.copyObject(configSchema, "configSchema");
-        inputSlots = copySchemas(inputSlots, "inputSlots");
-        outputSlots = copySchemas(outputSlots, "outputSlots");
+        inputSlots = copySlots(inputSlots, "inputSlots");
+        outputSlots = copySlots(outputSlots, "outputSlots");
         Objects.requireNonNull(capabilities, "capabilities must not be null");
     }
 
-    private static Map<String, ProtocolSchema> copySchemas(Map<String, ProtocolSchema> schemas,
-                                                             String fieldName) {
-        Objects.requireNonNull(schemas, fieldName + " must not be null");
-        Map<String, ProtocolSchema> copied = new LinkedHashMap<>();
-        for (Map.Entry<String, ProtocolSchema> entry : schemas.entrySet()) {
+    private static <T> Map<String, T> copySlots(Map<String, T> slots, String fieldName) {
+        Objects.requireNonNull(slots, fieldName + " must not be null");
+        Map<String, T> copied = new LinkedHashMap<>();
+        for (Map.Entry<String, T> entry : slots.entrySet()) {
             copied.put(JsonValues.requireText(entry.getKey(), fieldName + " key"),
                     Objects.requireNonNull(entry.getValue(), fieldName + " value must not be null"));
         }

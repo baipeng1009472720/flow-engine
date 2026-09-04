@@ -7,6 +7,8 @@ import com.playrewards.flowengine.contract.bundle.BundleTrust;
 import com.playrewards.flowengine.contract.bundle.CompiledComponentContract;
 import com.playrewards.flowengine.contract.bundle.ExecutableFlowBundle;
 import com.playrewards.flowengine.contract.bundle.FlowIdentity;
+import com.playrewards.flowengine.contract.bundle.InputSlotContract;
+import com.playrewards.flowengine.contract.bundle.OutputSlotContract;
 import com.playrewards.flowengine.contract.component.ComponentCapabilities;
 import com.playrewards.flowengine.contract.flow.FlowDefinition;
 import com.playrewards.flowengine.contract.flow.FlowEdge;
@@ -43,6 +45,8 @@ public final class ContractJson {
     private static final Set<String> CAPABILITY_FIELDS = Set.of("effect", "supportsTrial", "streaming", "retryable",
             "maxConcurrency");
     private static final Set<String> PROTOCOL_SCHEMA_FIELDS = Set.of("code", "version", "schema");
+    private static final Set<String> INPUT_SLOT_FIELDS = Set.of("name", "required", "protocol");
+    private static final Set<String> OUTPUT_SLOT_FIELDS = Set.of("name", "protocol");
     private static final Set<String> TRUST_FIELDS = Set.of("issuer", "keyId", "signature");
 
     private ContractJson() {
@@ -137,8 +141,8 @@ public final class ContractJson {
             contractJson.put("componentType", contract.componentType().name());
             contractJson.put("executorRef", contract.executorRef());
             contractJson.put("configSchema", contract.configSchema());
-            contractJson.put("inputSlots", schemas(contract.inputSlots()));
-            contractJson.put("outputSlots", schemas(contract.outputSlots()));
+            contractJson.put("inputSlots", inputSlots(contract.inputSlots()));
+            contractJson.put("outputSlots", outputSlots(contract.outputSlots()));
             contractJson.put("capabilities", capabilities(contract.capabilities()));
             result.put(code, sorted(contractJson));
         });
@@ -150,6 +154,24 @@ public final class ContractJson {
         values.forEach((code, schema) -> result.put(code,
                 sorted(Map.of("code", schema.code(), "version", schema.version(), "schema", schema.schema()))));
         return result;
+    }
+
+    private static Map<String, Object> inputSlots(Map<String, InputSlotContract> values) {
+        Map<String, Object> result = new TreeMap<>();
+        values.forEach((key, slot) -> result.put(key, sorted(Map.of(
+                "name", slot.name(), "required", slot.required(), "protocol", schema(slot.protocol())))));
+        return result;
+    }
+
+    private static Map<String, Object> outputSlots(Map<String, OutputSlotContract> values) {
+        Map<String, Object> result = new TreeMap<>();
+        values.forEach((key, slot) -> result.put(key, sorted(Map.of(
+                "name", slot.name(), "protocol", schema(slot.protocol())))));
+        return result;
+    }
+
+    private static Map<String, Object> schema(ProtocolSchema schema) {
+        return sorted(Map.of("code", schema.code(), "version", schema.version(), "schema", schema.schema()));
     }
 
     private static Map<String, Object> capabilities(ComponentCapabilities capabilities) {
@@ -246,9 +268,33 @@ public final class ContractJson {
                 validateFields(asObject(capabilities, "component capabilities"), CAPABILITY_FIELDS,
                         "component capabilities");
             }
-            validateSchemas(object(contract, "inputSlots"), "component inputSlots");
-            validateSchemas(object(contract, "outputSlots"), "component outputSlots");
+            validateInputSlots(object(contract, "inputSlots"));
+            validateOutputSlots(object(contract, "outputSlots"));
         }
+    }
+
+    private static void validateInputSlots(JSONObject slots) {
+        for (Map.Entry<String, Object> entry : slots.entrySet()) {
+            JSONObject slot = asObject(entry.getValue(), "component inputSlots." + entry.getKey());
+            validateFields(slot, INPUT_SLOT_FIELDS, "component inputSlots." + entry.getKey());
+            if (!slot.containsKey("required")) {
+                throw new IllegalArgumentException("component inputSlots." + entry.getKey()
+                        + ".required must be present");
+            }
+            validateProtocol(slot, "component inputSlots." + entry.getKey());
+        }
+    }
+
+    private static void validateOutputSlots(JSONObject slots) {
+        for (Map.Entry<String, Object> entry : slots.entrySet()) {
+            JSONObject slot = asObject(entry.getValue(), "component outputSlots." + entry.getKey());
+            validateFields(slot, OUTPUT_SLOT_FIELDS, "component outputSlots." + entry.getKey());
+            validateProtocol(slot, "component outputSlots." + entry.getKey());
+        }
+    }
+
+    private static void validateProtocol(JSONObject slot, String location) {
+        validateFields(object(slot, "protocol"), PROTOCOL_SCHEMA_FIELDS, location + ".protocol");
     }
 
     private static void validateSchemas(JSONObject schemas, String fieldName) {

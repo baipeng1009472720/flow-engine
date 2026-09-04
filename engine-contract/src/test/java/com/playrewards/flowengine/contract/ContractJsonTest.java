@@ -10,8 +10,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONObject;
 import com.playrewards.flowengine.contract.bundle.BundleTrust;
+import com.playrewards.flowengine.contract.bundle.CompiledComponentContract;
 import com.playrewards.flowengine.contract.bundle.ExecutableFlowBundle;
 import com.playrewards.flowengine.contract.bundle.FlowIdentity;
+import com.playrewards.flowengine.contract.bundle.InputSlotContract;
+import com.playrewards.flowengine.contract.bundle.OutputSlotContract;
+import com.playrewards.flowengine.contract.component.ComponentCapabilities;
+import com.playrewards.flowengine.contract.component.ComponentEffect;
 import com.playrewards.flowengine.contract.component.ComponentType;
 import com.playrewards.flowengine.contract.execution.ExecutionMode;
 import com.playrewards.flowengine.contract.execution.ExecutionPurpose;
@@ -19,6 +24,7 @@ import com.playrewards.flowengine.contract.execution.ExecutionRequest;
 import com.playrewards.flowengine.contract.flow.FlowDefinition;
 import com.playrewards.flowengine.contract.flow.FlowNode;
 import com.playrewards.flowengine.contract.json.ContractJson;
+import com.playrewards.flowengine.contract.protocol.ProtocolSchema;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
@@ -30,6 +36,43 @@ import org.junit.jupiter.api.Test;
 
 /** Verifies the versioned JSON boundary exposed by the standalone runtime engine. */
 class ContractJsonTest {
+
+    @Test
+    void slot_contract_round_trip_preserves_names_required_flag_protocol_identity_and_schema() {
+        ProtocolSchema protocol = new ProtocolSchema("order", "1.0", Map.of("type", "object"));
+        CompiledComponentContract component = new CompiledComponentContract(
+                "business.reward", ComponentType.BUSINESS, "rewardExecutor", Map.of(),
+                Map.of("order", new InputSlotContract("订单", true, protocol)),
+                Map.of("result", new OutputSlotContract("结果", protocol)),
+                new ComponentCapabilities(ComponentEffect.PURE, true, false, false, 1));
+        ExecutableFlowBundle original = new ExecutableFlowBundle(
+                "1.0", new FlowIdentity("tenant", "flow", "v1"),
+                new FlowDefinition("2.0", List.of(), List.of()), Map.of("business.reward", component),
+                Map.of("order", protocol), Map.of(), null, null);
+
+        String json = ContractJson.toBundleJson(original);
+        ExecutableFlowBundle restored = ContractJson.fromBundleJson(json);
+
+        InputSlotContract input = restored.componentContracts().get("business.reward").inputSlots().get("order");
+        OutputSlotContract output = restored.componentContracts().get("business.reward").outputSlots().get("result");
+        assertEquals("订单", input.name());
+        assertTrue(input.required());
+        assertEquals("order", input.protocol().code());
+        assertEquals(Map.of("type", "object"), input.protocol().schema());
+        assertEquals("结果", output.name());
+        assertEquals("order", output.protocol().code());
+        assertFalse(json.contains("\"outputSlots\":{\"result\":{\"required\""));
+        JSONObject optionalInput = JSON.parseObject(json);
+        optionalInput.getJSONObject("componentContracts").getJSONObject("business.reward")
+                .getJSONObject("inputSlots").getJSONObject("order").put("required", false);
+        assertNotEquals(original.calculateBundleHash(),
+                ContractJson.fromBundleJson(optionalInput.toJSONString()).calculateBundleHash());
+        JSONObject missingRequired = JSON.parseObject(json);
+        missingRequired.getJSONObject("componentContracts").getJSONObject("business.reward")
+                .getJSONObject("inputSlots").getJSONObject("order").remove("required");
+        assertThrows(IllegalArgumentException.class,
+                () -> ContractJson.fromBundleJson(missingRequired.toJSONString()));
+    }
 
     @Test
     void round_trips_every_current_and_historical_node_type_with_standard_fields() throws IOException {
@@ -149,6 +192,10 @@ class ContractJsonTest {
                 "sourcePort", "targetPort");
         assertNonBlankReference(definitions.getJSONObject("componentContract"), "componentCode", "executorRef");
         assertNonBlankReference(definitions.getJSONObject("protocolSchema"), "code", "version");
+        assertNonBlankReference(definitions.getJSONObject("inputSlot"), "name");
+        assertNonBlankReference(definitions.getJSONObject("outputSlot"), "name");
+        assertTrue(definitions.getJSONObject("inputSlot").getJSONArray("required").contains("required"));
+        assertFalse(definitions.getJSONObject("outputSlot").getJSONArray("required").contains("required"));
     }
 
     private static ExecutableFlowBundle bundleWithConfig(Map<String, Object> config) {
