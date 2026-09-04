@@ -1,6 +1,7 @@
 package com.playrewards.flowengine.core.node;
 
 import com.playrewards.flowengine.contract.bundle.OutputSlotContract;
+import com.playrewards.flowengine.contract.bundle.FlowIdentity;
 import com.playrewards.flowengine.contract.component.ComponentType;
 import com.playrewards.flowengine.contract.execution.ExecutionRequest;
 import com.playrewards.flowengine.contract.json.JsonValues;
@@ -88,6 +89,11 @@ public final class NodeExecutionContext {
         return executionId;
     }
 
+    /** @return immutable tenant/flow/version identity of the currently executing plan */
+    public FlowIdentity flowIdentity() {
+        return plan.flowIdentity();
+    }
+
     /** @return compiled node being invoked */
     public CompiledNode node() {
         return node;
@@ -161,7 +167,7 @@ public final class NodeExecutionContext {
         if (source == null) {
             throw new NodeExecutionException("NODE_SOURCE_NOT_FOUND", "source node not found: " + sourceNodeId);
         }
-        return executionContext.lookup(source.node().nodeCode(), scopePath, outputKey);
+        return executionContext.lookupVisible(source.node().nodeCode(), scopePath, outputKey);
     }
 
     /**

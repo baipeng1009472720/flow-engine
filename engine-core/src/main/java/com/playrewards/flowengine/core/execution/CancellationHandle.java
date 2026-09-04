@@ -17,7 +17,21 @@ public final class CancellationHandle implements CancellationToken {
     }
 
     private final AtomicReference<Reason> reason = new AtomicReference<>();
+    private final AtomicBoolean stopRequested = new AtomicBoolean();
     private final CopyOnWriteArrayList<Runnable> callbacks = new CopyOnWriteArrayList<>();
+    private final CancellationHandle root;
+    private final CancellationRegistration parentRegistration;
+
+    /** Creates one root cancellation source whose reason participates in public terminal arbitration. */
+    public CancellationHandle() {
+        this.root = this;
+        this.parentRegistration = null;
+    }
+
+    private CancellationHandle(CancellationHandle parent) {
+        this.root = parent.root;
+        this.parentRegistration = parent.onCancellation(this::requestStop);
+    }
 
     /** Requests explicit cancellation once and invokes registered interruption callbacks. */
     public boolean cancel() {
@@ -26,12 +40,29 @@ public final class CancellationHandle implements CancellationToken {
 
     /** @return the winning cancellation reason, or {@code null} while active */
     public Reason reason() {
-        return reason.get();
+        return root.reason.get();
     }
 
     @Override
     public boolean isCancellationRequested() {
-        return reason.get() != null;
+        return stopRequested.get();
+    }
+
+    /** Stops current child work before the controller arbitrates the public terminal reason. */
+    boolean requestStopWithoutReason() {
+        return requestStop();
+    }
+
+    /** Creates a region-local source: parent stop flows down, while local fail-fast stays local. */
+    CancellationHandle linkedChild() {
+        return new CancellationHandle(this);
+    }
+
+    /** Removes this child from its parent's callback set after the structured region has finished. */
+    void detachFromParent() {
+        if (parentRegistration != null) {
+            parentRegistration.close();
+        }
     }
 
     /** Requests deadline cancellation once so every child observes the same terminal cause. */
@@ -68,7 +99,18 @@ public final class CancellationHandle implements CancellationToken {
     }
 
     private boolean cancel(Reason requestedReason) {
+        if (root != this) {
+            return root.cancel(requestedReason);
+        }
         if (!reason.compareAndSet(null, requestedReason)) {
+            return false;
+        }
+        requestStop();
+        return true;
+    }
+
+    private boolean requestStop() {
+        if (!stopRequested.compareAndSet(false, true)) {
             return false;
         }
         for (Runnable callback : callbacks) {

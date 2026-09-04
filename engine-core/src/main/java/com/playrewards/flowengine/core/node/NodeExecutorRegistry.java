@@ -7,10 +7,16 @@ import com.playrewards.flowengine.core.node.builtin.IfNodeExecutor;
 import com.playrewards.flowengine.core.node.builtin.ScriptNodeExecutor;
 import com.playrewards.flowengine.core.node.builtin.StartNodeExecutor;
 import com.playrewards.flowengine.core.node.builtin.VariableNodeExecutor;
+import com.playrewards.flowengine.core.node.structure.LockNodeExecutor;
+import com.playrewards.flowengine.core.node.structure.LoopCoordinator;
+import com.playrewards.flowengine.core.node.structure.ParallelCoordinator;
+import com.playrewards.flowengine.core.node.structure.SubFlowNodeExecutor;
 import com.playrewards.flowengine.core.component.FlowBusinessComponentRegistry;
 import com.playrewards.flowengine.core.protocol.InputBindingResolver;
 import com.playrewards.flowengine.core.protocol.OutputValidator;
 import com.playrewards.flowengine.spi.ScriptRuntime;
+import com.playrewards.flowengine.spi.DistributedLockProvider;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.EnumMap;
@@ -83,6 +89,39 @@ public final class NodeExecutorRegistry {
                 new IfNodeExecutor(scriptRuntime),
                 new VariableNodeExecutor(scriptRuntime, outputValidator),
                 new ScriptNodeExecutor(scriptRuntime, outputValidator),
+                new ParallelCoordinator(),
+                new LoopCoordinator(scriptRuntime),
+                new SubFlowNodeExecutor(),
+                new BusinessNodeExecutor(businessComponents, new InputBindingResolver(), outputValidator)));
+    }
+
+    /**
+     * Creates the complete Task 7 runtime registry including scheduler-owned LOCK leases.
+     *
+     * @param scriptRuntime adapter-owned bounded script runtime
+     * @param businessComponents immutable startup business registry
+     * @param lockProvider tenant-scoped lease provider
+     * @param clock shared deadline and lease clock
+     * @return complete structural and Task 6 executor registry
+     */
+    public static NodeExecutorRegistry runtimeBuiltIns(ScriptRuntime scriptRuntime,
+            FlowBusinessComponentRegistry businessComponents,
+            DistributedLockProvider lockProvider, Clock clock) {
+        Objects.requireNonNull(scriptRuntime, "script runtime must not be null");
+        Objects.requireNonNull(businessComponents, "business components must not be null");
+        Objects.requireNonNull(lockProvider, "lock provider must not be null");
+        Objects.requireNonNull(clock, "clock must not be null");
+        OutputValidator outputValidator = new OutputValidator();
+        return new NodeExecutorRegistry(List.of(
+                new StartNodeExecutor(),
+                new EndNodeExecutor(),
+                new IfNodeExecutor(scriptRuntime),
+                new VariableNodeExecutor(scriptRuntime, outputValidator),
+                new ScriptNodeExecutor(scriptRuntime, outputValidator),
+                new ParallelCoordinator(),
+                new LoopCoordinator(scriptRuntime),
+                new SubFlowNodeExecutor(),
+                new LockNodeExecutor(scriptRuntime, lockProvider, clock),
                 new BusinessNodeExecutor(businessComponents, new InputBindingResolver(), outputValidator)));
     }
 

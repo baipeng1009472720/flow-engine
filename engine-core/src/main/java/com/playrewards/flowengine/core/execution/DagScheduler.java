@@ -1,5 +1,6 @@
 package com.playrewards.flowengine.core.execution;
 
+import com.playrewards.flowengine.contract.component.ComponentType;
 import com.playrewards.flowengine.contract.execution.ExecutionMode;
 import com.playrewards.flowengine.contract.execution.ExecutionRequest;
 import com.playrewards.flowengine.contract.execution.ExecutionResult;
@@ -13,16 +14,22 @@ import com.playrewards.flowengine.core.node.NodeExecutor;
 import com.playrewards.flowengine.core.node.NodeExecutorRegistry;
 import com.playrewards.flowengine.core.node.NodeInvocation;
 import com.playrewards.flowengine.core.node.NodeResult;
+import com.playrewards.flowengine.core.node.structure.LockNodeExecutor;
+import com.playrewards.flowengine.core.node.structure.LoopCoordinator;
+import com.playrewards.flowengine.core.node.structure.SubFlowNodeExecutor;
 import com.playrewards.flowengine.core.protocol.InputBindingResolver;
 import com.playrewards.flowengine.core.protocol.OutputValidator;
 import com.playrewards.flowengine.spi.ComponentInputs;
 import com.playrewards.flowengine.spi.ExecutionLogger;
+import com.playrewards.flowengine.spi.LockLease;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -61,17 +68,21 @@ public final class DagScheduler implements AutoCloseable {
 
     private static final int DEFAULT_MAX_IN_FLIGHT_NODE_TASKS = 1024;
     private static final int DEFAULT_MAX_IN_FLIGHT_EXECUTIONS = 1024;
+    private static final int DEFAULT_MAX_IN_FLIGHT_LOCK_WAITS = 1024;
     private static final long ADMISSION_POLL_MILLIS = 25;
     private static final Semaphore PROCESS_NODE_TASK_ADMISSION =
             new Semaphore(DEFAULT_MAX_IN_FLIGHT_NODE_TASKS, true);
     private static final Semaphore PROCESS_EXECUTION_ADMISSION =
             new Semaphore(DEFAULT_MAX_IN_FLIGHT_EXECUTIONS, true);
+    private static final Semaphore PROCESS_LOCK_WAIT_ADMISSION =
+            new Semaphore(DEFAULT_MAX_IN_FLIGHT_LOCK_WAITS, true);
 
     private final NodeExecutorRegistry executors;
     private final ConcurrencyGovernor governor;
     private final Clock clock;
     private final Semaphore nodeTaskAdmission;
     private final Semaphore executionAdmission;
+    private final Semaphore lockWaitAdmission;
     private final ExecutionLifecycleObserver lifecycleObserver;
     private final InputBindingResolver inputBindingResolver = new InputBindingResolver();
     private final OutputValidator outputValidator = new OutputValidator();
@@ -91,6 +102,7 @@ public final class DagScheduler implements AutoCloseable {
      */
     public DagScheduler(NodeExecutorRegistry executors, ConcurrencyGovernor governor, Clock clock) {
         this(executors, governor, clock, PROCESS_NODE_TASK_ADMISSION, PROCESS_EXECUTION_ADMISSION,
+                PROCESS_LOCK_WAIT_ADMISSION,
                 ExecutionLifecycleObserver.NOOP, ExecutionLogger.NOOP);
     }
 
@@ -105,6 +117,7 @@ public final class DagScheduler implements AutoCloseable {
     public DagScheduler(NodeExecutorRegistry executors, ConcurrencyGovernor governor, Clock clock,
             ExecutionLogger executionLogger) {
         this(executors, governor, clock, PROCESS_NODE_TASK_ADMISSION, PROCESS_EXECUTION_ADMISSION,
+                PROCESS_LOCK_WAIT_ADMISSION,
                 ExecutionLifecycleObserver.NOOP, executionLogger);
     }
 
@@ -142,11 +155,12 @@ public final class DagScheduler implements AutoCloseable {
         this(executors, governor, clock,
                 new Semaphore(positive(maxInFlightNodeTasks, "maxInFlightNodeTasks"), true),
                 new Semaphore(positive(maxInFlightExecutions, "maxInFlightExecutions"), true),
+                new Semaphore(positive(maxInFlightNodeTasks, "maxInFlightNodeTasks"), true),
                 ExecutionLifecycleObserver.NOOP, ExecutionLogger.NOOP);
     }
 
     private DagScheduler(NodeExecutorRegistry executors, ConcurrencyGovernor governor, Clock clock,
-            Semaphore nodeTaskAdmission, Semaphore executionAdmission,
+            Semaphore nodeTaskAdmission, Semaphore executionAdmission, Semaphore lockWaitAdmission,
             ExecutionLifecycleObserver lifecycleObserver, ExecutionLogger executionLogger) {
         this.executors = Objects.requireNonNull(executors, "executors must not be null");
         this.governor = Objects.requireNonNull(governor, "governor must not be null");
@@ -154,6 +168,8 @@ public final class DagScheduler implements AutoCloseable {
         this.nodeTaskAdmission = Objects.requireNonNull(nodeTaskAdmission, "nodeTaskAdmission must not be null");
         this.executionAdmission = Objects.requireNonNull(
                 executionAdmission, "executionAdmission must not be null");
+        this.lockWaitAdmission = Objects.requireNonNull(
+                lockWaitAdmission, "lockWaitAdmission must not be null");
         this.lifecycleObserver = Objects.requireNonNull(lifecycleObserver, "lifecycleObserver must not be null");
         this.executionLogger = Objects.requireNonNull(executionLogger, "executionLogger must not be null");
     }
@@ -174,6 +190,7 @@ public final class DagScheduler implements AutoCloseable {
         this(executors, governor, clock,
                 new Semaphore(positive(maxInFlightNodeTasks, "maxInFlightNodeTasks"), true),
                 new Semaphore(positive(maxInFlightExecutions, "maxInFlightExecutions"), true),
+                new Semaphore(positive(maxInFlightNodeTasks, "maxInFlightNodeTasks"), true),
                 lifecycleObserver, ExecutionLogger.NOOP);
     }
 
@@ -215,6 +232,7 @@ public final class DagScheduler implements AutoCloseable {
             }
             AtomicReference<Thread> controller = new AtomicReference<>();
             Map<Future<NodeCompletion>, AdmissionLease> runningNodes = new ConcurrentHashMap<>();
+            StructuralState structuralState = new StructuralState();
             CancellationHandle.CancellationRegistration controllerRegistration = cancellation.onCancellation(() -> {
                 runningNodes.forEach(DagScheduler::cancelRunningTask);
                 Thread thread = controller.get();
@@ -234,7 +252,8 @@ public final class DagScheduler implements AutoCloseable {
                     controller.set(Thread.currentThread());
                     try {
                         ExecutionResult executionResult =
-                                run(executionId, plan, request, context, cancellation, registration, runningNodes);
+                                run(executionId, plan, request, context, cancellation, registration,
+                                        runningNodes, structuralState);
                         lifecycleObserver.beforeResultPublication(cancellation.reason());
                         registration.publishFromController(executionResult);
                     } catch (Throwable failure) {
@@ -265,13 +284,33 @@ public final class DagScheduler implements AutoCloseable {
 
     private ExecutionResult run(String executionId, ExecutionPlan plan, ExecutionRequest request,
             ExecutionContext context, CancellationHandle cancellation, ExecutionRegistration registration,
-            Map<Future<NodeCompletion>, AdmissionLease> runningNodes) {
+            Map<Future<NodeCompletion>, AdmissionLease> runningNodes, StructuralState structuralState) {
+        ExecutionResult candidate = null;
+        List<LockAddress> cleanupFailures;
+        try {
+            candidate = runOutcome(executionId, plan, request, context, cancellation, registration,
+                    runningNodes, structuralState);
+        } finally {
+            cleanupFailures = structuralState.cleanupAll();
+            logCleanupFailures(executionId, cleanupFailures);
+        }
+        if (!cleanupFailures.isEmpty() && candidate.status() == ExecutionStatus.SUCCEEDED) {
+            return result(executionId, ExecutionStatus.FAILED, null,
+                    "LOCK_LEASE_CLEANUP_FAILED", "LOCK lease cleanup failed", candidate.startedAt());
+        }
+        return candidate;
+    }
+
+    private ExecutionResult runOutcome(String executionId, ExecutionPlan plan, ExecutionRequest request,
+            ExecutionContext context, CancellationHandle cancellation, ExecutionRegistration registration,
+            Map<Future<NodeCompletion>, AdmissionLease> runningNodes, StructuralState structuralState) {
         Instant startedAt = clock.instant();
         try {
             validateExecutionBoundary(plan, request);
             checkStop(request, cancellation);
             NodeResult.TerminalOutcome outcome = executeGraph(
-                    executionId, plan, request, context, cancellation, registration, runningNodes);
+                    executionId, plan, request, context, cancellation, registration,
+                    runningNodes, structuralState);
             return result(executionId, outcome.status(), outcome.result(), outcome.errorCode(),
                     outcome.errorMessage(), startedAt);
         } catch (ExecutionDeadlineExceededException exception) {
@@ -307,34 +346,77 @@ public final class DagScheduler implements AutoCloseable {
         }
     }
 
+    private void logCleanupFailures(String executionId, List<LockAddress> failures) {
+        failures.forEach(address -> {
+            try {
+                executionLogger.error("LOCK lease cleanup failed", null, Map.of(
+                        "executionId", executionId,
+                        "flowId", address.flowId(),
+                        "nodeId", address.acquireNodeId(),
+                        "scopePath", address.scopePath().value()));
+            } catch (RuntimeException ignored) {
+                // Observation failure must not replace the already selected business outcome.
+            }
+        });
+    }
+
     private NodeResult.TerminalOutcome executeGraph(String executionId, ExecutionPlan plan,
             ExecutionRequest request, ExecutionContext context, CancellationHandle cancellation,
             ExecutionRegistration registration,
-            Map<Future<NodeCompletion>, AdmissionLease> runningNodes) throws InterruptedException {
-        Map<String, Readiness> readiness = new HashMap<>();
-        PriorityQueue<String> ready = new PriorityQueue<>();
-        for (String nodeId : plan.nodesById().keySet()) {
-            int incoming = plan.reverseAdjacency().getOrDefault(nodeId, List.of()).size();
-            readiness.put(nodeId, new Readiness(incoming));
-            if (incoming == 0) {
-                ready.add(nodeId);
+            Map<Future<NodeCompletion>, AdmissionLease> runningNodes,
+            StructuralState structuralState) throws InterruptedException {
+        Set<String> starts = plan.nodesById().entrySet().stream()
+                .filter(entry -> entry.getValue().componentContract().componentType() == ComponentType.START)
+                .map(Map.Entry::getKey).collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
+        RegionOutcome region = executeRegion(executionId, plan, request, context, cancellation,
+                runningNodes, structuralState, ScopePath.root(), starts, null, 0, true);
+        if (region.terminalOutcome() == null) {
+            throw new NodeExecutionException("FLOW_TERMINATED_WITHOUT_END",
+                    "active execution graph completed without reaching END");
+        }
+        if (registration.selectReason(CancellationHandle.Reason.TERMINAL)
+                || cancellation.reason() == CancellationHandle.Reason.TERMINAL) {
+            return region.terminalOutcome();
+        }
+        throw new CancellationException("cancellation won the terminal outcome race");
+    }
+
+    private RegionOutcome executeRegion(String executionId, ExecutionPlan plan,
+            ExecutionRequest request, ExecutionContext context, CancellationHandle cancellation,
+            Map<Future<NodeCompletion>, AdmissionLease> allRunningNodes,
+            StructuralState structuralState, ScopePath seedScope, Set<String> seeds,
+            String boundaryNodeId, int subFlowDepth, boolean terminalAllowed) throws InterruptedException {
+        Set<String> included = collectRegion(plan, seeds, boundaryNodeId);
+        Map<String, Readiness> readiness = initializeReadiness(plan, included);
+        PriorityQueue<ReadyNode> ready = new PriorityQueue<>(java.util.Comparator.comparing(ReadyNode::nodeId));
+        for (String seed : new java.util.TreeSet<>(seeds)) {
+            Readiness state = readiness.get(seed);
+            if (state != null && state.totalIncoming == 0) {
+                state.activeScopes.add(seedScope);
+                ready.add(new ReadyNode(seed, seedScope));
             }
         }
         CompletionService<NodeCompletion> completions = new ExecutorCompletionService<>(virtualThreads);
+        Map<Future<NodeCompletion>, AdmissionLease> regionRunning = new LinkedHashMap<>();
         int running = 0;
+        try {
         while (!ready.isEmpty() || running > 0) {
             checkStop(request, cancellation);
             while (!ready.isEmpty() && nodeTaskAdmission.tryAcquire()) {
-                String nodeId = ready.remove();
-                submitNode(completions, runningNodes, readiness, nodeId,
-                        executionId, plan, request, context, cancellation);
+                ReadyNode next = ready.remove();
+                Future<NodeCompletion> future = submitNode(completions, allRunningNodes, readiness,
+                        next.nodeId(), next.scopePath(), executionId, plan, request, context,
+                        cancellation, structuralState, subFlowDepth);
+                regionRunning.put(future, allRunningNodes.get(future));
                 running++;
             }
             if (running == 0 && !ready.isEmpty()) {
                 acquireNodeAdmission(request, cancellation);
-                String nodeId = ready.remove();
-                submitNode(completions, runningNodes, readiness, nodeId,
-                        executionId, plan, request, context, cancellation);
+                ReadyNode next = ready.remove();
+                Future<NodeCompletion> future = submitNode(completions, allRunningNodes, readiness,
+                        next.nodeId(), next.scopePath(), executionId, plan, request, context,
+                        cancellation, structuralState, subFlowDepth);
+                regionRunning.put(future, allRunningNodes.get(future));
                 running++;
             }
             if (running == 0) {
@@ -344,12 +426,17 @@ public final class DagScheduler implements AutoCloseable {
             if (remainingNanos <= 0) {
                 throw new ExecutionDeadlineExceededException("execution deadline exceeded");
             }
-            Future<NodeCompletion> completedFuture = completions.poll(remainingNanos, TimeUnit.NANOSECONDS);
+            long completionWait = ready.isEmpty() ? remainingNanos : Math.min(
+                    remainingNanos, TimeUnit.MILLISECONDS.toNanos(ADMISSION_POLL_MILLIS));
+            Future<NodeCompletion> completedFuture = completions.poll(completionWait, TimeUnit.NANOSECONDS);
             if (completedFuture == null) {
+                if (!ready.isEmpty()) {
+                    continue;
+                }
                 throw new ExecutionDeadlineExceededException("execution deadline exceeded");
             }
             running--;
-            runningNodes.remove(completedFuture);
+            allRunningNodes.remove(completedFuture);
             NodeCompletion completed;
             try {
                 completed = completedFuture.get();
@@ -359,48 +446,112 @@ public final class DagScheduler implements AutoCloseable {
                 throw propagate(exception.getCause());
             }
             if (completed.failure() != null) {
+                cancellation.requestStopWithoutReason();
+                if (isRootRegion(seedScope, boundaryNodeId, subFlowDepth)) {
+                    Thread.interrupted();
+                }
+                boolean sourceCleanup = requiresSourceCleanup(
+                        seedScope, boundaryNodeId, subFlowDepth, completed.scopePath());
+                if (!cancelAndAwait(regionRunning, CleanupBudget.standard(), sourceCleanup)) {
+                    completed.failure().addSuppressed(new IllegalStateException(
+                            "structured sibling cleanup did not finish before the deadline"));
+                    logStructuredCleanupTimeout(executionId, seedScope);
+                }
                 throw propagate(completed.failure());
             }
+            regionRunning.remove(completedFuture);
             Readiness state = readiness.get(completed.nodeId());
             state.state = NodeState.COMPLETED;
             CompiledNode node = plan.nodesById().get(completed.nodeId());
             completed.result().outputs().forEach((key, value) ->
-                    context.writeOnce(node.node().nodeCode(), ScopePath.root(), key, value));
+                    context.writeOnce(node.node().nodeCode(), completed.scopePath(), key, value));
             if (completed.result().terminalOutcome() != null) {
-                if (registration.selectReason(CancellationHandle.Reason.TERMINAL)
-                        || cancellation.reason() == CancellationHandle.Reason.TERMINAL) {
-                    return completed.result().terminalOutcome();
+                cancellation.requestStopWithoutReason();
+                if (isRootRegion(seedScope, boundaryNodeId, subFlowDepth)) {
+                    Thread.interrupted();
                 }
-                throw new CancellationException("cancellation won the terminal outcome race");
+                boolean sourceCleanup = requiresSourceCleanup(
+                        seedScope, boundaryNodeId, subFlowDepth, completed.scopePath());
+                if (!cancelAndAwait(regionRunning, CleanupBudget.standard(), sourceCleanup)) {
+                    logStructuredCleanupTimeout(executionId, seedScope);
+                    throw new NodeExecutionException("STRUCTURED_CLEANUP_TIMEOUT",
+                            "structured sibling cleanup did not finish before the deadline");
+                }
+                if (!terminalAllowed) {
+                    throw new NodeExecutionException("STRUCTURED_REGION_END_FORBIDDEN",
+                            "structured region reached END before its boundary");
+                }
+                return new RegionOutcome(completed.result().terminalOutcome(), false);
             }
-            resolveOutgoing(plan, readiness, completed.nodeId(), completed.result().activatedPorts(), ready);
+            if (boundaryNodeId != null && boundaryNodeId.equals(completed.nodeId())) {
+                if (!cancelAndAwait(regionRunning, CleanupBudget.standard(), true)) {
+                    logStructuredCleanupTimeout(executionId, seedScope);
+                    throw new NodeExecutionException("STRUCTURED_CLEANUP_TIMEOUT",
+                            "structured sibling cleanup did not finish before the deadline");
+                }
+                return new RegionOutcome(null, true);
+            }
+            resolveOutgoing(plan, included, readiness, completed, ready);
         }
-        throw new NodeExecutionException("FLOW_TERMINATED_WITHOUT_END",
-                "active execution graph completed without reaching END");
+        return new RegionOutcome(null, false);
+        } catch (CancellationException | ExecutionDeadlineExceededException failure) {
+            cancellation.requestStopWithoutReason();
+            Thread.interrupted();
+            if (!cancelAndAwait(regionRunning, CleanupBudget.standard(),
+                    requiresRegionSourceCleanup(seedScope, boundaryNodeId, subFlowDepth))) {
+                logStructuredCleanupTimeout(executionId, seedScope);
+            }
+            throw failure;
+        } catch (InterruptedException failure) {
+            Thread.interrupted();
+            cancellation.requestStopWithoutReason();
+            if (!cancelAndAwait(regionRunning, CleanupBudget.standard(),
+                    requiresRegionSourceCleanup(seedScope, boundaryNodeId, subFlowDepth))) {
+                logStructuredCleanupTimeout(executionId, seedScope);
+            }
+            throw failure;
+        }
     }
 
-    private void submitNode(CompletionService<NodeCompletion> completions,
+    private static boolean isRootRegion(ScopePath scopePath, String boundaryNodeId, int subFlowDepth) {
+        return ScopePath.root().equals(scopePath) && boundaryNodeId == null && subFlowDepth == 0;
+    }
+
+    private static boolean requiresSourceCleanup(ScopePath seedScope, String boundaryNodeId,
+            int subFlowDepth, ScopePath completedScope) {
+        return boundaryNodeId != null || subFlowDepth > 0 || !completedScope.equals(seedScope);
+    }
+
+    private static boolean requiresRegionSourceCleanup(
+            ScopePath seedScope, String boundaryNodeId, int subFlowDepth) {
+        return boundaryNodeId != null || subFlowDepth > 0 || !ScopePath.root().equals(seedScope);
+    }
+
+    private Future<NodeCompletion> submitNode(CompletionService<NodeCompletion> completions,
             Map<Future<NodeCompletion>, AdmissionLease> runningNodes,
-            Map<String, Readiness> readiness, String nodeId,
+            Map<String, Readiness> readiness, String nodeId, ScopePath scopePath,
             String executionId, ExecutionPlan plan, ExecutionRequest request, ExecutionContext context,
-            CancellationHandle cancellation) {
+            CancellationHandle cancellation, StructuralState structuralState, int subFlowDepth) {
         Readiness state = readiness.get(nodeId);
         if (state.state != NodeState.PENDING) {
             nodeTaskAdmission.release();
             throw new IllegalStateException("ready queue contained a non-pending node: " + nodeId);
         }
         state.state = NodeState.RUNNING;
-        AdmissionLease admissionLease = new AdmissionLease(nodeTaskAdmission);
+        AdmissionLease admissionLease = new AdmissionLease(
+                nodeTaskAdmission, !ScopePath.root().equals(scopePath));
         try {
             Future<NodeCompletion> future = completions.submit(() -> {
                 admissionLease.started();
                 try {
-                    return invokeNode(executionId, plan, nodeId, request, context, cancellation, admissionLease);
+                    return invokeNode(executionId, plan, nodeId, scopePath, request, context,
+                            cancellation, admissionLease, runningNodes, structuralState, subFlowDepth);
                 } finally {
                     admissionLease.releaseAfterRun();
                 }
             });
             runningNodes.put(future, admissionLease);
+            return future;
         } catch (RuntimeException failure) {
             state.state = NodeState.PENDING;
             admissionLease.releaseBeforeStart();
@@ -430,15 +581,18 @@ public final class DagScheduler implements AutoCloseable {
     }
 
     private NodeCompletion invokeNode(String executionId, ExecutionPlan plan, String nodeId,
-            ExecutionRequest request, ExecutionContext context, CancellationHandle cancellation,
-            AdmissionLease admissionLease) {
+            ScopePath scopePath, ExecutionRequest request, ExecutionContext context,
+            CancellationHandle cancellation, AdmissionLease admissionLease,
+            Map<Future<NodeCompletion>, AdmissionLease> allRunningNodes,
+            StructuralState structuralState, int subFlowDepth) {
         ConcurrencyGovernor.Permit permit = null;
+        boolean lockWaitPermit = false;
         try {
             checkStop(request, cancellation);
             CompiledNode node = plan.nodesById().get(nodeId);
-            ComponentInputs inputs = inputBindingResolver.resolve(plan, node, context, ScopePath.root());
+            ComponentInputs inputs = inputBindingResolver.resolve(plan, node, context, scopePath);
             NodeExecutionContext nodeContext = new NodeExecutionContext(executionId, plan, node, context,
-                    ScopePath.root(), inputs, cancellation, request, clock, executionLogger);
+                    scopePath, inputs, cancellation, request, clock, executionLogger);
             String resourceKey = resourceKey(node);
             ConcurrencyGovernor.PermitRequest permitRequest = new ConcurrencyGovernor.PermitRequest(
                     request.tenantId(), plan.flowIdentity().flowId(), node.node().componentCode(), resourceKey,
@@ -447,6 +601,34 @@ public final class DagScheduler implements AutoCloseable {
             nodeContext.throwIfStopped();
             NodeExecutor executor = executors.required(node.componentContract().componentType(),
                     node.node().nodeCode());
+            boolean lockAcquisition = node.componentContract().componentType() == ComponentType.LOCK
+                    && "ACQUIRE".equals(text(node.node().config().get("role")));
+            if (lockAcquisition) {
+                if (!lockWaitAdmission.tryAcquire()) {
+                    throw new NodeExecutionException("LOCK_WAIT_CAPACITY_EXCEEDED",
+                            "LOCK wait capacity exceeded");
+                }
+                lockWaitPermit = true;
+            }
+            if (node.componentContract().componentType() == ComponentType.LOOP
+                    || node.componentContract().componentType() == ComponentType.SUB_FLOW
+                    || lockAcquisition) {
+                permit.close();
+                permit = null;
+                admissionLease.releaseForStructuredWait();
+            }
+            NodeResult structured = switch (node.componentContract().componentType()) {
+                case LOOP -> executeLoop(executionId, plan, nodeId, nodeContext, request, context,
+                        cancellation, allRunningNodes, structuralState, subFlowDepth, executor);
+                case SUB_FLOW -> executeSubFlow(executionId, plan, nodeId, nodeContext, request,
+                        cancellation, allRunningNodes, structuralState, subFlowDepth, executor);
+                case LOCK -> executeLock(plan, nodeId, nodeContext, structuralState, executor);
+                default -> null;
+            };
+            if (structured != null) {
+                outputValidator.validateResult(node, structured);
+                return NodeCompletion.success(nodeId, scopePath, structured);
+            }
             NodeInvocation invocation = Objects.requireNonNull(executor.execute(nodeContext),
                     "node invocation must not be null");
             StageAwaiter awaiter = bridge(invocation.completion(), permit, admissionLease);
@@ -455,13 +637,260 @@ public final class DagScheduler implements AutoCloseable {
                     cancellation.onCancellation(awaiter::cancel)) {
                 NodeResult result = awaitNode(awaiter, request, cancellation);
                 outputValidator.validateResult(node, result);
-                return NodeCompletion.success(nodeId, result);
+                return NodeCompletion.success(nodeId, scopePath, result);
             }
         } catch (Throwable failure) {
-            return NodeCompletion.failure(nodeId, failure);
+            return NodeCompletion.failure(nodeId, scopePath, failure);
         } finally {
             if (permit != null) {
                 permit.close();
+            }
+            if (lockWaitPermit) {
+                lockWaitAdmission.release();
+            }
+        }
+    }
+
+    private NodeResult executeLoop(String executionId, ExecutionPlan plan, String nodeId,
+            NodeExecutionContext nodeContext, ExecutionRequest request, ExecutionContext context,
+            CancellationHandle cancellation, Map<Future<NodeCompletion>, AdmissionLease> allRunningNodes,
+            StructuralState structuralState, int subFlowDepth, NodeExecutor executor)
+            throws Exception {
+        if (!(executor instanceof LoopCoordinator loop)) {
+            throw new NodeExecutionException("LOOP_EXECUTOR_INVALID", "LOOP executor is not a coordinator");
+        }
+        String role = text(nodeContext.node().node().config().get("role"));
+        if ("END".equals(role)) {
+            return NodeResult.continueWith(Map.of(), Set.of("NEXT"));
+        }
+        if (!"START".equals(role)) {
+            throw new NodeExecutionException("LOOP_CONFIG_INVALID", "LOOP role must be START or END");
+        }
+        LoopCoordinator.CollectionEvaluation collectionEvaluation = loop.collection(nodeContext);
+        List<Object> collection = awaitValue(collectionEvaluation.completion(),
+                collectionEvaluation.sourceCompletion(), request, cancellation,
+                "LOOP_COLLECTION_FAILED", nodeContext);
+        String endId = plan.loopPairs().get(nodeId);
+        List<String> bodyTargets = plan.outgoingByPort().getOrDefault(nodeId, Map.of())
+                .getOrDefault("BODY", List.of());
+        if (endId == null || bodyTargets.isEmpty()) {
+            throw new NodeExecutionException("LOOP_PLAN_INVALID", "LOOP plan is missing its body or pair");
+        }
+        String itemAlias = loop.itemAlias(nodeContext);
+        String indexAlias = loop.indexAlias(nodeContext);
+        LoopCoordinator.Source resultBinding = loop.resultBinding(nodeContext);
+        Set<String> bodyRegion = collectRegion(plan, new LinkedHashSet<>(bodyTargets), endId);
+        if (resultBinding != null && (!bodyRegion.contains(resultBinding.nodeId())
+                || endId.equals(resultBinding.nodeId()))) {
+            throw new NodeExecutionException("LOOP_RESULT_SOURCE_INVALID",
+                    "LOOP result source must be inside the paired body");
+        }
+        List<Object> results = new ArrayList<>(collection.size());
+        for (int index = 0; index < collection.size(); index++) {
+            nodeContext.throwIfStopped();
+            ScopePath iterationScope = nodeContext.scopePath()
+                    .child("loop:" + nodeContext.node().node().nodeCode())
+                    .child("index:" + index);
+            context.writeOnce(nodeContext.node().node().nodeCode(), iterationScope, itemAlias,
+                    collection.get(index));
+            context.writeOnce(nodeContext.node().node().nodeCode(), iterationScope, indexAlias, index);
+            CancellationHandle iterationCancellation = cancellation.linkedChild();
+            RegionOutcome iteration;
+            try {
+                iteration = executeRegion(executionId, plan, request, context, iterationCancellation,
+                        allRunningNodes, structuralState, iterationScope,
+                        new LinkedHashSet<>(bodyTargets), endId, subFlowDepth, false);
+            } finally {
+                iterationCancellation.detachFromParent();
+            }
+            if (!iteration.boundaryReached()) {
+                throw new NodeExecutionException("LOOP_ITERATION_INCOMPLETE",
+                        "LOOP iteration did not reach its paired LOOP_END");
+            }
+            if (resultBinding == null) {
+                results.add(null);
+            } else {
+                CompiledNode source = plan.nodesById().get(resultBinding.nodeId());
+                if (source == null) {
+                    throw new NodeExecutionException("LOOP_RESULT_SOURCE_NOT_FOUND",
+                            "LOOP result source is absent from the plan");
+                }
+                ExecutionContext.ContextValue value = context.lookupVisible(
+                        source.node().nodeCode(), iterationScope, resultBinding.outputKey());
+                if (!value.present()) {
+                    throw new NodeExecutionException("LOOP_RESULT_MISSING",
+                            "LOOP result source did not produce a value");
+                }
+                results.add(value.value());
+            }
+        }
+        return loop.completed(java.util.Collections.unmodifiableList(results));
+    }
+
+    private NodeResult executeSubFlow(String executionId, ExecutionPlan plan, String nodeId,
+            NodeExecutionContext nodeContext, ExecutionRequest request,
+            CancellationHandle cancellation, Map<Future<NodeCompletion>, AdmissionLease> allRunningNodes,
+            StructuralState structuralState, int subFlowDepth, NodeExecutor executor)
+            throws Exception {
+        if (!(executor instanceof SubFlowNodeExecutor subFlow)) {
+            throw new NodeExecutionException("SUB_FLOW_EXECUTOR_INVALID",
+                    "SUB_FLOW executor is not a coordinator");
+        }
+        if (subFlowDepth >= 32) {
+            throw new NodeExecutionException("SUB_FLOW_DEPTH_EXCEEDED",
+                    "SUB_FLOW nesting exceeds the maximum depth");
+        }
+        ExecutionPlan childPlan = plan.subFlowPlans().get(nodeId);
+        if (childPlan == null) {
+            throw new NodeExecutionException("SUB_FLOW_PLAN_MISSING",
+                    "compiled SUB_FLOW plan is missing");
+        }
+        String childId = UUID.randomUUID().toString();
+        ScopePath childScope = nodeContext.scopePath()
+                .child("subflow:" + nodeContext.node().node().nodeCode())
+                .child("execution:" + childId);
+        ExecutionContext childContext = new ExecutionContext(nodeContext.externalScopes());
+        nodeContext.executionContext().registerChildExecution(childId, childScope, childContext);
+        Map<String, Object> childInputs = new LinkedHashMap<>(nodeContext.inputs().requiredValues());
+        childInputs.putAll(nodeContext.inputs().optionalValues());
+        ExecutionRequest childRequest = new ExecutionRequest(request.flowReference(), request.mode(),
+                request.purpose(), childInputs, request.externalScopes(), request.contextReference(),
+                request.idempotencyKey(), request.tenantId(), request.deadline(), request.metadata());
+        Set<String> childStarts = childPlan.nodesById().entrySet().stream()
+                .filter(entry -> entry.getValue().componentContract().componentType() == ComponentType.START)
+                .map(Map.Entry::getKey).collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
+        CancellationHandle childCancellation = cancellation.linkedChild();
+        RegionOutcome child;
+        try {
+            child = executeRegion(executionId, childPlan, childRequest, childContext,
+                    childCancellation, allRunningNodes, structuralState, childScope, childStarts,
+                    null, subFlowDepth + 1, true);
+        } finally {
+            childCancellation.detachFromParent();
+        }
+        NodeResult.TerminalOutcome outcome = child.terminalOutcome();
+        if (outcome == null) {
+            throw new NodeExecutionException("SUB_FLOW_TERMINATED_WITHOUT_END",
+                    "child flow completed without reaching END");
+        }
+        if (outcome.status() != ExecutionStatus.SUCCEEDED) {
+            throw new NodeExecutionException(outcome.errorCode(),
+                    outcome.errorMessage() == null ? "child flow failed" : outcome.errorMessage());
+        }
+        return subFlow.mapSuccessfulResult(nodeContext, outcome.result());
+    }
+
+    private NodeResult executeLock(ExecutionPlan plan, String nodeId,
+            NodeExecutionContext nodeContext, StructuralState structuralState, NodeExecutor executor) {
+        if (!(executor instanceof LockNodeExecutor lock)) {
+            throw new NodeExecutionException("LOCK_EXECUTOR_INVALID", "LOCK executor is not a coordinator");
+        }
+        String role = text(nodeContext.node().node().config().get("role"));
+        if ("ACQUIRE".equals(role)) {
+            LockAddress address = new LockAddress(plan.flowIdentity().flowId(), nodeId, nodeContext.scopePath());
+            LockLease lease = lock.acquire(nodeContext);
+            structuralState.register(address, lock, lease);
+            return lock.continued();
+        }
+        if ("RELEASE".equals(role)) {
+            String acquireId = plan.lockPairs().get(nodeId);
+            if (acquireId == null) {
+                throw new NodeExecutionException("LOCK_PLAN_INVALID", "LOCK release has no paired acquire");
+            }
+            structuralState.release(new LockAddress(
+                    plan.flowIdentity().flowId(), acquireId, nodeContext.scopePath()));
+            return lock.continued();
+        }
+        throw new NodeExecutionException("LOCK_CONFIG_INVALID", "LOCK role must be ACQUIRE or RELEASE");
+    }
+
+    private <T> T awaitValue(CompletionStage<T> stage, CompletionStage<?> sourceStage,
+            ExecutionRequest request, CancellationHandle cancellation, String failureCode,
+            NodeExecutionContext nodeContext) throws Exception {
+        Objects.requireNonNull(stage, "structured completion must not be null");
+        Objects.requireNonNull(sourceStage, "structured source completion must not be null");
+        CompletableFuture<T> future = new CompletableFuture<>();
+        java.util.concurrent.CountDownLatch sourceDone = new java.util.concurrent.CountDownLatch(1);
+        sourceStage.whenComplete((ignored, failure) -> sourceDone.countDown());
+        stage.whenComplete((value, failure) -> {
+            if (failure == null) {
+                future.complete(value);
+            } else {
+                future.completeExceptionally(failure);
+            }
+        });
+        Future<?> cancellableStage = stage instanceof Future<?> source ? source : null;
+        Future<?> cancellableSource = sourceStage instanceof Future<?> source ? source : null;
+        try (CancellationHandle.CancellationRegistration ignored = cancellation.onCancellation(
+                () -> {
+                    if (cancellableSource != null) {
+                        cancellableSource.cancel(true);
+                    }
+                    if (cancellableStage != null && cancellableStage != cancellableSource) {
+                        cancellableStage.cancel(true);
+                    }
+                    future.cancel(true);
+                })) {
+            try {
+                return future.get(Math.max(1, TimeUnit.NANOSECONDS.toMillis(
+                        remainingNanos(request.deadline()))), TimeUnit.MILLISECONDS);
+            } catch (TimeoutException failure) {
+                if (cancellableSource != null) {
+                    cancellableSource.cancel(true);
+                }
+                if (cancellableStage != null && cancellableStage != cancellableSource) {
+                    cancellableStage.cancel(true);
+                }
+                future.cancel(true);
+                cancellation.cancelForDeadline();
+                ExecutionDeadlineExceededException deadlineFailure =
+                        new ExecutionDeadlineExceededException("execution deadline exceeded", failure);
+                awaitStructuredSourceCleanup(sourceDone, nodeContext, deadlineFailure);
+                throw deadlineFailure;
+            } catch (InterruptedException failure) {
+                if (cancellation.isCancellationRequested()) {
+                    awaitStructuredSourceCleanup(sourceDone, nodeContext, failure);
+                }
+                throw failure;
+            } catch (ExecutionException failure) {
+                Throwable cause = unwrapCompletionFailure(failure.getCause());
+                if (cause instanceof Exception exception) {
+                    throw exception;
+                }
+                throw propagate(cause);
+            } catch (CancellationException failure) {
+                if (cancellation.isCancellationRequested()) {
+                    awaitStructuredSourceCleanup(sourceDone, nodeContext, failure);
+                    throw failure;
+                }
+                throw new NodeExecutionException(failureCode, "structured node completion was cancelled");
+            }
+        }
+    }
+
+    private void awaitStructuredSourceCleanup(java.util.concurrent.CountDownLatch sourceDone,
+            NodeExecutionContext nodeContext, Throwable selectedFailure) {
+        boolean interrupted = false;
+        CleanupBudget budget = CleanupBudget.standard();
+        boolean cleaned = false;
+        try {
+            while (budget.remainingNanos() > 0) {
+                try {
+                    cleaned = sourceDone.await(budget.remainingNanos(), TimeUnit.NANOSECONDS);
+                    break;
+                } catch (InterruptedException ignored) {
+                    interrupted = true;
+                    // External cancellation can race with cleanup; the real source still owns resources.
+                }
+            }
+        } finally {
+            if (!cleaned) {
+                selectedFailure.addSuppressed(new IllegalStateException(
+                        "structured source cleanup did not finish before the deadline"));
+                logStructuredCleanupTimeout(nodeContext.executionId(), nodeContext.scopePath());
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
             }
         }
     }
@@ -534,27 +963,36 @@ public final class DagScheduler implements AutoCloseable {
         return new StageAwaiter(completion, source instanceof Future<?> future ? future : null);
     }
 
-    private static void resolveOutgoing(ExecutionPlan plan, Map<String, Readiness> readiness,
-            String completedNodeId, Set<String> activatedPorts, Queue<String> ready) {
+    private static void resolveOutgoing(ExecutionPlan plan, Set<String> included,
+            Map<String, Readiness> readiness, NodeCompletion completed, Queue<ReadyNode> ready) {
         ArrayDeque<Decision> decisions = new ArrayDeque<>();
-        decisions.add(new Decision(completedNodeId, activatedPorts));
+        decisions.add(new Decision(completed.nodeId(), completed.result().activatedPorts(), completed.scopePath()));
         while (!decisions.isEmpty()) {
             Decision decision = decisions.removeFirst();
             Map<String, List<String>> outgoing = plan.outgoingByPort().getOrDefault(decision.nodeId(), Map.of());
             new TreeMap<>(outgoing).forEach((port, targets) -> {
                 boolean active = decision.activatedPorts().contains(port);
-                for (String target : targets) {
+                List<String> stableTargets = targets.stream().sorted().toList();
+                for (int index = 0; index < stableTargets.size(); index++) {
+                    String target = stableTargets.get(index);
+                    if (!included.contains(target)) {
+                        continue;
+                    }
+                    if (isLoopBack(plan, decision.nodeId(), target, port)) {
+                        continue;
+                    }
                     Readiness state = readiness.get(target);
                     state.resolvedIncoming++;
                     if (active) {
                         state.activeIncoming++;
+                        state.activeScopes.add(targetScope(plan, decision, port, target, index));
                     }
                     if (state.resolvedIncoming == state.totalIncoming && state.state == NodeState.PENDING) {
                         if (state.activeIncoming > 0) {
-                            ready.add(target);
+                            ready.add(new ReadyNode(target, collapseScopes(state.activeScopes)));
                         } else {
                             state.state = NodeState.SKIPPED;
-                            decisions.addLast(new Decision(target, Set.of()));
+                            decisions.addLast(new Decision(target, Set.of(), decision.scopePath()));
                         }
                     }
                 }
@@ -562,10 +1000,135 @@ public final class DagScheduler implements AutoCloseable {
         }
     }
 
+    private static ScopePath targetScope(ExecutionPlan plan, Decision decision,
+            String port, String target, int targetIndex) {
+        CompiledNode source = plan.nodesById().get(decision.nodeId());
+        if (source.componentContract().componentType() == ComponentType.PARALLEL
+                && "BRANCH".equals(port)) {
+            return decision.scopePath().child("parallel:" + source.node().nodeCode())
+                    .child("branch:" + targetIndex);
+        }
+        return decision.scopePath();
+    }
+
+    private static ScopePath collapseScopes(List<ScopePath> scopes) {
+        ScopePath result = scopes.getFirst();
+        for (int index = 1; index < scopes.size(); index++) {
+            result = result.commonAncestor(scopes.get(index));
+        }
+        return result;
+    }
+
+    private static Set<String> collectRegion(ExecutionPlan plan, Set<String> seeds, String boundaryNodeId) {
+        Set<String> included = new LinkedHashSet<>();
+        ArrayDeque<String> pending = new ArrayDeque<>(new java.util.TreeSet<>(seeds));
+        while (!pending.isEmpty()) {
+            String nodeId = pending.removeFirst();
+            if (!included.add(nodeId) || nodeId.equals(boundaryNodeId)) {
+                continue;
+            }
+            CompiledNode node = plan.nodesById().get(nodeId);
+            if (node == null) {
+                throw new NodeExecutionException("STRUCTURED_PLAN_INVALID", "region seed is absent from plan");
+            }
+            Map<String, List<String>> outgoing = plan.outgoingByPort().getOrDefault(nodeId, Map.of());
+            new TreeMap<>(outgoing).forEach((port, targets) -> {
+                if (node.componentContract().componentType() == ComponentType.LOOP
+                        && "START".equals(text(node.node().config().get("role")))
+                        && "BODY".equals(port)) {
+                    return;
+                }
+                for (String target : targets) {
+                    if (!isLoopBack(plan, nodeId, target, port)) {
+                        pending.addLast(target);
+                    }
+                }
+            });
+        }
+        return Set.copyOf(included);
+    }
+
+    private static Map<String, Readiness> initializeReadiness(ExecutionPlan plan, Set<String> included) {
+        Map<String, Integer> incoming = new HashMap<>();
+        included.forEach(nodeId -> incoming.put(nodeId, 0));
+        for (String sourceId : included) {
+            CompiledNode source = plan.nodesById().get(sourceId);
+            for (Map.Entry<String, List<String>> port
+                    : plan.outgoingByPort().getOrDefault(sourceId, Map.of()).entrySet()) {
+                if (source.componentContract().componentType() == ComponentType.LOOP
+                        && "START".equals(text(source.node().config().get("role")))
+                        && "BODY".equals(port.getKey())) {
+                    continue;
+                }
+                for (String target : port.getValue()) {
+                    if (included.contains(target) && !isLoopBack(plan, sourceId, target, port.getKey())) {
+                        incoming.compute(target, (ignored, value) -> value + 1);
+                    }
+                }
+            }
+        }
+        Map<String, Readiness> result = new HashMap<>();
+        incoming.forEach((nodeId, total) -> result.put(nodeId, new Readiness(total)));
+        return result;
+    }
+
+    private static boolean isLoopBack(ExecutionPlan plan, String sourceId, String targetId, String port) {
+        CompiledNode source = plan.nodesById().get(sourceId);
+        return source != null && source.componentContract().componentType() == ComponentType.LOOP
+                && "END".equals(text(source.node().config().get("role")))
+                && "NEXT".equals(port) && targetId.equals(plan.loopPairs().get(sourceId));
+    }
+
+    private static String text(Object value) {
+        return value instanceof String text && !text.isBlank() ? text.strip() : null;
+    }
+
+    private boolean cancelAndAwait(Map<Future<NodeCompletion>, AdmissionLease> running,
+            CleanupBudget budget, boolean awaitSourceCleanup) throws InterruptedException {
+        running.forEach(DagScheduler::cancelRunningTask);
+        boolean cleaned = true;
+        boolean interrupted = false;
+        try {
+            for (AdmissionLease lease : List.copyOf(running.values())) {
+                AwaitOutcome task = awaitCleanupSignal(lease, budget, false);
+                cleaned &= task.completed();
+                interrupted |= task.interrupted();
+                if (awaitSourceCleanup || lease.structuredCleanupRequired()) {
+                    AwaitOutcome source = awaitCleanupSignal(lease, budget, true);
+                    cleaned &= source.completed();
+                    interrupted |= source.interrupted();
+                }
+            }
+        } finally {
+            running.clear();
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        return cleaned;
+    }
+
+    private AwaitOutcome awaitCleanupSignal(
+            AdmissionLease lease, CleanupBudget budget, boolean sourceSignal) {
+        boolean interrupted = false;
+        while (budget.remainingNanos() > 0) {
+            try {
+                boolean completed = sourceSignal
+                        ? lease.awaitSourceCleanup(budget.remainingNanos())
+                        : lease.awaitTaskCompletion(budget.remainingNanos());
+                return new AwaitOutcome(completed, interrupted);
+            } catch (InterruptedException ignored) {
+                interrupted = true;
+                // Cancellation interrupts cleanup workers too; keep draining until the bounded deadline.
+            }
+        }
+        return new AwaitOutcome(false, interrupted);
+    }
+
     private static void validateExecutionBoundary(ExecutionPlan plan, ExecutionRequest request) {
         if (request.mode() != ExecutionMode.EPHEMERAL) {
             throw new NodeExecutionException("EXECUTION_MODE_UNSUPPORTED",
-                    "Task 5 only supports EPHEMERAL execution");
+                    "flow runtime only supports EPHEMERAL execution");
         }
         if (!plan.flowIdentity().tenantId().equals(request.tenantId())) {
             throw new NodeExecutionException("EXECUTION_TENANT_MISMATCH",
@@ -586,6 +1149,16 @@ public final class DagScheduler implements AutoCloseable {
             return Math.max(0, clock.instant().until(deadline, ChronoUnit.NANOS));
         } catch (ArithmeticException exception) {
             return Long.MAX_VALUE;
+        }
+    }
+
+    private void logStructuredCleanupTimeout(String executionId, ScopePath scopePath) {
+        try {
+            executionLogger.error("structured source cleanup timed out", null, Map.of(
+                    "executionId", executionId,
+                    "scopePath", scopePath.value()));
+        } catch (RuntimeException ignored) {
+            // Cleanup observation must not replace the already selected execution outcome.
         }
     }
 
@@ -629,6 +1202,8 @@ public final class DagScheduler implements AutoCloseable {
         }
         registrations.forEach(ExecutionRegistration::cancelFromClose);
         virtualThreads.shutdownNow();
+        CleanupBudget closeBudget = CleanupBudget.standard();
+        registrations.forEach(registration -> registration.awaitCloseCompletion(closeBudget));
     }
 
     /**
@@ -668,29 +1243,49 @@ public final class DagScheduler implements AutoCloseable {
             this.controllerFuture = Objects.requireNonNull(future, "controller future must not be null");
         }
 
-        private void cancelFromClose() {
-            ExecutionResult selectedResult;
+        private boolean cancelFromClose() {
             Future<?> future;
             CancellationHandle.Reason reason;
             synchronized (terminalMonitor) {
                 if (winningResult != null) {
-                    return;
+                    return false;
                 }
                 boolean closeWon = selectReasonLocked(CancellationHandle.Reason.USER);
                 reason = cancellation.reason();
                 if (!closeWon && reason != CancellationHandle.Reason.USER) {
-                    return;
+                    return false;
                 }
-                winningResult = cancelledResult();
-                selectedResult = winningResult;
                 future = controllerFuture;
             }
             lifecycleObserver.afterCloseReasonSelection(reason);
             if (future != null) {
                 future.cancel(true);
             }
-            finishBeforeStart();
-            completeSelectedResult(selectedResult);
+            if (finishBeforeStart()) {
+                ExecutionResult selectedResult;
+                synchronized (terminalMonitor) {
+                    if (winningResult == null) {
+                        winningResult = cancelledResult();
+                    }
+                    selectedResult = winningResult;
+                }
+                completeSelectedResult(selectedResult);
+            }
+            return true;
+        }
+
+        private void awaitCloseCompletion(CleanupBudget closeBudget) {
+            long remainingNanos = closeBudget.remainingNanos();
+            if (remainingNanos <= 0) {
+                return;
+            }
+            try {
+                completion.get(remainingNanos, TimeUnit.NANOSECONDS);
+            } catch (InterruptedException failure) {
+                Thread.currentThread().interrupt();
+            } catch (ExecutionException | TimeoutException ignored) {
+                // close is bounded; the execution handle retains the eventual cleanup result.
+            }
         }
 
         private boolean selectReason(CancellationHandle.Reason requestedReason) {
@@ -760,10 +1355,12 @@ public final class DagScheduler implements AutoCloseable {
             }
         }
 
-        private void finishBeforeStart() {
+        private boolean finishBeforeStart() {
             if (state.compareAndSet(SUBMITTED, FINISHED)) {
                 release();
+                return true;
             }
+            return false;
         }
 
         private void finish() {
@@ -791,6 +1388,7 @@ public final class DagScheduler implements AutoCloseable {
         private final int totalIncoming;
         private int resolvedIncoming;
         private int activeIncoming;
+        private final List<ScopePath> activeScopes = new ArrayList<>();
         private NodeState state = NodeState.PENDING;
 
         private Readiness(int totalIncoming) {
@@ -798,18 +1396,69 @@ public final class DagScheduler implements AutoCloseable {
         }
     }
 
-    private record Decision(String nodeId, Set<String> activatedPorts) {
+    private record ReadyNode(String nodeId, ScopePath scopePath) {
     }
 
-    private record NodeCompletion(String nodeId, NodeResult result, Throwable failure) {
+    private record Decision(String nodeId, Set<String> activatedPorts, ScopePath scopePath) {
+    }
 
-        private static NodeCompletion success(String nodeId, NodeResult result) {
-            return new NodeCompletion(nodeId, result, null);
+    private record RegionOutcome(NodeResult.TerminalOutcome terminalOutcome, boolean boundaryReached) {
+    }
+
+    private record NodeCompletion(String nodeId, ScopePath scopePath, NodeResult result, Throwable failure) {
+
+        private static NodeCompletion success(String nodeId, ScopePath scopePath, NodeResult result) {
+            return new NodeCompletion(nodeId, scopePath, result, null);
         }
 
-        private static NodeCompletion failure(String nodeId, Throwable failure) {
-            return new NodeCompletion(nodeId, null, failure);
+        private static NodeCompletion failure(String nodeId, ScopePath scopePath, Throwable failure) {
+            return new NodeCompletion(nodeId, scopePath, null, failure);
         }
+    }
+
+    private record LockAddress(String flowId, String acquireNodeId, ScopePath scopePath) {
+    }
+
+    /** Scheduler-private structural state; leases never enter business ctx or public results. */
+    private static final class StructuralState {
+
+        private final ConcurrentHashMap<LockAddress, HeldLease> heldLeases = new ConcurrentHashMap<>();
+
+        private void register(LockAddress address, LockNodeExecutor executor, LockLease lease) {
+            HeldLease held = new HeldLease(executor, lease);
+            if (heldLeases.putIfAbsent(address, held) != null) {
+                executor.cleanup(lease);
+                throw new NodeExecutionException("LOCK_ALREADY_HELD", "paired LOCK is already held in this scope");
+            }
+        }
+
+        private void release(LockAddress address) {
+            HeldLease held = heldLeases.remove(address);
+            if (held == null) {
+                throw new NodeExecutionException("LOCK_LEASE_MISSING", "paired LOCK lease is not held");
+            }
+            held.executor().release(held.lease());
+        }
+
+        private List<LockAddress> cleanupAll() {
+            List<LockAddress> failures = new ArrayList<>();
+            List<Map.Entry<LockAddress, HeldLease>> remaining = new ArrayList<>(heldLeases.entrySet());
+            remaining.sort(java.util.Comparator
+                    .comparing((Map.Entry<LockAddress, HeldLease> entry) -> entry.getKey().flowId())
+                    .thenComparing(entry -> entry.getKey().acquireNodeId())
+                    .thenComparing(entry -> entry.getKey().scopePath().value()));
+            for (Map.Entry<LockAddress, HeldLease> entry : remaining) {
+                if (heldLeases.remove(entry.getKey(), entry.getValue())) {
+                    if (!entry.getValue().executor().cleanup(entry.getValue().lease())) {
+                        failures.add(entry.getKey());
+                    }
+                }
+            }
+            return List.copyOf(failures);
+        }
+    }
+
+    private record HeldLease(LockNodeExecutor executor, LockLease lease) {
     }
 
     /** One engine-owned future bridges arbitrary CompletionStage implementations exactly once. */
@@ -859,14 +1508,20 @@ public final class DagScheduler implements AutoCloseable {
     private static final class AdmissionLease {
 
         private final Semaphore admission;
+        private final boolean structuredCleanupRequired;
         private boolean started;
         private boolean deferred;
         private boolean sourceDone;
         private boolean taskDone;
         private boolean released;
+        private final java.util.concurrent.CountDownLatch taskSignal =
+                new java.util.concurrent.CountDownLatch(1);
+        private final java.util.concurrent.CountDownLatch sourceSignal =
+                new java.util.concurrent.CountDownLatch(1);
 
-        private AdmissionLease(Semaphore admission) {
+        private AdmissionLease(Semaphore admission, boolean structuredCleanupRequired) {
             this.admission = admission;
+            this.structuredCleanupRequired = structuredCleanupRequired;
         }
 
         private synchronized void started() {
@@ -880,12 +1535,24 @@ public final class DagScheduler implements AutoCloseable {
             if (!started && !released) {
                 released = true;
                 admission.release();
+                taskSignal.countDown();
+                sourceSignal.countDown();
             }
         }
 
         private synchronized void releaseAfterRun() {
             taskDone = true;
+            taskSignal.countDown();
             releaseIfFinished();
+        }
+
+        private synchronized void releaseForStructuredWait() {
+            if (!started || deferred || taskDone || released) {
+                throw new IllegalStateException("structured node admission cannot be released in this state");
+            }
+            released = true;
+            admission.release();
+            sourceSignal.countDown();
         }
 
         private synchronized void deferToSource() {
@@ -907,7 +1574,23 @@ public final class DagScheduler implements AutoCloseable {
             if (!released && taskDone && (!deferred || sourceDone)) {
                 released = true;
                 admission.release();
+                sourceSignal.countDown();
             }
         }
+
+        private boolean awaitTaskCompletion(long remainingNanos) throws InterruptedException {
+            return remainingNanos > 0 && taskSignal.await(remainingNanos, TimeUnit.NANOSECONDS);
+        }
+
+        private boolean awaitSourceCleanup(long remainingNanos) throws InterruptedException {
+            return remainingNanos > 0 && sourceSignal.await(remainingNanos, TimeUnit.NANOSECONDS);
+        }
+
+        private boolean structuredCleanupRequired() {
+            return structuredCleanupRequired;
+        }
+    }
+
+    private record AwaitOutcome(boolean completed, boolean interrupted) {
     }
 }

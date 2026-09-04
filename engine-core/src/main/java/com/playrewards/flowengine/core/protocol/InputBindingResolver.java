@@ -112,7 +112,7 @@ public final class InputBindingResolver {
         if (source == null) {
             throw new NodeExecutionException("NODE_SOURCE_NOT_FOUND", "source node not found: " + sourceNodeId);
         }
-        return context.lookup(source.node().nodeCode(), scopePath, outputKey);
+        return context.lookupVisible(source.node().nodeCode(), scopePath, outputKey);
     }
 
     @FunctionalInterface

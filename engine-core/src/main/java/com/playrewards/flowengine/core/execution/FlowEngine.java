@@ -3,7 +3,10 @@ package com.playrewards.flowengine.core.execution;
 import com.playrewards.flowengine.contract.execution.ExecutionRequest;
 import com.playrewards.flowengine.core.compile.ExecutionPlan;
 import com.playrewards.flowengine.core.node.NodeExecutorRegistry;
+import com.playrewards.flowengine.core.component.FlowBusinessComponentRegistry;
+import com.playrewards.flowengine.spi.DistributedLockProvider;
 import com.playrewards.flowengine.spi.ExecutionLogger;
+import com.playrewards.flowengine.spi.ScriptRuntime;
 import java.time.Clock;
 import java.util.Objects;
 
@@ -57,6 +60,20 @@ public final class FlowEngine implements AutoCloseable {
                 Objects.requireNonNull(governor, "governor must not be null"),
                 Objects.requireNonNull(clock, "clock must not be null"),
                 Objects.requireNonNull(executionLogger, "executionLogger must not be null"));
+    }
+
+    /**
+     * Creates a complete Task 7 embedded runtime from technology-neutral host adapters.
+     *
+     * @param scripts bounded sandbox runtime
+     * @param businessComponents immutable business component registry
+     * @param locks distributed lease provider with fencing support
+     * @param clock shared execution and lease clock
+     */
+    public FlowEngine(ScriptRuntime scripts, FlowBusinessComponentRegistry businessComponents,
+            DistributedLockProvider locks, Clock clock) {
+        this(NodeExecutorRegistry.runtimeBuiltIns(scripts, businessComponents, locks, clock),
+                PROCESS_GOVERNOR, clock);
     }
 
     /**

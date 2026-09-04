@@ -34,4 +34,30 @@ public record ScopePath(String value) {
         }
         return new ScopePath(value + "/" + normalized);
     }
+
+    /** @return true when this path is equal to or below the supplied ancestor */
+    public boolean isWithin(ScopePath ancestor) {
+        Objects.requireNonNull(ancestor, "scope ancestor must not be null");
+        return value.equals(ancestor.value) || value.startsWith(ancestor.value + "/");
+    }
+
+    /** Finds the deepest stable ancestor shared with another active scope. */
+    public ScopePath commonAncestor(ScopePath other) {
+        Objects.requireNonNull(other, "other scope path must not be null");
+        String[] left = value.split("/");
+        String[] right = other.value.split("/");
+        int shared = 0;
+        while (shared < left.length && shared < right.length && left[shared].equals(right[shared])) {
+            shared++;
+        }
+        if (shared == 0) {
+            throw new IllegalArgumentException("scope paths do not share a root");
+        }
+        if (shared > 1 && (left[shared - 1].startsWith("parallel:")
+                || left[shared - 1].startsWith("loop:")
+                || left[shared - 1].startsWith("subflow:"))) {
+            shared--;
+        }
+        return new ScopePath(String.join("/", java.util.Arrays.copyOf(left, shared)));
+    }
 }

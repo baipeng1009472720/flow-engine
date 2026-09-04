@@ -20,6 +20,7 @@ public final class ExecutionContext {
 
     private final Map<String, Map<String, Object>> externalScopes;
     private final ConcurrentHashMap<OutputAddress, StoredValue> outputs = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, ChildExecution> childExecutions = new ConcurrentHashMap<>();
 
     /**
      * Creates an isolated execution context.
@@ -65,6 +66,40 @@ public final class ExecutionContext {
     public ContextValue lookup(String nodeCode, ScopePath scopePath, String outputKey) {
         StoredValue value = outputs.get(address(nodeCode, scopePath, outputKey));
         return value == null ? ContextValue.missing() : ContextValue.present(value.value());
+    }
+
+    /**
+     * Resolves an exact value, the closest ancestor frame, or one unique descendant branch value.
+     * Ambiguous descendants at a natural join fail closed instead of depending on completion order.
+     */
+    public ContextValue lookupVisible(String nodeCode, ScopePath scopePath, String outputKey) {
+        String normalizedNode = JsonValues.requireText(nodeCode, "node code");
+        String normalizedOutput = JsonValues.requireText(outputKey, "output key");
+        Objects.requireNonNull(scopePath, "scope path must not be null");
+        List<Map.Entry<OutputAddress, StoredValue>> ancestors = outputs.entrySet().stream()
+                .filter(entry -> entry.getKey().nodeCode().equals(normalizedNode)
+                        && entry.getKey().outputKey().equals(normalizedOutput)
+                        && scopePath.isWithin(entry.getKey().scopePath()))
+                .sorted(Comparator.comparingInt((Map.Entry<OutputAddress, StoredValue> entry) ->
+                        entry.getKey().scopePath().value().length()).reversed())
+                .toList();
+        if (!ancestors.isEmpty()) {
+            return ContextValue.present(ancestors.getFirst().getValue().value());
+        }
+        List<Map.Entry<OutputAddress, StoredValue>> descendants = outputs.entrySet().stream()
+                .filter(entry -> entry.getKey().nodeCode().equals(normalizedNode)
+                        && entry.getKey().outputKey().equals(normalizedOutput)
+                        && entry.getKey().scopePath().isWithin(scopePath))
+                .sorted(Comparator.comparing(entry -> entry.getKey().scopePath().value()))
+                .toList();
+        if (descendants.isEmpty()) {
+            return ContextValue.missing();
+        }
+        if (descendants.size() != 1) {
+            throw new IllegalArgumentException("node output is ambiguous across structured scopes: "
+                    + normalizedNode + "." + normalizedOutput);
+        }
+        return ContextValue.present(descendants.getFirst().getValue().value());
     }
 
     /**
@@ -123,19 +158,42 @@ public final class ExecutionContext {
         Objects.requireNonNull(scopePath, "scope path must not be null");
         Objects.requireNonNull(visibleNodeCodes, "visible node codes must not be null");
         Map<String, Map<String, Object>> grouped = new TreeMap<>();
-        outputs.entrySet().stream()
-                .filter(entry -> entry.getKey().scopePath().equals(scopePath)
-                        && visibleNodeCodes.contains(entry.getKey().nodeCode()))
-                .sorted(Comparator.comparing((Map.Entry<OutputAddress, StoredValue> entry) ->
-                                entry.getKey().nodeCode())
-                        .thenComparing(entry -> entry.getKey().outputKey()))
-                .forEach(entry -> grouped.computeIfAbsent(
-                                entry.getKey().nodeCode(), ignored -> new TreeMap<>())
-                        .put(entry.getKey().outputKey(), entry.getValue().value()));
+        outputs.keySet().stream()
+                .filter(address -> visibleNodeCodes.contains(address.nodeCode()))
+                .map(address -> Map.entry(address.nodeCode(), address.outputKey()))
+                .distinct()
+                .sorted(Map.Entry.<String, String>comparingByKey().thenComparing(Map.Entry::getValue))
+                .forEach(address -> {
+                    try {
+                        ContextValue visible = lookupVisible(address.getKey(), scopePath, address.getValue());
+                        if (visible.present()) {
+                            grouped.computeIfAbsent(address.getKey(), ignored -> new TreeMap<>())
+                                    .put(address.getValue(), visible.value());
+                        }
+                    } catch (IllegalArgumentException ignored) {
+                        // Multiple completed loop frames are intentionally not projected into a parent ctx view.
+                    }
+                });
         Map<String, Map<String, Object>> snapshot = new java.util.LinkedHashMap<>();
         grouped.forEach((nodeCode, values) -> snapshot.put(
                 nodeCode, JsonValues.copyObject(values, "ctx." + nodeCode)));
         return java.util.Collections.unmodifiableMap(snapshot);
+    }
+
+    /** Records one independently owned child-flow context outside the business ctx namespace. */
+    public void registerChildExecution(String childExecutionId, ScopePath scopePath, ExecutionContext context) {
+        String normalized = JsonValues.requireText(childExecutionId, "child execution id");
+        ChildExecution child = new ChildExecution(normalized,
+                Objects.requireNonNull(scopePath, "child scope must not be null"),
+                Objects.requireNonNull(context, "child context must not be null"));
+        if (childExecutions.putIfAbsent(normalized, child) != null) {
+            throw new IllegalStateException("child execution id may only be registered once");
+        }
+    }
+
+    /** @return immutable stable child-flow diagnostic index */
+    public Map<String, ChildExecution> childExecutions() {
+        return java.util.Collections.unmodifiableMap(new TreeMap<>(childExecutions));
     }
 
     private static OutputAddress address(String nodeCode, ScopePath scopePath, String outputKey) {
@@ -160,5 +218,9 @@ public final class ExecutionContext {
     }
 
     private record StoredValue(Object value) {
+    }
+
+    /** Independently owned child-flow context and its stable scope identity. */
+    public record ChildExecution(String childExecutionId, ScopePath scopePath, ExecutionContext context) {
     }
 }
