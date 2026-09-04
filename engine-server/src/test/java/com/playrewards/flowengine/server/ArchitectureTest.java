@@ -3,6 +3,8 @@ package com.playrewards.flowengine.server;
 import com.playrewards.flowengine.core.fixture.ProhibitedSpringDependency;
 import com.playrewards.flowengine.core.fixture.ProhibitedJavaSqlDependency;
 import com.playrewards.flowengine.core.fixture.ProhibitedJdkHttpServerDependency;
+import com.playrewards.flowengine.core.fixture.ProhibitedMySqlDependency;
+import com.playrewards.flowengine.core.fixture.ProhibitedPlayRewardsDomainDependency;
 import com.playrewards.flowengine.contract.fixture.ProhibitedContractToCoreDependency;
 import com.playrewards.flowengine.adapters.fixture.ProhibitedAdapterToCoreDependency;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
@@ -57,6 +59,18 @@ final class ArchitectureTest {
     }
 
     @Test
+    void framework_independence_rule_rejects_mysql_driver_dependency_in_protected_package() {
+        assertThrows(AssertionError.class, () -> frameworkIndependenceRule()
+                .check(new ClassFileImporter().importClasses(ProhibitedMySqlDependency.class)));
+    }
+
+    @Test
+    void framework_independence_rule_rejects_playrewards_domain_dependency_in_protected_package() {
+        assertThrows(AssertionError.class, () -> frameworkIndependenceRule()
+                .check(new ClassFileImporter().importClasses(ProhibitedPlayRewardsDomainDependency.class)));
+    }
+
+    @Test
     void module_layer_rules_reject_forbidden_dependencies() {
         ClassFileImporter importer = new ClassFileImporter();
         assertThrows(AssertionError.class, () -> contractAndSpiRule()
@@ -71,7 +85,7 @@ final class ArchitectureTest {
                 .should().dependOnClassesThat()
                 .resideInAnyPackage("org.springframework..", "com.playrewards.domain..",
                         "com.playrewards.application..", "com.baomidou.mybatisplus..", "java.sql..",
-                        "javax.sql..", "com.sun.net.httpserver..");
+                        "javax.sql..", "com.mysql..", "com.sun.net.httpserver..");
     }
 
     private static ArchRule contractAndSpiRule() {
