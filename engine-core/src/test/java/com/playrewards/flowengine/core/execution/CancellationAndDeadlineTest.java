@@ -21,6 +21,7 @@ import com.playrewards.flowengine.contract.flow.FlowEdge;
 import com.playrewards.flowengine.contract.flow.FlowNode;
 import com.playrewards.flowengine.core.compile.ExecutionPlan;
 import com.playrewards.flowengine.core.node.NodeExecutionContext;
+import com.playrewards.flowengine.core.node.NodeExecutionException;
 import com.playrewards.flowengine.core.node.NodeExecutor;
 import com.playrewards.flowengine.core.node.NodeExecutorRegistry;
 import com.playrewards.flowengine.core.node.NodeInvocation;
@@ -31,6 +32,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
@@ -42,6 +44,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 /** Verifies cooperative stop propagation and hierarchical-permit cleanup. */
@@ -133,14 +136,100 @@ class CancellationAndDeadlineTest {
 
     @Test
     void schedule_after_close_returns_a_completed_rejection_without_consuming_admission() throws Exception {
-        DagScheduler scheduler = new DagScheduler(
+        DagScheduler closedScheduler = new DagScheduler(
                 NodeExecutorRegistry.builtIns(), ConcurrencyGovernor.defaults(), Clock.systemUTC());
-        scheduler.close();
+        DagScheduler survivor = new DagScheduler(
+                NodeExecutorRegistry.builtIns(), ConcurrencyGovernor.defaults(), Clock.systemUTC());
+        ExecutionPlan plan = successfulPlan();
+        closedScheduler.close();
+        try {
+            for (int index = 0; index < 1100; index++) {
+                ExecutionResult rejected = await(closedScheduler.schedule(plan, request(Map.of())));
+                assertEquals(ExecutionStatus.FAILED, rejected.status());
+                assertEquals("EXECUTION_SCHEDULER_CLOSED", rejected.errorCode());
+            }
 
-        ExecutionResult rejected = await(scheduler.schedule(closeAwarePlan(), request(Map.of())));
+            ExecutionResult accepted = await(survivor.schedule(plan, request(Map.of())));
 
-        assertEquals(ExecutionStatus.FAILED, rejected.status());
-        assertEquals("EXECUTION_SCHEDULER_CLOSED", rejected.errorCode());
+            assertEquals(ExecutionStatus.SUCCEEDED, accepted.status());
+        } finally {
+            survivor.close();
+        }
+    }
+
+    @Test
+    void close_preserves_a_terminal_end_that_won_before_result_publication() throws Exception {
+        BlockingPublicationObserver observer = new BlockingPublicationObserver(
+                CancellationHandle.Reason.TERMINAL);
+        DagScheduler scheduler = observedScheduler(NodeExecutorRegistry.builtIns(), Clock.systemUTC(), observer);
+        try {
+            ExecutionHandle handle = scheduler.schedule(successfulPlan(), request(Map.of()));
+            assertTrue(observer.entered.await(2, TimeUnit.SECONDS));
+
+            scheduler.close();
+            observer.release.countDown();
+
+            assertEquals(ExecutionStatus.SUCCEEDED, await(handle).status());
+        } finally {
+            observer.release.countDown();
+            scheduler.close();
+        }
+    }
+
+    @Test
+    void close_preserves_a_node_failure_that_won_before_result_publication() throws Exception {
+        BlockingPublicationObserver observer = new BlockingPublicationObserver(
+                CancellationHandle.Reason.FAILURE);
+        NodeExecutor failing = new NodeExecutor() {
+            @Override
+            public ComponentType supports() {
+                return ComponentType.SCRIPT;
+            }
+
+            @Override
+            public NodeInvocation execute(NodeExecutionContext context) {
+                throw new NodeExecutionException("EXPECTED_NODE_FAILURE", "expected safe failure");
+            }
+        };
+        DagScheduler scheduler = observedScheduler(
+                NodeExecutorRegistry.withBuiltIns(List.of(failing)), Clock.systemUTC(), observer);
+        try {
+            ExecutionHandle handle = scheduler.schedule(blockingPlan(), request(Map.of()));
+            assertTrue(observer.entered.await(2, TimeUnit.SECONDS));
+
+            scheduler.close();
+            observer.release.countDown();
+
+            ExecutionResult result = await(handle);
+            assertEquals(ExecutionStatus.FAILED, result.status());
+            assertEquals("EXPECTED_NODE_FAILURE", result.errorCode());
+        } finally {
+            observer.release.countDown();
+            scheduler.close();
+        }
+    }
+
+    @Test
+    void close_preserves_a_deadline_that_won_before_result_publication() throws Exception {
+        Instant deadline = Instant.parse("2026-09-04T00:00:00Z");
+        Clock afterDeadline = Clock.fixed(deadline.plusMillis(1), ZoneOffset.UTC);
+        BlockingPublicationObserver observer = new BlockingPublicationObserver(
+                CancellationHandle.Reason.DEADLINE);
+        DagScheduler scheduler = observedScheduler(NodeExecutorRegistry.builtIns(), afterDeadline, observer);
+        try {
+            ExecutionHandle handle = scheduler.schedule(successfulPlan(), request(Map.of(), deadline));
+            assertTrue(observer.entered.await(2, TimeUnit.SECONDS));
+
+            scheduler.close();
+            observer.release.countDown();
+
+            ExecutionResult result = await(handle);
+            assertEquals(ExecutionStatus.FAILED, result.status());
+            assertEquals("EXECUTION_DEADLINE_EXCEEDED", result.errorCode());
+        } finally {
+            observer.release.countDown();
+            scheduler.close();
+        }
     }
 
     @Test
@@ -174,6 +263,25 @@ class CancellationAndDeadlineTest {
             if (result.status() == ExecutionStatus.FAILED) {
                 assertEquals("EXECUTION_SCHEDULER_CLOSED", result.errorCode());
             }
+        }
+    }
+
+    @Test
+    void user_cancelled_pre_start_execution_is_completed_and_releases_admission_on_close() throws Exception {
+        BlockingControllerStartObserver observer = new BlockingControllerStartObserver();
+        DagScheduler scheduler = observedScheduler(NodeExecutorRegistry.builtIns(), Clock.systemUTC(), observer);
+        try {
+            ExecutionHandle handle = scheduler.schedule(successfulPlan(), request(Map.of()));
+            assertTrue(observer.controllerSubmitted.await(2, TimeUnit.SECONDS));
+            assertTrue(handle.cancel());
+
+            scheduler.close();
+
+            assertEquals(ExecutionStatus.CANCELLED, await(handle).status());
+            assertTrue(observer.executionAdmissionReleased.await(2, TimeUnit.SECONDS));
+        } finally {
+            observer.allowControllerStart.countDown();
+            scheduler.close();
         }
     }
 
@@ -695,6 +803,21 @@ class CancellationAndDeadlineTest {
         return twoInvocationPlan("close", "test.close-aware");
     }
 
+    private static ExecutionPlan successfulPlan() {
+        FlowNode start = node("successful-start", "builtin.start", "successfulStart", Map.of());
+        FlowNode end = node("successful-end", "builtin.end", "successfulEnd",
+                Map.of("resultStatus", "SUCCESS"));
+        return compile(List.of(start, end),
+                List.of(edge("successful-edge", start.id(), end.id(), "NEXT", "IN")), Map.of(
+                        "builtin.start", contract("builtin.start", ComponentType.START, Map.of(), Map.of()),
+                        "builtin.end", contract("builtin.end", ComponentType.END, Map.of(), Map.of())));
+    }
+
+    private static DagScheduler observedScheduler(NodeExecutorRegistry registry, Clock clock,
+            ExecutionLifecycleObserver observer) {
+        return new DagScheduler(registry, ConcurrencyGovernor.defaults(), clock, 8, 8, observer);
+    }
+
     private static ExecutionPlan twoInvocationPlan(String suffix, String componentCode) {
         FlowNode start = node("start-" + suffix, "builtin.start", "start" + suffix, Map.of());
         FlowNode work = node("work-" + suffix, componentCode, "work" + suffix, Map.of());
@@ -950,6 +1073,66 @@ class CancellationAndDeadlineTest {
             entered.incrementAndGet();
             expectedEntries.countDown();
             return new NodeInvocation(new CompletableFuture<>(), ComponentInvocation.emptyContent());
+        }
+    }
+
+    private static final class BlockingPublicationObserver implements ExecutionLifecycleObserver {
+
+        private final CancellationHandle.Reason expectedReason;
+        private final CountDownLatch entered = new CountDownLatch(1);
+        private final CountDownLatch release = new CountDownLatch(1);
+        private final AtomicReference<CancellationHandle.Reason> actualReason = new AtomicReference<>();
+
+        private BlockingPublicationObserver(CancellationHandle.Reason expectedReason) {
+            this.expectedReason = expectedReason;
+        }
+
+        @Override
+        public void beforeResultPublication(CancellationHandle.Reason reason) {
+            actualReason.set(reason);
+            entered.countDown();
+            boolean interrupted = false;
+            while (true) {
+                try {
+                    release.await();
+                    break;
+                } catch (InterruptedException exception) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            assertEquals(expectedReason, actualReason.get());
+        }
+    }
+
+    private static final class BlockingControllerStartObserver implements ExecutionLifecycleObserver {
+
+        private final CountDownLatch controllerSubmitted = new CountDownLatch(1);
+        private final CountDownLatch allowControllerStart = new CountDownLatch(1);
+        private final CountDownLatch executionAdmissionReleased = new CountDownLatch(1);
+
+        @Override
+        public void beforeControllerStart() {
+            controllerSubmitted.countDown();
+            boolean interrupted = false;
+            while (true) {
+                try {
+                    allowControllerStart.await();
+                    break;
+                } catch (InterruptedException exception) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        @Override
+        public void afterExecutionAdmissionReleased() {
+            executionAdmissionReleased.countDown();
         }
     }
 

@@ -72,6 +72,7 @@ public final class DagScheduler implements AutoCloseable {
     private final Clock clock;
     private final Semaphore nodeTaskAdmission;
     private final Semaphore executionAdmission;
+    private final ExecutionLifecycleObserver lifecycleObserver;
     private final ExecutorService virtualThreads = Executors.newVirtualThreadPerTaskExecutor();
     private final Object lifecycleMonitor = new Object();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -86,7 +87,8 @@ public final class DagScheduler implements AutoCloseable {
      * @param clock deadline and result timestamp source
      */
     public DagScheduler(NodeExecutorRegistry executors, ConcurrencyGovernor governor, Clock clock) {
-        this(executors, governor, clock, PROCESS_NODE_TASK_ADMISSION, PROCESS_EXECUTION_ADMISSION);
+        this(executors, governor, clock, PROCESS_NODE_TASK_ADMISSION, PROCESS_EXECUTION_ADMISSION,
+                ExecutionLifecycleObserver.NOOP);
     }
 
     /**
@@ -122,17 +124,39 @@ public final class DagScheduler implements AutoCloseable {
             int maxInFlightNodeTasks, int maxInFlightExecutions) {
         this(executors, governor, clock,
                 new Semaphore(positive(maxInFlightNodeTasks, "maxInFlightNodeTasks"), true),
-                new Semaphore(positive(maxInFlightExecutions, "maxInFlightExecutions"), true));
+                new Semaphore(positive(maxInFlightExecutions, "maxInFlightExecutions"), true),
+                ExecutionLifecycleObserver.NOOP);
     }
 
     private DagScheduler(NodeExecutorRegistry executors, ConcurrencyGovernor governor, Clock clock,
-            Semaphore nodeTaskAdmission, Semaphore executionAdmission) {
+            Semaphore nodeTaskAdmission, Semaphore executionAdmission,
+            ExecutionLifecycleObserver lifecycleObserver) {
         this.executors = Objects.requireNonNull(executors, "executors must not be null");
         this.governor = Objects.requireNonNull(governor, "governor must not be null");
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
         this.nodeTaskAdmission = Objects.requireNonNull(nodeTaskAdmission, "nodeTaskAdmission must not be null");
         this.executionAdmission = Objects.requireNonNull(
                 executionAdmission, "executionAdmission must not be null");
+        this.lifecycleObserver = Objects.requireNonNull(lifecycleObserver, "lifecycleObserver must not be null");
+    }
+
+    /**
+     * Creates an isolated scheduler with a package-local lifecycle observation seam.
+     *
+     * @param executors startup executor registry
+     * @param governor hierarchical concurrency gate
+     * @param clock deadline and result timestamp source
+     * @param maxInFlightNodeTasks isolated submitted/running node-task bound
+     * @param maxInFlightExecutions isolated controller bound
+     * @param lifecycleObserver read-only pre-publication observer used by deterministic lifecycle tests
+     */
+    DagScheduler(NodeExecutorRegistry executors, ConcurrencyGovernor governor, Clock clock,
+            int maxInFlightNodeTasks, int maxInFlightExecutions,
+            ExecutionLifecycleObserver lifecycleObserver) {
+        this(executors, governor, clock,
+                new Semaphore(positive(maxInFlightNodeTasks, "maxInFlightNodeTasks"), true),
+                new Semaphore(positive(maxInFlightExecutions, "maxInFlightExecutions"), true),
+                lifecycleObserver);
     }
 
     private static int positive(int value, String name) {
@@ -185,14 +209,18 @@ public final class DagScheduler implements AutoCloseable {
             activeExecutions.put(cancellation, registration);
             try {
                 Future<?> controllerFuture = virtualThreads.submit(() -> {
+                    lifecycleObserver.beforeControllerStart();
                     if (!registration.start()) {
                         return;
                     }
                     controller.set(Thread.currentThread());
                     try {
-                        completion.complete(run(executionId, plan, request, context, cancellation, runningNodes));
+                        ExecutionResult executionResult =
+                                run(executionId, plan, request, context, cancellation, runningNodes);
+                        lifecycleObserver.beforeResultPublication(cancellation.reason());
+                        registration.publish(executionResult);
                     } catch (Throwable failure) {
-                        completion.completeExceptionally(failure);
+                        registration.publishExceptionally(failure);
                     } finally {
                         controllerRegistration.close();
                         controller.set(null);
@@ -206,7 +234,7 @@ public final class DagScheduler implements AutoCloseable {
                 controllerRegistration.close();
                 cancellation.cancelForFailure();
                 registration.finishBeforeStart();
-                completion.complete(result(executionId, ExecutionStatus.FAILED, null,
+                registration.publish(result(executionId, ExecutionStatus.FAILED, null,
                         "EXECUTION_SCHEDULING_REJECTED", "execution scheduling was rejected", scheduledAt));
             } catch (RuntimeException failure) {
                 controllerRegistration.close();
@@ -637,6 +665,7 @@ public final class DagScheduler implements AutoCloseable {
         private final CancellationHandle cancellation;
         private final CompletableFuture<ExecutionResult> completion;
         private final AtomicInteger state = new AtomicInteger(SUBMITTED);
+        private final AtomicBoolean resultPublished = new AtomicBoolean();
         private volatile Future<?> controllerFuture;
 
         private ExecutionRegistration(String executionId, Instant scheduledAt,
@@ -656,14 +685,30 @@ public final class DagScheduler implements AutoCloseable {
         }
 
         private void cancelFromClose() {
-            cancellation.cancel();
+            boolean closeWon = cancellation.cancel();
+            CancellationHandle.Reason reason = cancellation.reason();
+            if (!closeWon && reason != CancellationHandle.Reason.USER) {
+                return;
+            }
             Future<?> future = controllerFuture;
             if (future != null) {
                 future.cancel(true);
             }
             finishBeforeStart();
-            completion.complete(result(executionId, ExecutionStatus.CANCELLED, null,
+            publish(result(executionId, ExecutionStatus.CANCELLED, null,
                     "EXECUTION_CANCELLED", "execution was cancelled", scheduledAt));
+        }
+
+        private void publish(ExecutionResult result) {
+            if (resultPublished.compareAndSet(false, true)) {
+                completion.complete(result);
+            }
+        }
+
+        private void publishExceptionally(Throwable failure) {
+            if (resultPublished.compareAndSet(false, true)) {
+                completion.completeExceptionally(failure);
+            }
         }
 
         private void finishBeforeStart() {
@@ -681,6 +726,7 @@ public final class DagScheduler implements AutoCloseable {
         private void release() {
             activeExecutions.remove(cancellation, this);
             executionAdmission.release();
+            lifecycleObserver.afterExecutionAdmissionReleased();
         }
     }
 
