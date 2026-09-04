@@ -1,11 +1,11 @@
 package com.playrewards.flowengine.core.execution;
 
 import com.playrewards.flowengine.spi.CancellationToken;
+import com.playrewards.flowengine.spi.HttpNodeClient;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.ConcurrentHashMap;
-import com.playrewards.flowengine.spi.HttpNodeClient;
 
 /** Thread-safe cancellation source exposed as the narrower SPI token to running nodes. */
 public final class CancellationHandle implements CancellationToken {
@@ -53,7 +53,7 @@ public final class CancellationHandle implements CancellationToken {
         java.util.Objects.requireNonNull(identity, "side effect identity must not be null");
         return new HttpNodeClient.SendObserver() {
             @Override
-            public void sent() {
+            public void possiblySent() {
                 unresolvedSideEffects.put(identity, Boolean.TRUE);
             }
 

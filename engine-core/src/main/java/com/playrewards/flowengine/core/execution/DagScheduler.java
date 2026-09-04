@@ -519,9 +519,10 @@ public final class DagScheduler implements AutoCloseable {
                 if (!cancelAndAwait(regionRunning, CleanupBudget.standard(), true)) {
                     logStructuredCleanupTimeout(executionId, seedScope);
                 }
-                throw new NodeExecutionException("HTTP_SIDE_EFFECT_UNCERTAIN",
-                        "HTTP side effect may have been sent; manual confirmation is required",
-                        ExecutionStatus.WAITING_MANUAL);
+                if (cancellation.hasUnresolvedSideEffect()) {
+                    throw uncertainHttpSideEffect();
+                }
+                throw failure;
             }
             if (isRootRegion(seedScope, boundaryNodeId, subFlowDepth)) {
                 lifecycleObserver.beforeControllerReasonSelection(CancellationHandle.Reason.DEADLINE);
@@ -533,24 +534,40 @@ public final class DagScheduler implements AutoCloseable {
             }
             throw failure;
         } catch (CancellationException failure) {
+            boolean possiblySent = cancellation.hasUnresolvedSideEffect();
             cancellation.requestStopWithoutReason();
             Thread.interrupted();
             if (!cancelAndAwait(regionRunning, CleanupBudget.standard(),
-                    cancellation.reason() == CancellationHandle.Reason.DEADLINE
+                    possiblySent || cancellation.reason() == CancellationHandle.Reason.DEADLINE
                             || requiresRegionSourceCleanup(seedScope, boundaryNodeId, subFlowDepth))) {
                 logStructuredCleanupTimeout(executionId, seedScope);
+            }
+            if (cancellation.hasUnresolvedSideEffect()) {
+                Thread.interrupted();
+                throw uncertainHttpSideEffect();
             }
             throw failure;
         } catch (InterruptedException failure) {
+            boolean possiblySent = cancellation.hasUnresolvedSideEffect();
             Thread.interrupted();
             cancellation.requestStopWithoutReason();
             if (!cancelAndAwait(regionRunning, CleanupBudget.standard(),
-                    cancellation.reason() == CancellationHandle.Reason.DEADLINE
+                    possiblySent || cancellation.reason() == CancellationHandle.Reason.DEADLINE
                             || requiresRegionSourceCleanup(seedScope, boundaryNodeId, subFlowDepth))) {
                 logStructuredCleanupTimeout(executionId, seedScope);
             }
+            if (cancellation.hasUnresolvedSideEffect()) {
+                Thread.interrupted();
+                throw uncertainHttpSideEffect();
+            }
             throw failure;
         }
+    }
+
+    private static NodeExecutionException uncertainHttpSideEffect() {
+        return new NodeExecutionException("HTTP_SIDE_EFFECT_UNCERTAIN",
+                "HTTP side effect may have been sent; manual confirmation is required",
+                ExecutionStatus.WAITING_MANUAL);
     }
 
     private static boolean isRootRegion(ScopePath scopePath, String boundaryNodeId, int subFlowDepth) {
@@ -1365,6 +1382,11 @@ public final class DagScheduler implements AutoCloseable {
         }
 
         private ExecutionResult normalizeForWinningReason(ExecutionResult candidate) {
+            // An unprotected request that may have crossed the socket boundary is a safer public
+            // outcome than USER/DEADLINE cancellation, but is selected only after source cleanup.
+            if (candidate.status() == ExecutionStatus.WAITING_MANUAL) {
+                return candidate;
+            }
             return switch (cancellation.reason()) {
                 case USER -> cancelledResult();
                 case DEADLINE -> result(executionId, ExecutionStatus.FAILED, null,

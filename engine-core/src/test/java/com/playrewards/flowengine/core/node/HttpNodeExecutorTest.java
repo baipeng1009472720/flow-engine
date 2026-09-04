@@ -142,6 +142,24 @@ class HttpNodeExecutorTest {
     }
 
     @Test
+    void rejects_opaque_missing_authority_userinfo_and_fragment_before_query_assembly() throws Exception {
+        for (String target : List.of(
+                "https:opaque",
+                "https:///missing-authority",
+                "https://user@example.com/path",
+                "https://example.com/path#fragment")) {
+            RecordingClient client = new RecordingClient();
+
+            ExecutionResult result = execute("GET", objectScript(Map.of("key", "value")), client,
+                    ComponentEffect.PURE, false, target, Map.of(), 0, 1_000, 1_024);
+
+            assertEquals(ExecutionStatus.FAILED, result.status(), target);
+            assertEquals("HTTP_CONFIG_URL_INVALID", result.errorCode(), target);
+            assertTrue(client.requests.isEmpty(), target);
+        }
+    }
+
+    @Test
     void validates_declared_result_and_does_not_publish_when_output_is_undeclared() throws Exception {
         RecordingClient valid = new RecordingClient();
         valid.responses.add(response(200, "{\"accepted\":true}"));
@@ -185,6 +203,15 @@ class HttpNodeExecutorTest {
         assertEquals(ExecutionStatus.FAILED, invalidResult.status());
         assertEquals("HTTP_RESPONSE_JSON_INVALID", invalidResult.errorCode());
         assertEquals(1, invalid.requests.size());
+
+        RecordingClient completedSideEffect = new RecordingClient();
+        completedSideEffect.responses.add(response(200, "not-json"));
+        ExecutionResult completedButInvalid = execute("POST", objectScript(Map.of()), completedSideEffect,
+                ComponentEffect.SIDE_EFFECT, OBJECT, "https://public.example/path", Map.of(), 3,
+                1_000, 1_024, Duration.ofSeconds(3));
+        assertEquals(ExecutionStatus.FAILED, completedButInvalid.status());
+        assertEquals("HTTP_RESPONSE_JSON_INVALID", completedButInvalid.errorCode());
+        assertEquals(1, completedSideEffect.requests.size());
 
         RecordingClient required = new RecordingClient();
         ExecutionResult requiredResult = execute("GET", objectScript(Map.of()), required,
@@ -268,6 +295,28 @@ class HttpNodeExecutorTest {
     }
 
     @Test
+    void any_transport_failure_after_an_unprotected_possible_send_requires_manual_confirmation()
+            throws Exception {
+        RecordingClient client = new RecordingClient() {
+            @Override
+            public CompletionStage<HttpResponse> execute(HttpRequest request) {
+                requests.add(request);
+                request.sendObserver().possiblySent();
+                return CompletableFuture.failedFuture(new HttpClientException(
+                        FailureKind.INVALID_RESPONSE, "HTTP response was invalid"));
+            }
+        };
+
+        ExecutionResult result = execute("POST", objectScript(Map.of("operation", "charge")), client,
+                ComponentEffect.SIDE_EFFECT, false, "https://public.example/path",
+                Map.of(), 2, 1_000, 1_024);
+
+        assertEquals(ExecutionStatus.WAITING_MANUAL, result.status());
+        assertEquals("HTTP_SIDE_EFFECT_UNCERTAIN", result.errorCode());
+        assertEquals(1, client.requests.size());
+    }
+
+    @Test
     void stable_node_key_isolated_by_tenant_request_flow_node_and_scope() {
         IdempotencyCoordinator coordinator = new IdempotencyCoordinator();
         String base = coordinator.nodeKey("tenant-a", "request-a", "v1", "node-a", ScopePath.root());
@@ -287,7 +336,7 @@ class HttpNodeExecutorTest {
             @Override
             public CompletionStage<HttpResponse> execute(HttpRequest request) {
                 requests.add(request);
-                request.sendObserver().sent();
+                request.sendObserver().possiblySent();
                 return new CompletableFuture<>();
             }
         };
@@ -353,7 +402,7 @@ class HttpNodeExecutorTest {
             @Override
             public CompletionStage<HttpResponse> execute(HttpRequest request) {
                 requests.add(request);
-                request.sendObserver().sent();
+                request.sendObserver().possiblySent();
                 afterSendClock.set(deadline.plusMillis(1));
                 return new CompletableFuture<>();
             }
@@ -470,14 +519,14 @@ class HttpNodeExecutorTest {
                 FailureKind kind = failures.get(attempt).kind();
                 if (kind == FailureKind.TIMEOUT_AFTER_SEND
                         || kind == FailureKind.CONNECTION_LOST_AFTER_SEND) {
-                    request.sendObserver().sent();
+                    request.sendObserver().possiblySent();
                 } else {
                     request.sendObserver().resolved();
                 }
                 return CompletableFuture.failedFuture(failures.get(attempt));
             }
             int responseIndex = attempt - failures.size();
-            request.sendObserver().sent();
+            request.sendObserver().possiblySent();
             request.sendObserver().resolved();
             if (responseIndex >= responses.size()) {
                 return CompletableFuture.completedFuture(response(204, ""));

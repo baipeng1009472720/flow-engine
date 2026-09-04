@@ -1,42 +1,72 @@
 package com.playrewards.flowengine.adapter.http;
 
 import com.playrewards.flowengine.contract.execution.ExecutionPurpose;
+import com.playrewards.flowengine.spi.CancellationToken;
 import com.playrewards.flowengine.spi.HttpTargetPolicy;
 import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.URI;
 import java.net.UnknownHostException;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Public-Internet-only HTTP target policy with all-answer DNS validation.
  *
- * <p>Every resolution answer must be globally routable. The transport invokes this policy both
- * before sending and after receiving headers, so a changed mixed/private answer fails closed.</p>
+ * <p>Every resolution answer must be globally routable. One approval returns immutable concrete
+ * addresses which the transport pins for the lifetime of that request; redirects are disabled.</p>
  */
 public final class DefaultHttpTargetPolicy implements HttpTargetPolicy {
 
+    private static final int MAX_RESOLUTIONS = 64;
+    private static final long DNS_POLL_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
+    private static final Semaphore DNS_ADMISSION = new Semaphore(MAX_RESOLUTIONS, true);
+    private static final ExecutorService DNS_TASKS = Executors.newThreadPerTaskExecutor(
+            Thread.ofVirtual().name("flow-http-dns-", 0).factory());
+
     private final AddressResolver resolver;
+    private final java.util.function.Predicate<InetAddress> publicAddress;
 
     /** Creates the production policy using the host JVM resolver. */
     public DefaultHttpTargetPolicy() {
-        this(host -> List.of(InetAddress.getAllByName(host)));
+        this(host -> List.of(InetAddress.getAllByName(host)), DefaultHttpTargetPolicy::isPublic);
     }
 
     /** Package-local deterministic DNS seam used by rebinding and mixed-answer tests. */
     DefaultHttpTargetPolicy(AddressResolver resolver) {
+        this(resolver, DefaultHttpTargetPolicy::isPublic);
+    }
+
+    /** Package-local seam for proving address pinning with isolated loopback fixtures. */
+    DefaultHttpTargetPolicy(AddressResolver resolver,
+            java.util.function.Predicate<InetAddress> publicAddress) {
         this.resolver = Objects.requireNonNull(resolver, "resolver must not be null");
+        this.publicAddress = Objects.requireNonNull(publicAddress, "publicAddress must not be null");
     }
 
     /** Validates URI syntax, resolves every address and rejects the whole target if any answer is unsafe. */
     @Override
-    public void validate(URI uri, ExecutionPurpose purpose) {
+    public ApprovedTarget approve(URI uri, ExecutionPurpose purpose,
+            CancellationToken cancellation, Instant deadline) {
         Objects.requireNonNull(uri, "HTTP target URI must not be null");
         Objects.requireNonNull(purpose, "execution purpose must not be null");
+        Objects.requireNonNull(cancellation, "cancellation must not be null");
+        Objects.requireNonNull(deadline, "deadline must not be null");
         String scheme = uri.getScheme();
         if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))
                 || uri.getRawUserInfo() != null || uri.getRawFragment() != null
@@ -51,14 +81,84 @@ public final class DefaultHttpTargetPolicy implements HttpTargetPolicy {
         if (host.endsWith(".") || host.indexOf('%') >= 0 || !isCanonicalHost(host)) {
             throw rejected(null);
         }
-        List<InetAddress> addresses;
-        try {
-            addresses = List.copyOf(resolver.resolve(host));
-        } catch (UnknownHostException | RuntimeException failure) {
-            throw rejected(failure);
-        }
-        if (addresses.isEmpty() || addresses.stream().anyMatch(address -> !isPublic(address))) {
+        List<InetAddress> addresses = resolve(host, cancellation, deadline);
+        if (addresses.isEmpty() || addresses.stream().anyMatch(address -> !publicAddress.test(address))) {
             throw rejected(null);
+        }
+        int port = uri.getPort() > 0 ? uri.getPort() : scheme.equalsIgnoreCase("https") ? 443 : 80;
+        return new ApprovedTarget(uri, addresses, port);
+    }
+
+    private List<InetAddress> resolve(String host, CancellationToken cancellation, Instant deadline) {
+        acquireDnsAdmission(cancellation, deadline);
+        ResolutionOperation operation = new ResolutionOperation();
+        try {
+            DNS_TASKS.submit(() -> {
+                operation.started(Thread.currentThread());
+                List<InetAddress> resolved = null;
+                Throwable resolverFailure = null;
+                try {
+                    resolved = List.copyOf(resolver.resolve(host));
+                } catch (Throwable failure) {
+                    resolverFailure = failure;
+                } finally {
+                    operation.finished();
+                    DNS_ADMISSION.release();
+                }
+                if (resolverFailure == null) {
+                    operation.completion.complete(resolved);
+                } else {
+                    operation.completion.completeExceptionally(resolverFailure);
+                }
+            });
+        } catch (RuntimeException failure) {
+            DNS_ADMISSION.release();
+            throw new TargetRejectedException(TargetFailureKind.CAPACITY,
+                    "HTTP target approval capacity unavailable", failure);
+        }
+        try (CancellationToken.CancellationRegistration ignored =
+                cancellation.onCancellation(operation::interrupt)) {
+            while (true) {
+                cancellation.throwIfCancellationRequested();
+                long remaining = remainingNanos(deadline);
+                if (remaining <= 0) {
+                    operation.interrupt();
+                    throw new TargetRejectedException(TargetFailureKind.TIMEOUT,
+                            "HTTP target approval timed out", null);
+                }
+                try {
+                    return operation.completion.get(Math.min(DNS_POLL_NANOS, remaining),
+                            TimeUnit.NANOSECONDS);
+                } catch (TimeoutException ignoredTimeout) {
+                    // The exact remaining deadline, not the poll interval, decides expiry.
+                } catch (InterruptedException failure) {
+                    operation.interrupt();
+                    Thread.currentThread().interrupt();
+                    throw new CancellationException("HTTP target approval was cancelled");
+                } catch (ExecutionException failure) {
+                    throw rejected(failure.getCause());
+                }
+            }
+        }
+    }
+
+    private static void acquireDnsAdmission(CancellationToken cancellation, Instant deadline) {
+        cancellation.throwIfCancellationRequested();
+        if (remainingNanos(deadline) <= 0) {
+            throw new TargetRejectedException(TargetFailureKind.TIMEOUT,
+                    "HTTP target approval timed out", null);
+        }
+        if (!DNS_ADMISSION.tryAcquire()) {
+            throw new TargetRejectedException(TargetFailureKind.CAPACITY,
+                    "HTTP target approval capacity unavailable", null);
+        }
+    }
+
+    private static long remainingNanos(Instant deadline) {
+        try {
+            return Math.max(0, Duration.between(Instant.now(), deadline).toNanos());
+        } catch (ArithmeticException failure) {
+            return deadline.isAfter(Instant.now()) ? Long.MAX_VALUE : 0;
         }
     }
 
@@ -100,10 +200,12 @@ public final class DefaultHttpTargetPolicy implements HttpTargetPolicy {
         }
         int first = bytes[0] & 0xff;
         int second = bytes[1] & 0xff;
-        if ((first & 0xfe) == 0xfc || first == 0xff
-                || first == 0xfe && (second & 0xc0) == 0x80
+        if ((first & 0xe0) != 0x20
+                || first == 0x20 && second == 0x01 && (bytes[2] & 0xfe) == 0
                 || first == 0x20 && second == 0x01
-                && (bytes[2] & 0xff) == 0x0d && (bytes[3] & 0xff) == 0xb8) {
+                && (bytes[2] & 0xff) == 0x0d && (bytes[3] & 0xff) == 0xb8
+                || first == 0x20 && second == 0x02
+                || first == 0x3f && second == 0xff && (bytes[2] & 0xf0) == 0) {
             return false;
         }
         if (isIpv4MappedOrCompatible(bytes)) {
@@ -151,5 +253,31 @@ public final class DefaultHttpTargetPolicy implements HttpTargetPolicy {
     @FunctionalInterface
     interface AddressResolver {
         List<InetAddress> resolve(String host) throws UnknownHostException;
+    }
+
+    private static final class ResolutionOperation {
+
+        private final CompletableFuture<List<InetAddress>> completion = new CompletableFuture<>();
+        private final AtomicReference<Thread> worker = new AtomicReference<>();
+        private final AtomicBoolean stopRequested = new AtomicBoolean();
+
+        private void started(Thread running) {
+            worker.set(running);
+            if (stopRequested.get()) {
+                running.interrupt();
+            }
+        }
+
+        private void interrupt() {
+            stopRequested.set(true);
+            Thread running = worker.get();
+            if (running != null) {
+                running.interrupt();
+            }
+        }
+
+        private void finished() {
+            worker.set(null);
+        }
     }
 }

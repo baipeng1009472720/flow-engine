@@ -83,15 +83,16 @@ public interface HttpNodeClient {
     /**
      * One-way lifecycle signal for an unprotected side effect.
      *
-     * <p>Adapters call {@link #sent()} only after a transport source exists, and call
-     * {@link #resolved()} after a definitive response or deterministic pre-send outcome. An
-     * unresolved sent marker lets the scheduler arbitrate an execution deadline safely.</p>
+     * <p>Adapters call {@link #possiblySent()} immediately before bytes may be written to an
+     * approved socket, and call {@link #resolved()} after a definitive response or deterministic
+     * pre-send outcome. The unresolved marker is deliberately conservative: it means the peer may
+     * have observed any prefix, not that the full request definitely arrived.</p>
      */
     interface SendObserver {
 
         SendObserver NOOP = new SendObserver() {
             @Override
-            public void sent() {
+            public void possiblySent() {
             }
 
             @Override
@@ -104,8 +105,8 @@ public interface HttpNodeClient {
             }
         };
 
-        /** Marks that the external peer may observe the request. */
-        void sent();
+        /** Marks that the external peer may observe any prefix of the request. */
+        void possiblySent();
 
         /** Clears the marker after a definitive outcome. */
         void resolved();

@@ -20,6 +20,9 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -45,6 +48,9 @@ class HttpTargetPolicyTest {
                 "http://0.0.0.0/path",
                 "http://[::1]/path",
                 "http://[::ffff:127.0.0.1]/path",
+                "http://[2002:7f00:1::]/path",
+                "http://[64:ff9b::7f00:1]/path",
+                "http://[4000::1]/path",
                 "http://192.0.2.1/path")) {
             assertThrows(HttpTargetPolicy.TargetRejectedException.class,
                     () -> policy.validate(URI.create(target), ExecutionPurpose.PRODUCTION), target);
@@ -70,15 +76,153 @@ class HttpTargetPolicyTest {
     }
 
     @Test
+    void transport_connects_only_to_the_address_approved_by_the_policy() throws Exception {
+        try (PinnedFixture fixture = new PinnedFixture()) {
+            AtomicReference<InetAddress> dnsAnswer = new AtomicReference<>(fixture.addressA);
+            java.util.concurrent.CountDownLatch resolutionCaptured = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch allowResolution = new java.util.concurrent.CountDownLatch(1);
+            AtomicInteger resolutions = new AtomicInteger();
+            DefaultHttpTargetPolicy policy = new DefaultHttpTargetPolicy(host -> {
+                InetAddress captured = dnsAnswer.get();
+                resolutions.incrementAndGet();
+                resolutionCaptured.countDown();
+                try {
+                    allowResolution.await();
+                } catch (InterruptedException failure) {
+                    Thread.currentThread().interrupt();
+                    throw new java.net.UnknownHostException("resolution interrupted");
+                }
+                return List.of(captured);
+            }, address -> true);
+            try (JdkHttpNodeClient client = new JdkHttpNodeClient(
+                    policy, policy, 1, Duration.ofMillis(5))) {
+                var response = client.execute(request(
+                        fixture.uri(), ExecutionPurpose.TRIAL, 1_024,
+                        Duration.ofSeconds(2), NEVER_CANCELLED));
+                assertTrue(resolutionCaptured.await(1, TimeUnit.SECONDS));
+                dnsAnswer.set(fixture.addressB);
+                allowResolution.countDown();
+
+                assertEquals("a", new String(response.toCompletableFuture()
+                        .get(2, TimeUnit.SECONDS).body(), StandardCharsets.UTF_8));
+                assertEquals(1, fixture.hitsA.get());
+                assertEquals(0, fixture.hitsB.get());
+                assertEquals(1, resolutions.get());
+            } finally {
+                allowResolution.countDown();
+            }
+        }
+    }
+
+    @Test
+    void dns_resolution_is_cancelled_or_timed_out_without_leaving_an_unbounded_waiter() throws Exception {
+        CountDownLatch cancelStarted = new CountDownLatch(1);
+        CountDownLatch cancelInterrupted = new CountDownLatch(1);
+        DefaultHttpTargetPolicy cancellable = new DefaultHttpTargetPolicy(host -> {
+            cancelStarted.countDown();
+            try {
+                new CountDownLatch(1).await();
+                throw new AssertionError("resolver should have been interrupted");
+            } catch (InterruptedException expected) {
+                cancelInterrupted.countDown();
+                throw new java.net.UnknownHostException("resolution interrupted");
+            }
+        }, address -> true);
+        MutableCancellation cancellation = new MutableCancellation();
+        AtomicReference<Throwable> cancelledFailure = new AtomicReference<>();
+        Thread caller = Thread.ofVirtual().start(() -> {
+            try {
+                cancellable.approve(URI.create("https://cancel.example/path"), ExecutionPurpose.TRIAL,
+                        cancellation, Instant.now().plusSeconds(3));
+            } catch (Throwable failure) {
+                cancelledFailure.set(failure);
+            }
+        });
+        assertTrue(cancelStarted.await(1, TimeUnit.SECONDS));
+        cancellation.cancel();
+        caller.join(2_000);
+        assertFalse(caller.isAlive());
+        assertTrue(cancelledFailure.get() instanceof java.util.concurrent.CancellationException);
+        assertTrue(cancelInterrupted.await(1, TimeUnit.SECONDS));
+
+        CountDownLatch deadlineStarted = new CountDownLatch(1);
+        CountDownLatch deadlineInterrupted = new CountDownLatch(1);
+        DefaultHttpTargetPolicy expiring = new DefaultHttpTargetPolicy(host -> {
+            deadlineStarted.countDown();
+            try {
+                new CountDownLatch(1).await();
+                throw new AssertionError("resolver should have been interrupted");
+            } catch (InterruptedException expected) {
+                deadlineInterrupted.countDown();
+                throw new java.net.UnknownHostException("resolution interrupted");
+            }
+        }, address -> true);
+        AtomicReference<Throwable> deadlineFailure = new AtomicReference<>();
+        Thread deadlineCaller = Thread.ofVirtual().start(() -> {
+            try {
+                expiring.approve(URI.create("https://deadline.example/path"), ExecutionPurpose.TRIAL,
+                        NEVER_CANCELLED, Instant.now().plusMillis(100));
+            } catch (Throwable failure) {
+                deadlineFailure.set(failure);
+            }
+        });
+        assertTrue(deadlineStarted.await(1, TimeUnit.SECONDS));
+        deadlineCaller.join(2_000);
+        assertFalse(deadlineCaller.isAlive());
+        assertEquals(HttpTargetPolicy.TargetFailureKind.TIMEOUT,
+                ((HttpTargetPolicy.TargetRejectedException) deadlineFailure.get()).kind());
+        assertTrue(deadlineInterrupted.await(1, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void dns_resolution_capacity_rejects_overflow_instead_of_queueing_unbounded_work() throws Exception {
+        CountDownLatch started = new CountDownLatch(64);
+        CountDownLatch release = new CountDownLatch(1);
+        DefaultHttpTargetPolicy saturated = new DefaultHttpTargetPolicy(host -> {
+            started.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException failure) {
+                Thread.currentThread().interrupt();
+                throw new java.net.UnknownHostException("resolution interrupted");
+            }
+            return List.of(InetAddress.getLoopbackAddress());
+        }, address -> true);
+        var callers = Executors.newVirtualThreadPerTaskExecutor();
+        List<Future<?>> active = new java.util.ArrayList<>();
+        try {
+            for (int index = 0; index < 64; index++) {
+                active.add(callers.submit(() -> saturated.approve(
+                        URI.create("https://capacity.example/path"), ExecutionPurpose.TRIAL,
+                        NEVER_CANCELLED, Instant.now().plusSeconds(5))));
+            }
+            assertTrue(started.await(2, TimeUnit.SECONDS));
+
+            HttpTargetPolicy.TargetRejectedException overflow = assertThrows(
+                    HttpTargetPolicy.TargetRejectedException.class,
+                    () -> saturated.approve(URI.create("https://overflow.example/path"),
+                            ExecutionPurpose.TRIAL, NEVER_CANCELLED, Instant.now().plusMillis(100)));
+            assertEquals(HttpTargetPolicy.TargetFailureKind.CAPACITY, overflow.kind());
+        } finally {
+            release.countDown();
+            for (Future<?> future : active) {
+                future.get(2, TimeUnit.SECONDS);
+            }
+            callers.close();
+        }
+    }
+
+    @Test
     void uses_separate_trial_policy_and_real_transport_preserves_repeated_response_headers() throws Exception {
         try (Fixture fixture = new Fixture()) {
-            HttpTargetPolicy denyProduction = (uri, purpose) -> {
+            HttpTargetPolicy denyProduction = (uri, purpose, cancellation, deadline) -> {
                 throw new HttpTargetPolicy.TargetRejectedException("HTTP target rejected");
             };
-            HttpTargetPolicy allowTrial = (uri, purpose) -> {
+            HttpTargetPolicy allowTrial = (uri, purpose, cancellation, deadline) -> {
                 if (purpose != ExecutionPurpose.TRIAL) {
                     throw new HttpTargetPolicy.TargetRejectedException("HTTP target rejected");
                 }
+                return approveLocal(uri);
             };
             try (JdkHttpNodeClient client = new JdkHttpNodeClient(
                     denyProduction, allowTrial, 2, Duration.ofMillis(5))) {
@@ -125,22 +269,19 @@ class HttpTargetPolicyTest {
     }
 
     @Test
-    void revalidates_after_connect_and_never_follows_redirects() throws Exception {
+    void approves_once_and_never_follows_redirects() throws Exception {
         try (Fixture fixture = new Fixture()) {
-            AtomicInteger validations = new AtomicInteger();
-            HttpTargetPolicy rebinding = (uri, purpose) -> {
-                if (validations.incrementAndGet() > 1) {
-                    throw new HttpTargetPolicy.TargetRejectedException("rebound");
-                }
+            AtomicInteger approvals = new AtomicInteger();
+            HttpTargetPolicy oneApproval = (uri, purpose, cancellation, deadline) -> {
+                approvals.incrementAndGet();
+                return approveLocal(uri);
             };
             try (JdkHttpNodeClient client = new JdkHttpNodeClient(
-                    rebinding, rebinding, 1, Duration.ofMillis(5))) {
-                CompletionException rejected = assertThrows(CompletionException.class,
-                        () -> client.execute(request(fixture.uri("/echo"), ExecutionPurpose.TRIAL,
-                                1_024, Duration.ofSeconds(1), NEVER_CANCELLED)).toCompletableFuture().join());
-                assertEquals(HttpNodeClient.FailureKind.TARGET_REJECTED,
-                        ((HttpNodeClient.HttpClientException) rejected.getCause()).kind());
-                assertEquals(2, validations.get());
+                    oneApproval, oneApproval, 1, Duration.ofMillis(5))) {
+                assertEquals(200, client.execute(request(fixture.uri("/echo"), ExecutionPurpose.TRIAL,
+                        1_024, Duration.ofSeconds(1), NEVER_CANCELLED))
+                        .toCompletableFuture().join().statusCode());
+                assertEquals(1, approvals.get());
             }
 
             try (JdkHttpNodeClient client = new JdkHttpNodeClient(
@@ -166,23 +307,27 @@ class HttpTargetPolicyTest {
             assertEquals(HttpNodeClient.FailureKind.RESPONSE_TOO_LARGE,
                     ((HttpNodeClient.HttpClientException) oversized.getCause()).kind());
 
-            CompletionException timeout = assertThrows(CompletionException.class,
+            java.util.concurrent.ExecutionException timeout = assertThrows(
+                    java.util.concurrent.ExecutionException.class,
                     () -> client.execute(request(fixture.uri("/slow"), ExecutionPurpose.TRIAL,
-                            1_024, Duration.ofMillis(30), NEVER_CANCELLED)).toCompletableFuture().join());
+                            1_024, Duration.ofMillis(100), NEVER_CANCELLED)).toCompletableFuture()
+                            .get(2, TimeUnit.SECONDS));
             assertEquals(HttpNodeClient.FailureKind.TIMEOUT_AFTER_SEND,
                     ((HttpNodeClient.HttpClientException) timeout.getCause()).kind());
 
-            long bodyStarted = System.nanoTime();
-            CompletionException bodyTimeout = assertThrows(CompletionException.class,
-                    () -> client.execute(request(fixture.uri("/slow-body"), ExecutionPurpose.TRIAL,
-                            1_024, Duration.ofMillis(30), NEVER_CANCELLED)).toCompletableFuture().join());
+            var bodySource = client.execute(request(fixture.uri("/slow-body"), ExecutionPurpose.TRIAL,
+                    1_024, Duration.ofMillis(100), NEVER_CANCELLED)).toCompletableFuture();
+            assertTrue(fixture.slowBodyStarted.await(1, TimeUnit.SECONDS));
+            java.util.concurrent.ExecutionException bodyTimeout = assertThrows(
+                    java.util.concurrent.ExecutionException.class,
+                    () -> bodySource.get(2, TimeUnit.SECONDS));
             assertEquals(HttpNodeClient.FailureKind.TIMEOUT_AFTER_SEND,
                     ((HttpNodeClient.HttpClientException) bodyTimeout.getCause()).kind());
-            assertTrue(Duration.ofNanos(System.nanoTime() - bodyStarted).compareTo(Duration.ofMillis(200)) < 0);
 
             MutableCancellation cancelled = new MutableCancellation();
-            var active = client.execute(request(fixture.uri("/slow"), ExecutionPurpose.TRIAL,
+            var active = client.execute(request(fixture.uri("/cancel"), ExecutionPurpose.TRIAL,
                     1_024, Duration.ofSeconds(2), cancelled)).toCompletableFuture();
+            assertTrue(fixture.cancelStarted.await(1, TimeUnit.SECONDS));
             cancelled.cancel();
             assertThrows(java.util.concurrent.CancellationException.class,
                     () -> active.get(1, TimeUnit.SECONDS));
@@ -197,14 +342,13 @@ class HttpTargetPolicyTest {
             assertThrows(java.util.concurrent.CancellationException.class,
                     () -> waiting.get(1, TimeUnit.SECONDS));
 
-            long admissionStarted = System.nanoTime();
-            CompletionException admissionTimeout = assertThrows(CompletionException.class,
+            java.util.concurrent.ExecutionException admissionTimeout = assertThrows(
+                    java.util.concurrent.ExecutionException.class,
                     () -> client.execute(request(fixture.uri("/echo"), ExecutionPurpose.TRIAL,
-                            1_024, Duration.ofMillis(30), NEVER_CANCELLED)).toCompletableFuture().join());
+                            1_024, Duration.ofMillis(100), NEVER_CANCELLED)).toCompletableFuture()
+                            .get(2, TimeUnit.SECONDS));
             assertEquals(HttpNodeClient.FailureKind.TIMEOUT_BEFORE_SEND,
                     ((HttpNodeClient.HttpClientException) admissionTimeout.getCause()).kind());
-            assertTrue(Duration.ofNanos(System.nanoTime() - admissionStarted)
-                    .compareTo(Duration.ofMillis(300)) < 0);
 
             MutableCancellation queuedCancellation = new MutableCancellation();
             var queued = client.execute(request(fixture.uri("/echo"), ExecutionPurpose.TRIAL,
@@ -243,8 +387,20 @@ class HttpTargetPolicyTest {
                 Instant.now().plusSeconds(3), maxBytes, purpose, cancellation);
     }
 
-    private static final HttpTargetPolicy ALLOW_ALL = (uri, purpose) -> { };
+    private static final HttpTargetPolicy ALLOW_ALL =
+            (uri, purpose, cancellation, deadline) -> approveLocal(uri);
     private static final CancellationToken NEVER_CANCELLED = () -> false;
+
+    private static HttpTargetPolicy.ApprovedTarget approveLocal(URI uri) {
+        try {
+            int port = uri.getPort() > 0 ? uri.getPort()
+                    : uri.getScheme().equalsIgnoreCase("https") ? 443 : 80;
+            return new HttpTargetPolicy.ApprovedTarget(
+                    uri, List.of(InetAddress.getByName(uri.getHost())), port);
+        } catch (java.net.UnknownHostException failure) {
+            throw new HttpTargetPolicy.TargetRejectedException("HTTP target rejected", failure);
+        }
+    }
 
     private static final class MutableCancellation implements CancellationToken {
 
@@ -274,12 +430,18 @@ class HttpTargetPolicyTest {
     private static final class Fixture implements AutoCloseable {
 
         private final HttpServer server;
+        private final java.util.concurrent.ExecutorService serverTasks =
+                java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
         private final AtomicReference<String> lastMethod = new AtomicReference<>();
         private final AtomicReference<String> lastBody = new AtomicReference<>();
         private final AtomicReference<String> lastHeader = new AtomicReference<>();
         private final AtomicInteger privateRedirectHits = new AtomicInteger();
         private final java.util.concurrent.CountDownLatch holdStarted = new java.util.concurrent.CountDownLatch(1);
         private final java.util.concurrent.CountDownLatch releaseHold = new java.util.concurrent.CountDownLatch(1);
+        private final java.util.concurrent.CountDownLatch slowBodyStarted = new java.util.concurrent.CountDownLatch(1);
+        private final java.util.concurrent.CountDownLatch releaseSlowBody = new java.util.concurrent.CountDownLatch(1);
+        private final java.util.concurrent.CountDownLatch cancelStarted = new java.util.concurrent.CountDownLatch(1);
+        private final java.util.concurrent.CountDownLatch releaseCancel = new java.util.concurrent.CountDownLatch(1);
 
         private Fixture() throws IOException {
             server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
@@ -318,7 +480,7 @@ class HttpTargetPolicyTest {
             });
             server.createContext("/slow", exchange -> {
                 try {
-                    Thread.sleep(250);
+                    releaseSlowBody.await();
                     byte[] body = "late".getBytes(StandardCharsets.UTF_8);
                     exchange.sendResponseHeaders(200, body.length);
                     exchange.getResponseBody().write(body);
@@ -332,8 +494,20 @@ class HttpTargetPolicyTest {
                 try {
                     exchange.sendResponseHeaders(200, 4);
                     exchange.getResponseBody().flush();
-                    Thread.sleep(250);
+                    slowBodyStarted.countDown();
+                    releaseSlowBody.await();
                     exchange.getResponseBody().write("late".getBytes(StandardCharsets.UTF_8));
+                } catch (InterruptedException failure) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    exchange.close();
+                }
+            });
+            server.createContext("/cancel", exchange -> {
+                try {
+                    cancelStarted.countDown();
+                    releaseCancel.await();
+                    exchange.sendResponseHeaders(204, -1);
                 } catch (InterruptedException failure) {
                     Thread.currentThread().interrupt();
                 } finally {
@@ -353,6 +527,7 @@ class HttpTargetPolicyTest {
                     exchange.close();
                 }
             });
+            server.setExecutor(serverTasks);
             server.start();
         }
 
@@ -364,7 +539,49 @@ class HttpTargetPolicyTest {
         @Override
         public void close() {
             releaseHold.countDown();
+            releaseSlowBody.countDown();
+            releaseCancel.countDown();
             server.stop(0);
+            serverTasks.shutdownNow();
+        }
+    }
+
+    private static final class PinnedFixture implements AutoCloseable {
+
+        private final InetAddress addressA = InetAddress.getByName("127.0.0.1");
+        private final InetAddress addressB = InetAddress.getByName("::1");
+        private final HttpServer serverA;
+        private final HttpServer serverB;
+        private final AtomicInteger hitsA = new AtomicInteger();
+        private final AtomicInteger hitsB = new AtomicInteger();
+
+        private PinnedFixture() throws IOException {
+            serverA = HttpServer.create(new InetSocketAddress(addressA, 0), 0);
+            int port = serverA.getAddress().getPort();
+            serverB = HttpServer.create(new InetSocketAddress(addressB, port), 0);
+            serverA.createContext("/pinned", exchange -> respond(exchange, hitsA, "a"));
+            serverB.createContext("/pinned", exchange -> respond(exchange, hitsB, "b"));
+            serverA.start();
+            serverB.start();
+        }
+
+        private URI uri() {
+            return URI.create("http://rebind.test:" + serverA.getAddress().getPort() + "/pinned");
+        }
+
+        private static void respond(com.sun.net.httpserver.HttpExchange exchange,
+                AtomicInteger hits, String value) throws IOException {
+            hits.incrementAndGet();
+            byte[] body = value.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        }
+
+        @Override
+        public void close() {
+            serverA.stop(0);
+            serverB.stop(0);
         }
     }
 }

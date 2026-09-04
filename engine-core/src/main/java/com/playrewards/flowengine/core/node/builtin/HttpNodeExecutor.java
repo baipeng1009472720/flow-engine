@@ -131,7 +131,7 @@ public final class HttpNodeExecutor implements NodeExecutor {
                 response = awaitHttp(client.execute(request), context, sendObserver);
                 sendObserver.resolved();
             } catch (HttpClientException failure) {
-                if (isUnprotectedUncertain(config.method(), protectedSideEffect, failure.kind())) {
+                if (isUnprotectedUncertain(config.method(), protectedSideEffect, sendObserver)) {
                     throw new NodeExecutionException("HTTP_SIDE_EFFECT_UNCERTAIN",
                             "HTTP side effect may have been sent; manual confirmation is required",
                             ExecutionStatus.WAITING_MANUAL);
@@ -189,7 +189,9 @@ public final class HttpNodeExecutor implements NodeExecutor {
         } catch (URISyntaxException failure) {
             uri = null;
         }
-        if (uri == null || !uri.isAbsolute()) {
+        if (uri == null || !uri.isAbsolute() || uri.isOpaque()
+                || uri.getRawAuthority() == null || uri.getHost() == null
+                || uri.getRawUserInfo() != null || uri.getRawFragment() != null) {
             throw new NodeExecutionException("HTTP_CONFIG_URL_INVALID", "HTTP url must be an absolute URI");
         }
         String script = text(values.get("requestParamsScript"));
@@ -355,10 +357,10 @@ public final class HttpNodeExecutor implements NodeExecutor {
                 && (status == 408 || status == 429 || status >= 500 && status <= 599);
     }
 
-    private static boolean isUnprotectedUncertain(
-            String method, boolean protectedSideEffect, FailureKind kind) {
+    private static boolean isUnprotectedUncertain(String method, boolean protectedSideEffect,
+            HttpNodeClient.SendObserver sendObserver) {
         return BODY_METHODS.contains(method) && !protectedSideEffect
-                && (kind == FailureKind.TIMEOUT_AFTER_SEND || kind == FailureKind.CONNECTION_LOST_AFTER_SEND);
+                && sendObserver.isSentUnresolved();
     }
 
     private static NodeExecutionException safeFailure(HttpClientException failure) {
