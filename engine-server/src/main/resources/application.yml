@@ -1,0 +1,9 @@
+spring:
+  threads.virtual.enabled: true
+flow-engine:
+  concurrency:
+    global: 1024
+    per-tenant: 256
+  events.buffer-per-execution: 1024
+  payload.max-bytes: 1048576
+  execution.max-duration: 5m
