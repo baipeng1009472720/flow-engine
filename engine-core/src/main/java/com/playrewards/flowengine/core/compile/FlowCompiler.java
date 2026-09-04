@@ -219,11 +219,12 @@ public final class FlowCompiler {
                 Map<String, Object> componentConfig = EngineReservedConfig.withoutEngineFields(node.config());
                 ValidateResult result = schema.validate(componentConfig);
                 if (!result.isSuccess()) {
-                    issues.add(issue("FLOW_NODE_CONFIG_INVALID", node.id(), "config", result.getMessage()));
+                    issues.add(issue("FLOW_NODE_CONFIG_INVALID", node.id(), "config",
+                            "节点配置不符合组件 Schema"));
                 }
             } catch (RuntimeException exception) {
                 issues.add(issue("FLOW_COMPONENT_CONFIG_SCHEMA_INVALID", node.id(), "componentCode.configSchema",
-                        "组件配置 Schema 无法校验: " + exception.getMessage()));
+                        "组件配置 Schema 无法校验"));
             }
         }
     }

@@ -4,6 +4,7 @@ import com.playrewards.flowengine.contract.json.JsonValues;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeSet;
 
 /**
  * Immutable external scopes available to a component for the duration of one execution.
@@ -39,6 +40,13 @@ public record ReadOnlyExecutionContext(Map<String, Map<String, Object>> scopes) 
         String normalized = JsonValues.requireText(scopeCode, "external scope code");
         return optionalScope(normalized)
                 .orElseThrow(() -> new IllegalArgumentException("missing external scope: " + normalized));
+    }
+
+    /** Returns external namespace keys and count without exposing context values. */
+    @Override
+    public String toString() {
+        return "ReadOnlyExecutionContext[scopeKeys=" + new TreeSet<>(scopes.keySet())
+                + ", scopeCount=" + scopes.size() + "]";
     }
 
     private static Map<String, Map<String, Object>> copyScopes(Map<String, Map<String, Object>> source) {

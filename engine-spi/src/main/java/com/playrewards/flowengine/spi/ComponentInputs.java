@@ -3,6 +3,7 @@ package com.playrewards.flowengine.spi;
 import com.playrewards.flowengine.contract.json.JsonValues;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeSet;
 
 /**
  * Immutable named inputs for one component, preserving required and optional slot declarations.
@@ -44,5 +45,14 @@ public record ComponentInputs(Map<String, Object> requiredValues, Map<String, Ob
      */
     public Optional<Object> optionalJson(String key) {
         return Optional.ofNullable(optionalValues.get(JsonValues.requireText(key, "optional component input key")));
+    }
+
+    /** Returns slot keys and counts without exposing bound values. */
+    @Override
+    public String toString() {
+        return "ComponentInputs[requiredKeys=" + new TreeSet<>(requiredValues.keySet())
+                + ", requiredCount=" + requiredValues.size()
+                + ", optionalKeys=" + new TreeSet<>(optionalValues.keySet())
+                + ", optionalCount=" + optionalValues.size() + "]";
     }
 }

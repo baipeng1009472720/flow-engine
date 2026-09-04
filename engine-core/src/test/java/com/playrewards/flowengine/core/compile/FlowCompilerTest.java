@@ -200,6 +200,27 @@ class FlowCompilerTest {
                 "FLOW_NODE_CONFIG_INVALID");
     }
 
+    @Test
+    void config_validation_never_exposes_fastjson_messages_or_rejected_values() {
+        String marker = "customer-private-marker";
+        CompiledComponentContract work = new CompiledComponentContract(
+                "business.work", ComponentType.BUSINESS, "workExecutor",
+                Map.of("type", "object", "additionalProperties", false,
+                        "required", List.of("mode"),
+                        "properties", Map.of("mode", Map.of("const", "allowed"))),
+                Map.of(), Map.of(), capabilities());
+
+        FlowCompilationException failure = assertThrows(FlowCompilationException.class,
+                () -> new FlowCompiler().compile(linearBundle(work, Map.of("mode", marker))));
+        CompilationIssue issue = failure.issues().stream()
+                .filter(candidate -> candidate.code().equals("FLOW_NODE_CONFIG_INVALID"))
+                .findFirst().orElseThrow();
+
+        assertEquals("节点配置不符合组件 Schema", issue.message());
+        assertFalse(issue.toString().contains(marker));
+        assertFalse(failure.toString().contains(marker));
+    }
+
     private static ExecutableFlowBundle linearBundle(CompiledComponentContract work, Map<String, Object> workConfig) {
         return bundle(List.of(node("start", "builtin.start"),
                         new FlowNode("work", "business.work", "work", "work", workConfig),

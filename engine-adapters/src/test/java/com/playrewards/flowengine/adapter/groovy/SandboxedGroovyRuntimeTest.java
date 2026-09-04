@@ -87,6 +87,72 @@ class SandboxedGroovyRuntimeTest {
         }
     }
 
+    @Test
+    void runs_the_collection_closure_snippets_published_by_the_management_editor() throws Exception {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            Object result = await(runtime.execute(invocation("""
+                    def items = play.items
+                    def found = items.find { item -> item.active }
+                    def active = items.findAll { it.active }
+                    def ids = active.collect { item -> item.id + 10 }
+                    def anyActive = items.any { item -> item.active }
+                    def everyNamed = items.every { it.name.startsWith('item-') }
+                    return [found: found.get('id'), ids: ids, anyActive: anyActive, everyNamed: everyNamed]
+                    """, Map.of("play", Map.of("items", List.of(
+                            Map.of("id", 1, "name", "item-one", "active", false),
+                            Map.of("id", 2, "name", "item-two", "active", true),
+                            Map.of("id", 3, "name", "item-three", "active", true)))),
+                    Map.of(), entry -> { }, () -> false, Instant.now().plusSeconds(2))));
+
+            assertEquals(Map.of(
+                    "found", 2,
+                    "ids", List.of(12, 13),
+                    "anyActive", true,
+                    "everyNamed", true), result);
+
+            Object managementSandboxResult = await(runtime.execute(invocation("""
+                    def items = [1, 2]
+                    def doubled = items.collect { item -> item * 2 }
+                    return doubled.collect { it + 1 }
+                    """, Map.of(), Map.of(), entry -> { }, () -> false,
+                    Instant.now().plusSeconds(2))));
+            assertEquals(List.of(3, 5), managementSandboxResult);
+        }
+    }
+
+    @Test
+    void rejects_collection_closure_capture_nesting_side_effects_and_non_list_receivers() {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            for (String script : List.of(
+                    "return [1, 2].collect { item -> ctx.safe }",
+                    "return [1, 2].collect { item -> println(item); item }",
+                    "return [[1]].collect { item -> item.collect { it } }",
+                    "return [[1]].collect { item -> item }",
+                    "def helper = { it + 1 }; return helper(1)",
+                    "return play.object.collect { it }")) {
+                assertScriptCode(runtime, script, "SCRIPT_SECURITY_VIOLATION",
+                        Map.of("play", Map.of("object", Map.of("value", 1))),
+                        Map.of("safe", true));
+            }
+        }
+    }
+
+    @Test
+    void collection_closure_consumes_growth_budget_before_allocation_and_runtime_remains_reusable()
+            throws Exception {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 64, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+            assertScriptCode(runtime,
+                    "return play.items.collect { item -> item + '-expanded' }",
+                    "SCRIPT_OPERATION_LIMIT_EXCEEDED",
+                    Map.of("play", Map.of("items", List.of(
+                            "one", "two", "three", "four", "five", "six", "seven"))),
+                    Map.of());
+            assertEquals(11, await(runtime.execute(invocation("return 11", Map.of(), Map.of(),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+        }
+    }
+
     @ParameterizedTest(name = "rejects escape: {0}")
     @MethodSource("forbiddenScripts")
     void rejects_file_process_reflection_class_loading_thread_and_network_escapes(String label, String script) {
@@ -202,6 +268,110 @@ class SandboxedGroovyRuntimeTest {
     }
 
     @Test
+    void rejects_input_bytes_depth_nodes_and_large_string_tokens_without_leaking_values() {
+        String marker = "input-marker-";
+        Map<String, Map<String, Object>> oversizedBytes = Map.of("play", Map.of(
+                "one", "a".repeat(240_000), "two", "b".repeat(240_000),
+                "three", "c".repeat(240_000), "four", "d".repeat(240_000),
+                "five", "e".repeat(240_000)));
+        Map<String, Map<String, Object>> oversizedToken = Map.of(
+                "play", Map.of("secret", marker + "x".repeat(300_000)));
+        Object nested = true;
+        for (int depth = 0; depth < 40; depth++) {
+            nested = Map.of("next", nested);
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> deepScope = (Map<String, Object>) nested;
+        Map<String, Map<String, Object>> oversizedDepth = Map.of("play", deepScope);
+        Map<String, Map<String, Object>> oversizedNodes = Map.of(
+                "play", Map.of("items", java.util.Collections.nCopies(10_001, true)));
+
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            for (Map<String, Map<String, Object>> scopes : List.of(
+                    oversizedBytes, oversizedToken, oversizedDepth, oversizedNodes)) {
+                CompletionException failure = assertThrows(CompletionException.class,
+                        () -> runtime.execute(invocation("return true", scopes, Map.of(),
+                                entry -> { }, () -> false, Instant.now().plusSeconds(2)))
+                                .toCompletableFuture().join());
+                assertEquals("SCRIPT_INPUT_TOO_LARGE",
+                        ((ScriptExecutionException) failure.getCause()).code());
+                assertFalse(failure.getCause().toString().contains(marker));
+            }
+        }
+    }
+
+    @Test
+    void rejects_string_and_list_amplification_before_allocation_budget_and_remains_reusable() throws Exception {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 64, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+            assertScriptCode(runtime, "return 'x' * 100000", "SCRIPT_OPERATION_LIMIT_EXCEEDED");
+            assertScriptCode(runtime, "return [1] * 100000", "SCRIPT_OPERATION_LIMIT_EXCEEDED");
+            assertEquals(7, await(runtime.execute(invocation("return 7", Map.of(), Map.of(),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+        }
+    }
+
+    @Test
+    void repeated_references_in_list_and_map_literals_consume_budget_before_container_allocation()
+            throws Exception {
+        String payload = "payload-".repeat(8);
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 96, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+            Map<String, Map<String, Object>> scopes = Map.of("play", Map.of("payload", payload));
+            assertScriptCode(runtime,
+                    "return [play.payload, play.payload, play.payload]",
+                    "SCRIPT_OPERATION_LIMIT_EXCEEDED", scopes, Map.of());
+            assertScriptCode(runtime,
+                    "return [one: play.payload, two: play.payload, three: play.payload]",
+                    "SCRIPT_OPERATION_LIMIT_EXCEEDED", scopes, Map.of());
+            assertEquals(13, await(runtime.execute(invocation("return 13", Map.of(), Map.of(),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+        }
+    }
+
+    @Test
+    void removes_unbudgeted_join_and_replace_expansion_paths() {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 64, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+            assertScriptCode(runtime, "return [1, 2].join('x')", "SCRIPT_SECURITY_VIOLATION");
+            assertScriptCode(runtime, "return 'xx'.replace('x', 'y' * 20)", "SCRIPT_SECURITY_VIOLATION");
+        }
+    }
+
+    @Test
+    void case_conversion_reserves_its_worst_case_growth_before_allocating() throws Exception {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 3, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+            assertScriptCode(runtime, "return 'ß'.toUpperCase()", "SCRIPT_OPERATION_LIMIT_EXCEEDED");
+            assertEquals(1, await(runtime.execute(invocation("return 1", Map.of(), Map.of(),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+        }
+    }
+
+    @Test
+    void string_growth_reserves_json_escape_bytes_before_allocating() throws Exception {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 64, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+            for (String script : List.of(
+                    "return '\\n' * 40", "return '\"' * 40", "return '\\\\' * 40")) {
+                assertScriptCode(runtime, script, "SCRIPT_OPERATION_LIMIT_EXCEEDED");
+            }
+            assertEquals(1, await(runtime.execute(invocation("return 1", Map.of(), Map.of(),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+        }
+    }
+
+    @Test
+    void pre_serialization_measurement_counts_valid_unicode_surrogate_pairs_as_one_code_point()
+            throws Exception {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime(
+                Duration.ofSeconds(1), 10_000, 6, 8, Duration.ofMinutes(1), Clock.systemUTC())) {
+            assertEquals("😀", await(runtime.execute(invocation("return '😀'", Map.of(), Map.of(),
+                    entry -> { }, () -> false, Instant.now().plusSeconds(1)))));
+        }
+    }
+
+    @Test
     void compilation_itself_is_async_admitted_timed_and_cancelled_before_runtime_reuse() {
         assertTimeoutPreemptively(Duration.ofSeconds(3), () -> {
             StringBuilder source = new StringBuilder();
@@ -250,6 +420,36 @@ class SandboxedGroovyRuntimeTest {
                 .allMatch(bytes -> bytes <= 16));
         assertEquals(24, logger.entries.stream()
                 .mapToInt(entry -> entry.message().getBytes(StandardCharsets.UTF_8).length).sum());
+    }
+
+    @Test
+    void flushes_the_final_partial_log_line_before_completing_the_result() throws Exception {
+        CollectingLogger logger = new CollectingLogger();
+        List<String> messagesAtCompletion;
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            messagesAtCompletion = runtime.execute(invocation(
+                            "print('tail-line'); return true", Map.of(), Map.of(), logger,
+                            () -> false, Instant.now().plusSeconds(1)))
+                    .thenApply(ignored -> logger.entries.stream().map(ExecutionLogEntry::message).toList())
+                    .toCompletableFuture().get(2, TimeUnit.SECONDS);
+        }
+
+        assertEquals(List.of("tail-line"), messagesAtCompletion);
+    }
+
+    @Test
+    void flushes_the_final_partial_log_line_before_completing_a_failure() throws Exception {
+        CollectingLogger logger = new CollectingLogger();
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            List<String> messagesAtCompletion = runtime.execute(invocation(
+                            "print('failure-tail'); return 1 / 0", Map.of(), Map.of(), logger,
+                            () -> false, Instant.now().plusSeconds(1)))
+                    .handle((ignored, failure) ->
+                            logger.entries.stream().map(ExecutionLogEntry::message).toList())
+                    .toCompletableFuture().get(2, TimeUnit.SECONDS);
+
+            assertEquals(List.of("failure-tail"), messagesAtCompletion);
+        }
     }
 
     @Test
@@ -354,8 +554,8 @@ class SandboxedGroovyRuntimeTest {
                         "def secret = '   '; return secret.allWhitespace"),
                 org.junit.jupiter.params.provider.Arguments.of("direct attribute access",
                         "return ctx.@table"),
-                org.junit.jupiter.params.provider.Arguments.of("closure dispatch",
-                        "return [1, 2].collect { it + 1 }"),
+                org.junit.jupiter.params.provider.Arguments.of("general closure value",
+                        "def helper = { it + 1 }; return helper(1)"),
                 org.junit.jupiter.params.provider.Arguments.of("thread",
                         "new java.lang.Thread({ -> }); return true"),
                 org.junit.jupiter.params.provider.Arguments.of("network",
@@ -382,8 +582,13 @@ class SandboxedGroovyRuntimeTest {
     }
 
     private static void assertScriptCode(ScriptRuntime runtime, String script, String code) {
+        assertScriptCode(runtime, script, code, Map.of(), Map.of());
+    }
+
+    private static void assertScriptCode(ScriptRuntime runtime, String script, String code,
+            Map<String, Map<String, Object>> scopes, Map<String, Object> ctx) {
         CompletionException failure = assertThrows(CompletionException.class,
-                () -> runtime.execute(invocation(script, Map.of(), Map.of(),
+                () -> runtime.execute(invocation(script, scopes, ctx,
                         entry -> { }, () -> false, Instant.now().plusSeconds(2)))
                         .toCompletableFuture().join());
         assertEquals(code, ((ScriptExecutionException) failure.getCause()).code());

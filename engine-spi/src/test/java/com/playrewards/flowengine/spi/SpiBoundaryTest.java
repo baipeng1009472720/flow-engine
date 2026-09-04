@@ -7,9 +7,11 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.playrewards.flowengine.contract.execution.ContentChunk;
+import com.playrewards.flowengine.contract.execution.ExecutionPurpose;
 import com.playrewards.flowengine.contract.execution.ExecutionRequest;
 import java.lang.reflect.Method;
 import java.lang.reflect.RecordComponent;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -135,6 +137,73 @@ class SpiBoundaryTest {
         assertTrue(finished.await(1, TimeUnit.SECONDS));
         assertEquals(4, observed.size());
         observed.forEach(copy -> assertArrayEquals("stable".toCharArray(), copy));
+    }
+
+    @Test
+    void component_value_objects_and_composite_context_have_redacted_to_strings() {
+        String marker = "private-marker-value";
+        ComponentConfig config = new ComponentConfig(Map.of("secretConfig", marker));
+        ComponentInputs inputs = new ComponentInputs(
+                Map.of("requiredSecret", marker), Map.of("optionalSecret", marker));
+        ReadOnlyExecutionContext context = new ReadOnlyExecutionContext(
+                Map.of("privateScope", Map.of("secret", marker)));
+        ComponentOutputs outputs = new ComponentOutputs(Map.of("secretOutput", marker));
+        ExecutionLogger logger = new ExecutionLogger() {
+            @Override
+            public void write(ExecutionLogEntry entry) {
+            }
+
+            @Override
+            public String toString() {
+                return marker;
+            }
+        };
+        CancellationToken cancellation = new CancellationToken() {
+            @Override
+            public boolean isCancellationRequested() {
+                return false;
+            }
+
+            @Override
+            public String toString() {
+                return marker;
+            }
+        };
+        ComponentExecutionContext composite = new ComponentExecutionContext(
+                config, inputs, context, logger, cancellation, ExecutionPurpose.PRODUCTION);
+
+        for (Object value : List.of(config, inputs, context, outputs, composite)) {
+            assertFalse(value.toString().contains(marker), value.getClass().getSimpleName());
+        }
+        assertTrue(config.toString().contains("secretConfig"));
+        assertTrue(inputs.toString().contains("requiredSecret"));
+        assertTrue(context.toString().contains("privateScope"));
+        assertTrue(outputs.toString().contains("secretOutput"));
+        assertTrue(composite.toString().contains("loggerType"));
+    }
+
+    @Test
+    void script_invocation_rejects_an_unbounded_string_token_before_copying_context() {
+        Map<String, Map<String, Object>> scopes = Map.of(
+                "play", Map.of("oversized", "x".repeat(1_048_577)));
+
+        IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
+                () -> new ScriptRuntime.ScriptInvocation("return true", scopes, Map.of(),
+                        ExecutionLogger.NOOP, () -> false, Instant.now().plusSeconds(1)));
+
+        assertEquals("script invocation context exceeds the hard resource limit", failure.getMessage());
+    }
+
+    @Test
+    void script_invocation_counts_null_values_toward_the_pre_copy_node_limit() {
+        Map<String, Map<String, Object>> scopes = Map.of(
+                "play", Map.of("items", java.util.Collections.nCopies(100_001, null)));
+
+        IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
+                () -> new ScriptRuntime.ScriptInvocation("return true", scopes, Map.of(),
+                        ExecutionLogger.NOOP, () -> false, Instant.now().plusSeconds(1)));
+
+        assertEquals("script invocation context exceeds the hard resource limit", failure.getMessage());
     }
 
     private static final class RecordingSubscriber implements Flow.Subscriber<ContentChunk> {

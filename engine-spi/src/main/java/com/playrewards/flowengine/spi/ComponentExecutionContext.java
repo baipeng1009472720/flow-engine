@@ -21,4 +21,15 @@ public record ComponentExecutionContext(ComponentConfig config, ComponentInputs 
         Objects.requireNonNull(cancellationToken, "cancellation token must not be null");
         Objects.requireNonNull(purpose, "execution purpose must not be null");
     }
+
+    /** Returns only redacted nested summaries and service implementation types. */
+    @Override
+    public String toString() {
+        return "ComponentExecutionContext[config=" + config
+                + ", inputs=" + inputs
+                + ", context=" + context
+                + ", loggerType=" + logger.getClass().getName()
+                + ", cancellationTokenType=" + cancellationToken.getClass().getName()
+                + ", purpose=" + purpose + "]";
+    }
 }

@@ -2,8 +2,8 @@ package com.playrewards.flowengine.spi;
 
 import com.playrewards.flowengine.contract.json.JsonValues;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
+import java.util.TreeSet;
 
 /**
  * Immutable JSON configuration resolved for one business-component invocation.
@@ -41,5 +41,12 @@ public record ComponentConfig(Map<String, Object> values) {
      */
     public Optional<Object> optionalJson(String key) {
         return Optional.ofNullable(values.get(JsonValues.requireText(key, "component config key")));
+    }
+
+    /** Returns structural diagnostics without exposing configuration values. */
+    @Override
+    public String toString() {
+        return "ComponentConfig[keys=" + new TreeSet<>(values.keySet())
+                + ", count=" + values.size() + "]";
     }
 }
