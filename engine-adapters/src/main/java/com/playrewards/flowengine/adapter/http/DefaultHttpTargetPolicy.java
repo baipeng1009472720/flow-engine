@@ -136,6 +136,9 @@ public final class DefaultHttpTargetPolicy implements HttpTargetPolicy {
                     Thread.currentThread().interrupt();
                     throw new CancellationException("HTTP target approval was cancelled");
                 } catch (ExecutionException failure) {
+                    // Cancellation can interrupt the resolver and make its DNS failure win the
+                    // future race. Preserve the caller-visible cancellation classification.
+                    cancellation.throwIfCancellationRequested();
                     throw rejected(failure.getCause());
                 }
             }

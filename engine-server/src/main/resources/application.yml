@@ -1,5 +1,8 @@
 spring:
   threads.virtual.enabled: true
+  lifecycle.timeout-per-shutdown-phase: 30s
+server:
+  shutdown: graceful
 flow-engine:
   concurrency:
     global: 1024

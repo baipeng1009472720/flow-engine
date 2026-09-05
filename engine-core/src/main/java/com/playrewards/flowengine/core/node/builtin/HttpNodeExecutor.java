@@ -141,6 +141,7 @@ public final class HttpNodeExecutor implements NodeExecutor {
                     context.throwIfStopped();
                 }
                 if (attempt <= retries && retryable(config.method(), protectedSideEffect, failure.kind())) {
+                    recordRetry(context, safeFailure(failure).code());
                     backoff(context, retryPolicy.backoffBeforeAttempt(attempt + 1));
                     continue;
                 }
@@ -151,6 +152,7 @@ public final class HttpNodeExecutor implements NodeExecutor {
             }
             if (attempt <= retries && retryableStatus(config.method(), protectedSideEffect,
                     response.statusCode())) {
+                recordRetry(context, "HTTP_STATUS_" + response.statusCode());
                 backoff(context, retryPolicy.backoffBeforeAttempt(attempt + 1));
                 continue;
             }
@@ -615,6 +617,12 @@ public final class HttpNodeExecutor implements NodeExecutor {
                 throw new CancellationException("HTTP retry wait was interrupted");
             }
             remaining -= Math.max(1, System.nanoTime() - started);
+        }
+    }
+
+    private static void recordRetry(NodeExecutionContext context, String code) {
+        if (context.executionLogger() instanceof com.playrewards.flowengine.core.observation.ExecutionRecorder.Attempt attempt) {
+            attempt.retry(code);
         }
     }
 

@@ -177,6 +177,32 @@ class HttpTargetPolicyTest {
     }
 
     @Test
+    void cancellation_wins_when_the_interrupted_resolver_completes_exceptionally_first()
+            throws Exception {
+        AtomicReference<Thread> resolverThread = new AtomicReference<>();
+        CountDownLatch resolverStarted = new CountDownLatch(1);
+        CountDownLatch resolverInterrupted = new CountDownLatch(1);
+        DefaultHttpTargetPolicy policy = new DefaultHttpTargetPolicy(host -> {
+            resolverThread.set(Thread.currentThread());
+            resolverStarted.countDown();
+            try {
+                new CountDownLatch(1).await();
+                throw new AssertionError("resolver should have been interrupted");
+            } catch (InterruptedException expected) {
+                resolverInterrupted.countDown();
+                throw new java.net.UnknownHostException("resolution interrupted");
+            }
+        }, address -> true);
+        CancellationDuringSecondObservation cancellation =
+                new CancellationDuringSecondObservation(resolverThread, resolverStarted);
+
+        assertThrows(java.util.concurrent.CancellationException.class,
+                () -> policy.approve(URI.create("https://cancel-race.example/path"),
+                        ExecutionPurpose.TRIAL, cancellation, Instant.now().plusSeconds(3)));
+        assertEquals(0, resolverInterrupted.getCount());
+    }
+
+    @Test
     void dns_resolution_capacity_rejects_overflow_instead_of_queueing_unbounded_work() throws Exception {
         CountDownLatch started = new CountDownLatch(64);
         CountDownLatch release = new CountDownLatch(1);
@@ -437,6 +463,52 @@ class HttpTargetPolicyTest {
         private void cancel() {
             cancelled.set(true);
             listener.run();
+        }
+    }
+
+    /** Reproduces cancellation immediately after the resolve loop's token snapshot. */
+    private static final class CancellationDuringSecondObservation implements CancellationToken {
+
+        private final AtomicInteger observations = new AtomicInteger();
+        private final AtomicBoolean cancelled = new AtomicBoolean();
+        private final AtomicReference<Thread> resolverThread;
+        private final CountDownLatch resolverStarted;
+        private volatile Runnable listener = () -> { };
+
+        private CancellationDuringSecondObservation(AtomicReference<Thread> resolverThread,
+                CountDownLatch resolverStarted) {
+            this.resolverThread = resolverThread;
+            this.resolverStarted = resolverStarted;
+        }
+
+        @Override
+        public boolean isCancellationRequested() {
+            if (observations.incrementAndGet() != 2) {
+                return cancelled.get();
+            }
+            boolean snapshot = cancelled.get();
+            try {
+                if (!resolverStarted.await(2, TimeUnit.SECONDS)) {
+                    throw new AssertionError("resolver did not start");
+                }
+                cancelled.set(true);
+                listener.run();
+                Thread worker = resolverThread.get();
+                worker.join(2_000);
+                if (worker.isAlive()) {
+                    throw new AssertionError("resolver did not finish after cancellation");
+                }
+            } catch (InterruptedException failure) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("test cancellation seam was interrupted", failure);
+            }
+            return snapshot;
+        }
+
+        @Override
+        public CancellationRegistration onCancellation(Runnable action) {
+            listener = action;
+            return () -> listener = () -> { };
         }
     }
 

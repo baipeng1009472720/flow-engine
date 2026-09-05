@@ -14,6 +14,7 @@
         <module>engine-spi</module>
         <module>engine-core</module>
         <module>engine-adapters</module>
+        <module>engine-server-starter</module>
         <module>engine-server</module>
     </modules>
 

@@ -10,6 +10,9 @@ import java.util.Optional;
  */
 public interface PayloadStore {
 
+    /** Resolves ownership for authorization. Legacy adapters deny public payload access by default. */
+    default Optional<String> executionId(PayloadReference reference) { return Optional.empty(); }
+
     /**
      * Stores one JSON-compatible payload under an adapter-owned opaque reference.
      *

@@ -3,7 +3,7 @@ package com.playrewards.flowengine.server;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
-/** Starts the standalone server; runtime flow behavior is deliberately out of scope for this bootstrap. */
+/** Starts the generic distribution; reusable controllers and runtime assembly belong to the Starter. */
 @SpringBootApplication
 public class FlowEngineApplication {
     /** Starts the server process. */

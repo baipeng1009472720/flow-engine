@@ -18,6 +18,12 @@ public final class FlowEngine implements AutoCloseable {
 
     private final DagScheduler scheduler;
 
+    /** Creates a production runtime with real execution/node observation and bounded event delivery. */
+    public FlowEngine(NodeExecutorRegistry executors, ConcurrencyGovernor governor, Clock clock,
+            com.playrewards.flowengine.core.observation.ExecutionRecorder recorder) {
+        this.scheduler = new DagScheduler(executors, governor, clock, recorder);
+    }
+
     /** Creates an engine containing built-ins and process-shared finite concurrency resources. */
     public FlowEngine() {
         this(NodeExecutorRegistry.builtIns());
