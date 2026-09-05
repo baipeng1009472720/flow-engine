@@ -518,6 +518,11 @@ public final class HttpNodeExecutor implements NodeExecutor {
             cancelAndAwait(completion);
             Thread.currentThread().interrupt();
             throw new CancellationException("HTTP node wait was interrupted");
+        } catch (CancellationException failure) {
+            // A token can become visible before the scheduler's interrupt callback reaches this
+            // virtual thread. Preserve the same real-source cleanup barrier on that race path.
+            cancelAndAwait(completion);
+            throw failure;
         } catch (ExecutionException failure) {
             Throwable cause = unwrap(failure.getCause());
             if (cause instanceof RuntimeException runtime) {
@@ -525,10 +530,6 @@ public final class HttpNodeExecutor implements NodeExecutor {
             }
             throw new HttpClientException(FailureKind.CONNECTION_LOST_AFTER_SEND,
                     "HTTP transport failed");
-        } finally {
-            if (context.cancellationToken().isCancellationRequested()) {
-                cancel(completion);
-            }
         }
     }
 

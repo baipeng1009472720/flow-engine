@@ -54,6 +54,7 @@ public final class JdkHttpNodeClient implements HttpNodeClient, AutoCloseable {
 
     private static final int MAX_HEADER_BYTES = 65_536;
     private static final int MAX_HEADER_COUNT = 128;
+    private static final int MAX_INTERIM_RESPONSES = 8;
     private static final Set<String> METHODS = Set.of("GET", "POST", "PUT", "PATCH", "DELETE");
     private static final Set<String> RESERVED_REQUEST_HEADERS = Set.of(
             "accept-encoding", "connection", "content-length", "host", "transfer-encoding");
@@ -323,47 +324,28 @@ public final class JdkHttpNodeClient implements HttpNodeClient, AutoCloseable {
 
     private static HttpResponse readResponse(InputStream input, int maxBytes) throws IOException {
         LineReader lines = new LineReader(input, MAX_HEADER_BYTES);
-        String statusLine = requiredLine(lines);
-        String[] statusParts = statusLine.split(" ", 3);
-        if (statusParts.length < 2 || !(statusParts[0].equals("HTTP/1.1") || statusParts[0].equals("HTTP/1.0"))) {
-            throw invalidResponse();
-        }
-        int status;
-        try {
-            status = Integer.parseInt(statusParts[1]);
-        } catch (NumberFormatException failure) {
-            throw invalidResponse();
-        }
-        if (status < 100 || status > 599) {
-            throw invalidResponse();
-        }
-        Map<String, List<String>> headers = new LinkedHashMap<>();
-        int count = 0;
+        ResponseHead head;
+        int interimResponses = 0;
         while (true) {
-            String line = requiredLine(lines);
-            if (line.isEmpty()) {
+            head = readHead(lines);
+            if (head.status() == 101) {
+                throw invalidResponse();
+            }
+            if (head.status() < 100 || head.status() >= 200) {
                 break;
             }
-            if (++count > MAX_HEADER_COUNT || line.startsWith(" ") || line.startsWith("\t")) {
+            if (++interimResponses > MAX_INTERIM_RESPONSES
+                    || !headerValues(head.headers(), "Transfer-Encoding").isEmpty()
+                    || !headerValues(head.headers(), "Content-Length").isEmpty()) {
                 throw invalidResponse();
             }
-            int colon = line.indexOf(':');
-            if (colon <= 0) {
-                throw invalidResponse();
-            }
-            String name = line.substring(0, colon);
-            String value = line.substring(colon + 1).strip();
-            if (!validHeaderName(name) || !validHeaderValue(value)) {
-                throw invalidResponse();
-            }
-            String existing = headers.keySet().stream()
-                    .filter(key -> key.equalsIgnoreCase(name)).findFirst().orElse(name);
-            headers.computeIfAbsent(existing, ignored -> new ArrayList<>()).add(value);
         }
+        int status = head.status();
+        Map<String, List<String>> headers = head.headers();
         rejectRedirect(status);
         rejectEncoded(headers);
         byte[] body;
-        if (status / 100 == 1 || status == 204 || status == 304) {
+        if (status == 204 || status == 304) {
             body = new byte[0];
         } else {
             List<String> transferEncoding = headerValues(headers, "Transfer-Encoding");
@@ -392,16 +374,73 @@ public final class JdkHttpNodeClient implements HttpNodeClient, AutoCloseable {
         return new HttpResponse(status, immutableHeaders, body);
     }
 
+    private static ResponseHead readHead(LineReader lines) throws IOException {
+        String statusLine = requiredLine(lines);
+        String version;
+        if (statusLine.startsWith("HTTP/1.1 ")) {
+            version = "HTTP/1.1";
+        } else if (statusLine.startsWith("HTTP/1.0 ")) {
+            version = "HTTP/1.0";
+        } else {
+            throw invalidResponse();
+        }
+        int codeStart = version.length() + 1;
+        int codeEnd = statusLine.indexOf(' ', codeStart);
+        String statusCode = statusLine.substring(
+                codeStart, codeEnd < 0 ? statusLine.length() : codeEnd);
+        if (!asciiDigits(statusCode, 3)) {
+            throw invalidResponse();
+        }
+        int status = (statusCode.charAt(0) - '0') * 100
+                + (statusCode.charAt(1) - '0') * 10 + statusCode.charAt(2) - '0';
+        if (status < 100 || status > 599) {
+            throw invalidResponse();
+        }
+        Map<String, List<String>> headers = new LinkedHashMap<>();
+        int count = 0;
+        while (true) {
+            String line = requiredLine(lines);
+            if (line.isEmpty()) {
+                break;
+            }
+            if (++count > MAX_HEADER_COUNT || line.startsWith(" ") || line.startsWith("\t")) {
+                throw invalidResponse();
+            }
+            int colon = line.indexOf(':');
+            if (colon <= 0) {
+                throw invalidResponse();
+            }
+            String name = line.substring(0, colon);
+            String rawValue = line.substring(colon + 1);
+            if (!validHeaderName(name) || !validHeaderValue(rawValue)) {
+                throw invalidResponse();
+            }
+            String value = stripOptionalWhitespace(rawValue);
+            String existing = headers.keySet().stream()
+                    .filter(key -> key.equalsIgnoreCase(name)).findFirst().orElse(name);
+            headers.computeIfAbsent(existing, ignored -> new ArrayList<>()).add(value);
+        }
+        return new ResponseHead(status, headers);
+    }
+
     private static byte[] readChunked(InputStream input, LineReader lines, int maxBytes) throws IOException {
         ByteArrayOutputStream output = new ByteArrayOutputStream(Math.min(maxBytes, 8_192));
         while (true) {
             String sizeLine = requiredLine(lines);
-            String rawSize = sizeLine.split(";", 2)[0].strip();
+            int extension = sizeLine.indexOf(';');
+            String rawSize = extension < 0 ? sizeLine : sizeLine.substring(0, extension);
+            if (!asciiHexDigits(rawSize)) {
+                throw invalidResponse();
+            }
             long size;
             try {
                 size = Long.parseUnsignedLong(rawSize, 16);
             } catch (NumberFormatException failure) {
                 throw invalidResponse();
+            }
+            if (size < 0) {
+                // Unsigned values above Long.MAX_VALUE are represented as negative longs.
+                throw tooLarge();
             }
             if (size == 0) {
                 int trailers = 0;
@@ -411,8 +450,9 @@ public final class JdkHttpNodeClient implements HttpNodeClient, AutoCloseable {
                         throw invalidResponse();
                     }
                     int colon = trailer.indexOf(':');
+                    String rawValue = colon < 0 ? "" : trailer.substring(colon + 1);
                     if (colon <= 0 || !validHeaderName(trailer.substring(0, colon))
-                            || !validHeaderValue(trailer.substring(colon + 1).strip())) {
+                            || !validHeaderValue(rawValue)) {
                         throw invalidResponse();
                     }
                 }
@@ -457,10 +497,14 @@ public final class JdkHttpNodeClient implements HttpNodeClient, AutoCloseable {
     private static long contentLength(List<String> values) {
         Long selected = null;
         for (String value : values) {
-            for (String item : value.split(",")) {
+            for (String item : value.split(",", -1)) {
+                String digits = stripOptionalWhitespace(item);
+                if (!asciiDigits(digits, -1)) {
+                    throw invalidResponse();
+                }
                 long parsed;
                 try {
-                    parsed = Long.parseLong(item.strip());
+                    parsed = Long.parseLong(digits);
                 } catch (NumberFormatException failure) {
                     throw invalidResponse();
                 }
@@ -550,7 +594,9 @@ public final class JdkHttpNodeClient implements HttpNodeClient, AutoCloseable {
         }
         for (int index = 0; index < name.length(); index++) {
             char value = name.charAt(index);
-            if (!(Character.isLetterOrDigit(value) || "!#$%&'*+-.^_`|~".indexOf(value) >= 0)) {
+            if (!(value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z'
+                    || value >= '0' && value <= '9'
+                    || "!#$%&'*+-.^_`|~".indexOf(value) >= 0)) {
                 return false;
             }
         }
@@ -569,6 +615,46 @@ public final class JdkHttpNodeClient implements HttpNodeClient, AutoCloseable {
             }
         }
         return true;
+    }
+
+    private static boolean asciiDigits(String value, int exactLength) {
+        if (value.isEmpty() || exactLength >= 0 && value.length() != exactLength) {
+            return false;
+        }
+        for (int index = 0; index < value.length(); index++) {
+            char character = value.charAt(index);
+            if (character < '0' || character > '9') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean asciiHexDigits(String value) {
+        if (value.isEmpty()) {
+            return false;
+        }
+        for (int index = 0; index < value.length(); index++) {
+            char character = value.charAt(index);
+            if (!(character >= '0' && character <= '9'
+                    || character >= 'a' && character <= 'f'
+                    || character >= 'A' && character <= 'F')) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String stripOptionalWhitespace(String value) {
+        int start = 0;
+        int end = value.length();
+        while (start < end && (value.charAt(start) == ' ' || value.charAt(start) == '\t')) {
+            start++;
+        }
+        while (end > start && (value.charAt(end - 1) == ' ' || value.charAt(end - 1) == '\t')) {
+            end--;
+        }
+        return value.substring(start, end);
     }
 
     private static boolean isIpLiteral(String host) {
@@ -749,6 +835,9 @@ public final class JdkHttpNodeClient implements HttpNodeClient, AutoCloseable {
                 line.write(value);
             }
         }
+    }
+
+    private record ResponseHead(int status, Map<String, List<String>> headers) {
     }
 
     private static String requiredLine(LineReader lines) throws IOException {

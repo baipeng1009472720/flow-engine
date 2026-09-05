@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.playrewards.flowengine.contract.bundle.CompiledComponentContract;
@@ -21,13 +22,16 @@ import com.playrewards.flowengine.contract.flow.FlowNode;
 import com.playrewards.flowengine.contract.protocol.ProtocolSchema;
 import com.playrewards.flowengine.core.compile.CompiledNode;
 import com.playrewards.flowengine.core.compile.ExecutionPlan;
+import com.playrewards.flowengine.core.execution.CancellationHandle;
 import com.playrewards.flowengine.core.execution.ConcurrencyGovernor;
+import com.playrewards.flowengine.core.execution.ExecutionContext;
 import com.playrewards.flowengine.core.execution.ExecutionHandle;
 import com.playrewards.flowengine.core.execution.FlowEngine;
 import com.playrewards.flowengine.core.execution.ScopePath;
 import com.playrewards.flowengine.core.idempotency.IdempotencyCoordinator;
 import com.playrewards.flowengine.core.node.builtin.HttpNodeExecutor;
 import com.playrewards.flowengine.core.retry.RetryPolicy;
+import com.playrewards.flowengine.spi.ComponentInputs;
 import com.playrewards.flowengine.spi.HttpNodeClient;
 import com.playrewards.flowengine.spi.ScriptRuntime;
 import java.net.URI;
@@ -43,7 +47,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
@@ -414,6 +421,131 @@ class HttpNodeExecutorTest {
         assertEquals("HTTP_SIDE_EFFECT_UNCERTAIN", uncertain.errorCode());
     }
 
+    @Test
+    void token_cancellation_waits_for_delayed_http_source_cleanup_before_result_and_close()
+            throws Exception {
+        DelayedCancellationClient client = new DelayedCancellationClient(false);
+        Clock clock = Clock.systemUTC();
+        ExecutionPlan plan = httpPlan("POST", ComponentEffect.SIDE_EFFECT, null,
+                "https://public.example/path", Map.of(), 0, 1_000);
+        FlowEngine engine = httpEngine(
+                objectScript(Map.of("operation", "charge")), client, clock, 1_024);
+        Thread closer = null;
+        try {
+            ExecutionRequest request = new ExecutionRequest("inline:flow", ExecutionMode.EPHEMERAL,
+                    ExecutionPurpose.TRIAL, Map.of(), Map.of(), null, "request-a", "tenant-a",
+                    clock.instant().plusSeconds(5), Map.of());
+            ExecutionHandle handle = engine.execute(plan, request);
+            assertTrue(client.started.await(2, TimeUnit.SECONDS));
+            assertTrue(handle.cancel());
+            assertTrue(client.source.cancelRequested.await(2, TimeUnit.SECONDS));
+
+            assertThrows(TimeoutException.class,
+                    () -> handle.completion().toCompletableFuture().get(1, TimeUnit.SECONDS));
+            closer = Thread.ofVirtual().start(engine::close);
+            closer.join(1_000);
+            assertTrue(closer.isAlive());
+
+            client.source.allowCompletion.countDown();
+            closer.join(2_000);
+            assertFalse(closer.isAlive());
+            assertEquals(ExecutionStatus.CANCELLED,
+                    handle.completion().toCompletableFuture().get(2, TimeUnit.SECONDS).status());
+            assertEquals(0, client.source.cleanupCompleted.getCount());
+        } finally {
+            client.source.allowCompletion.countDown();
+            if (closer != null) {
+                closer.join(2_000);
+            }
+            engine.close();
+        }
+    }
+
+    @Test
+    void possibly_sent_cancellation_waits_for_delayed_cleanup_then_publishes_manual()
+            throws Exception {
+        DelayedCancellationClient client = new DelayedCancellationClient(true);
+        Clock clock = Clock.systemUTC();
+        ExecutionPlan plan = httpPlan("POST", ComponentEffect.SIDE_EFFECT, null,
+                "https://public.example/path", Map.of(), 0, 1_000);
+        FlowEngine engine = httpEngine(
+                objectScript(Map.of("operation", "charge")), client, clock, 1_024);
+        Thread closer = null;
+        try {
+            ExecutionRequest request = new ExecutionRequest("inline:flow", ExecutionMode.EPHEMERAL,
+                    ExecutionPurpose.TRIAL, Map.of(), Map.of(), null, "request-a", "tenant-a",
+                    clock.instant().plusSeconds(5), Map.of());
+            ExecutionHandle handle = engine.execute(plan, request);
+            assertTrue(client.started.await(2, TimeUnit.SECONDS));
+            assertTrue(handle.cancel());
+            assertTrue(client.source.cancelRequested.await(2, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class,
+                    () -> handle.completion().toCompletableFuture().get(1, TimeUnit.SECONDS));
+
+            closer = Thread.ofVirtual().start(engine::close);
+            closer.join(1_000);
+            assertTrue(closer.isAlive());
+            client.source.allowCompletion.countDown();
+            closer.join(2_000);
+
+            assertFalse(closer.isAlive());
+            ExecutionResult result = handle.completion().toCompletableFuture()
+                    .get(2, TimeUnit.SECONDS);
+            assertEquals(ExecutionStatus.WAITING_MANUAL, result.status());
+            assertEquals("HTTP_SIDE_EFFECT_UNCERTAIN", result.errorCode());
+            assertEquals(0, client.source.cleanupCompleted.getCount());
+        } finally {
+            client.source.allowCompletion.countDown();
+            if (closer != null) {
+                closer.join(2_000);
+            }
+            engine.close();
+        }
+    }
+
+    @Test
+    void direct_token_cancellation_cannot_return_before_the_http_source_cleanup_barrier()
+            throws Exception {
+        DelayedCancellationClient client = new DelayedCancellationClient(false);
+        Clock clock = Clock.systemUTC();
+        ExecutionPlan plan = httpPlan("POST", ComponentEffect.SIDE_EFFECT, null,
+                "https://public.example/path", Map.of(), 0, 1_000);
+        HttpNodeExecutor executor = httpExecutor(objectScript(Map.of("operation", "charge")),
+                client, clock, 1_024);
+        CancellationHandle cancellation = new CancellationHandle();
+        ExecutionRequest request = new ExecutionRequest("inline:flow", ExecutionMode.EPHEMERAL,
+                ExecutionPurpose.TRIAL, Map.of(), Map.of(), null, "request-a", "tenant-a",
+                clock.instant().plusSeconds(5), Map.of());
+        NodeExecutionContext context = new NodeExecutionContext("execution", plan,
+                plan.nodesById().get("http"), new ExecutionContext(Map.of()), ScopePath.root(),
+                new ComponentInputs(Map.of(), Map.of()), cancellation, request, clock);
+        CountDownLatch invocationReturned = new CountDownLatch(1);
+        AtomicReference<Throwable> selectedFailure = new AtomicReference<>();
+        Thread invocation = Thread.ofVirtual().start(() -> {
+            try {
+                executor.execute(context);
+            } catch (Throwable failure) {
+                selectedFailure.set(failure);
+            } finally {
+                invocationReturned.countDown();
+            }
+        });
+        try {
+            assertTrue(client.started.await(2, TimeUnit.SECONDS));
+            assertTrue(cancellation.cancel());
+            assertTrue(client.source.cancelRequested.await(2, TimeUnit.SECONDS));
+            assertFalse(invocationReturned.await(1, TimeUnit.SECONDS));
+
+            client.source.allowCompletion.countDown();
+            assertTrue(invocationReturned.await(2, TimeUnit.SECONDS));
+            assertTrue(selectedFailure.get() instanceof java.util.concurrent.CancellationException);
+            assertEquals(0, client.source.cleanupCompleted.getCount());
+        } finally {
+            client.source.allowCompletion.countDown();
+            invocation.join(2_000);
+        }
+    }
+
     private static ExecutionResult execute(String method, ScriptRuntime scripts, RecordingClient client,
             ComponentEffect effect, boolean output, String url, Map<String, Object> extraConfig,
             int retryCount, int timeoutMillis, int maxResponseBytes) throws Exception {
@@ -442,6 +574,19 @@ class HttpNodeExecutorTest {
             ComponentEffect effect, ProtocolSchema outputProtocol, String url, Map<String, Object> extraConfig,
             int retryCount, int timeoutMillis, int maxResponseBytes, Clock clock, Instant deadline)
             throws Exception {
+        ExecutionPlan plan = httpPlan(method, effect, outputProtocol, url, extraConfig,
+                retryCount, timeoutMillis);
+        try (FlowEngine engine = httpEngine(scripts, client, clock, maxResponseBytes)) {
+            ExecutionHandle handle = engine.execute(plan, new ExecutionRequest(
+                    "inline:flow", ExecutionMode.EPHEMERAL, ExecutionPurpose.TRIAL,
+                    Map.of(), Map.of(), null, "request-a", "tenant-a", deadline, Map.of()));
+            return handle.completion().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    private static ExecutionPlan httpPlan(String method, ComponentEffect effect,
+            ProtocolSchema outputProtocol, String url, Map<String, Object> extraConfig,
+            int retryCount, int timeoutMillis) {
         Map<String, Object> config = new LinkedHashMap<>();
         config.put("method", method);
         config.put("url", url);
@@ -468,18 +613,21 @@ class HttpNodeExecutorTest {
                 Map.of("start", List.of(), "http", List.of("start"), "end", List.of("http")),
                 Map.of("start", Map.of("NEXT", List.of("http")), "http", Map.of("NEXT", List.of("end"))),
                 Map.of(), Map.of(), Map.of(), Map.of(), Map.of());
-        HttpNodeExecutor executor = new HttpNodeExecutor(scripts, client,
-                new RetryPolicy(2, Duration.ofMillis(1), Duration.ofMillis(2)),
-                new IdempotencyCoordinator(), clock, Duration.ofSeconds(2), 1_024);
+        return plan;
+    }
+
+    private static FlowEngine httpEngine(
+            ScriptRuntime scripts, HttpNodeClient client, Clock clock, int maxResponseBytes) {
+        HttpNodeExecutor executor = httpExecutor(scripts, client, clock, maxResponseBytes);
         NodeExecutorRegistry registry = NodeExecutorRegistry.withBuiltIns(List.of(executor));
-        ExecutionRequest request = new ExecutionRequest("inline:flow", ExecutionMode.EPHEMERAL,
-                ExecutionPurpose.TRIAL, Map.of(), Map.of(), null, "request-a", "tenant-a",
-                deadline, Map.of());
-        try (FlowEngine engine = new FlowEngine(registry,
-                new ConcurrencyGovernor(32, 32, 32, 32, 32, clock), clock)) {
-            ExecutionHandle handle = engine.execute(plan, request);
-            return handle.completion().toCompletableFuture().get(5, TimeUnit.SECONDS);
-        }
+        return new FlowEngine(registry, new ConcurrencyGovernor(32, 32, 32, 32, 32, clock), clock);
+    }
+
+    private static HttpNodeExecutor httpExecutor(
+            ScriptRuntime scripts, HttpNodeClient client, Clock clock, int maxResponseBytes) {
+        return new HttpNodeExecutor(scripts, client,
+                new RetryPolicy(2, Duration.ofMillis(1), Duration.ofMillis(2)),
+                new IdempotencyCoordinator(), clock, Duration.ofSeconds(2), maxResponseBytes);
     }
 
     private static CompiledNode node(String id, ComponentType type, Map<String, Object> config,
@@ -532,6 +680,54 @@ class HttpNodeExecutorTest {
                 return CompletableFuture.completedFuture(response(204, ""));
             }
             return CompletableFuture.completedFuture(responses.get(responseIndex));
+        }
+    }
+
+    private static final class DelayedCancellationClient implements HttpNodeClient {
+
+        private final CountDownLatch started = new CountDownLatch(1);
+        private final DelayedCancellationFuture source = new DelayedCancellationFuture();
+        private final boolean possiblySent;
+
+        private DelayedCancellationClient(boolean possiblySent) {
+            this.possiblySent = possiblySent;
+        }
+
+        @Override
+        public CompletionStage<HttpResponse> execute(HttpRequest request) {
+            if (possiblySent) {
+                request.sendObserver().possiblySent();
+            }
+            started.countDown();
+            return source;
+        }
+    }
+
+    private static final class DelayedCancellationFuture
+            extends CompletableFuture<HttpNodeClient.HttpResponse> {
+
+        private final AtomicBoolean cancellationStarted = new AtomicBoolean();
+        private final CountDownLatch cancelRequested = new CountDownLatch(1);
+        private final CountDownLatch allowCompletion = new CountDownLatch(1);
+        private final CountDownLatch cleanupCompleted = new CountDownLatch(1);
+
+        @Override
+        public boolean cancel(boolean mayInterruptIfRunning) {
+            if (isDone() || !cancellationStarted.compareAndSet(false, true)) {
+                return false;
+            }
+            cancelRequested.countDown();
+            Thread.ofVirtual().start(() -> {
+                try {
+                    allowCompletion.await();
+                    cleanupCompleted.countDown();
+                    super.cancel(mayInterruptIfRunning);
+                } catch (InterruptedException failure) {
+                    Thread.currentThread().interrupt();
+                    cleanupCompleted.countDown();
+                }
+            });
+            return true;
         }
     }
 

@@ -48,6 +48,8 @@ class HttpTargetPolicyTest {
                 "http://0.0.0.0/path",
                 "http://[::1]/path",
                 "http://[::ffff:127.0.0.1]/path",
+                "http://[2001:2::1]/path",
+                "http://[2001:10::1]/path",
                 "http://[2002:7f00:1::]/path",
                 "http://[64:ff9b::7f00:1]/path",
                 "http://[4000::1]/path",
@@ -379,6 +381,17 @@ class HttpTargetPolicyTest {
 
         assertFalse(request.toString().contains(secret));
         assertFalse(failure.toString().contains(secret));
+    }
+
+    @Test
+    void approved_target_to_string_redacts_the_uri_query() throws Exception {
+        String secret = "approved-target-secret";
+        HttpTargetPolicy.ApprovedTarget approved = new HttpTargetPolicy.ApprovedTarget(
+                URI.create("https://public.example/path?token=" + secret),
+                List.of(InetAddress.getByName("93.184.216.34")), 443);
+
+        assertFalse(approved.toString().contains(secret));
+        assertFalse(approved.toString().contains("token="));
     }
 
     private static HttpNodeClient.HttpRequest request(URI uri, ExecutionPurpose purpose,

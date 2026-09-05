@@ -72,6 +72,70 @@ class HttpTransportProtocolTest {
                 64, HttpNodeClient.FailureKind.INVALID_RESPONSE);
         assertFailure("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\noversized",
                 8, HttpNodeClient.FailureKind.RESPONSE_TOO_LARGE);
+        assertFailure("HTTP/1.1 200 OK\r\nContent-Length: +1\r\n\r\na",
+                64, HttpNodeClient.FailureKind.INVALID_RESPONSE);
+        assertFailure("HTTP/1.1 200 OK\r\nContent-Length: 1,\r\n\r\na",
+                64, HttpNodeClient.FailureKind.INVALID_RESPONSE);
+        assertFailure("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                        + "+1\r\na\r\n0\r\n\r\n",
+                64, HttpNodeClient.FailureKind.INVALID_RESPONSE);
+        assertFailure("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                        + " 1\r\na\r\n0\r\n\r\n",
+                64, HttpNodeClient.FailureKind.INVALID_RESPONSE);
+        assertFailure("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                        + "1\r\na\r\n0\r\nX-Trailer: safe\u000b\r\n\r\n",
+                64, HttpNodeClient.FailureKind.INVALID_RESPONSE);
+        assertFailure("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                        + "ffffffffffffffff\r\n",
+                64, HttpNodeClient.FailureKind.RESPONSE_TOO_LARGE);
+        assertFailure("HTTP/1.1 +200 OK\r\nContent-Length: 2\r\n\r\nok",
+                64, HttpNodeClient.FailureKind.INVALID_RESPONSE);
+        assertFailure("HTTP/1.1 0200 OK\r\nContent-Length: 2\r\n\r\nok",
+                64, HttpNodeClient.FailureKind.INVALID_RESPONSE);
+        assertFailure("HTTP/1.1 ²00 OK\r\nContent-Length: 2\r\n\r\nok",
+                64, HttpNodeClient.FailureKind.INVALID_RESPONSE);
+        assertFailure("HTTP/1.1 200 OK\r\nX-é: value\r\nContent-Length: 2\r\n\r\nok",
+                64, HttpNodeClient.FailureKind.INVALID_RESPONSE);
+    }
+
+    @Test
+    void skips_bounded_informational_responses_but_rejects_protocol_upgrade() throws Exception {
+        try (RawServer earlyHints = new RawServer(
+                "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n"
+                        + "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                JdkHttpNodeClient client = client(earlyHints, null)) {
+            HttpNodeClient.HttpResponse response = client.execute(
+                    request(earlyHints.uri("http"), 64, Map.of())).get(2, TimeUnit.SECONDS);
+            assertEquals(200, response.statusCode());
+            assertEquals("ok", text(response.body()));
+        }
+        try (RawServer continueResponse = new RawServer(
+                "HTTP/1.1 100 Continue\r\n\r\n"
+                        + "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                JdkHttpNodeClient client = client(continueResponse, null)) {
+            assertEquals(200, client.execute(request(continueResponse.uri("http"), 64, Map.of()))
+                    .get(2, TimeUnit.SECONDS).statusCode());
+        }
+        try (RawServer processing = new RawServer(
+                "HTTP/1.1 102 Processing\r\n\r\n"
+                        + "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                JdkHttpNodeClient client = client(processing, null)) {
+            assertEquals(200, client.execute(request(processing.uri("http"), 64, Map.of()))
+                    .get(2, TimeUnit.SECONDS).statusCode());
+        }
+
+        String interim = "HTTP/1.1 103 Early Hints\r\n\r\n";
+        assertFailure(interim.repeat(9)
+                        + "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                64, HttpNodeClient.FailureKind.INVALID_RESPONSE);
+        assertFailure("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
+                        + "Upgrade: websocket\r\n\r\n",
+                64, HttpNodeClient.FailureKind.INVALID_RESPONSE);
+        String largeInterimHeader = "X-Fill: " + "a".repeat(33_000) + "\r\n";
+        assertFailure("HTTP/1.1 103 Early Hints\r\n" + largeInterimHeader + "\r\n"
+                        + "HTTP/1.1 103 Early Hints\r\n" + largeInterimHeader + "\r\n"
+                        + "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                64, HttpNodeClient.FailureKind.INVALID_RESPONSE);
     }
 
     @Test

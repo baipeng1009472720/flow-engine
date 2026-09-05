@@ -48,6 +48,13 @@ public interface HttpTargetPolicy {
                 throw new IllegalArgumentException("approved port is invalid");
             }
         }
+
+        /** Redacts the URI, DNS answers and any query-carried user data. */
+        @Override
+        public String toString() {
+            return "ApprovedTarget[uri=<redacted>, addressCount=" + addresses.size()
+                    + ", port=" + port + "]";
+        }
     }
 
     /** Stable pre-send policy outcome used by the transport failure mapper. */

@@ -200,6 +200,8 @@ public final class DefaultHttpTargetPolicy implements HttpTargetPolicy {
         }
         int first = bytes[0] & 0xff;
         int second = bytes[1] & 0xff;
+        // The conservative 2001::/23 denial also contains benchmark 2001:2::/48 and both
+        // ORCHID prefixes (2001:10::/28 and 2001:20::/28); do not punch holes into special-use space.
         if ((first & 0xe0) != 0x20
                 || first == 0x20 && second == 0x01 && (bytes[2] & 0xfe) == 0
                 || first == 0x20 && second == 0x01
