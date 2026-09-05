@@ -1,9 +1,7 @@
 package com.playrewards.flowengine.core.node;
 
 import com.playrewards.flowengine.contract.execution.ContentChunk;
-import com.playrewards.flowengine.contract.json.JsonValues;
 
-import java.util.Collections;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -36,9 +34,7 @@ public final class ContentDrain implements Flow.Subscriber<ContentChunk>, AutoCl
             if (++chunks > 4096)
                 throw new NodeExecutionException(
                         "CONTENT_LIMIT_EXCEEDED", "content limit exceeded");
-            JsonValues.measureJsonResources(
-                    Collections.singletonList(chunk.payload()),
-                    new JsonValues.JsonResourceLimits(16384, 8192, 16, 1024));
+            chunk.validateResourceLimits();
             sink.accept(chunk);
         } catch (RuntimeException failure) {
             onError(failure);

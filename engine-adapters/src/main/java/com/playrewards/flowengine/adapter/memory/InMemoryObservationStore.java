@@ -66,6 +66,22 @@ public final class InMemoryObservationStore implements ExecutionRecordStore, Pay
         executions.put(value.executionId(), value);
     }
 
+    /** 所有拒绝条件均在修改前校验，同一监视器保护查询及终态的原子可见性。 */
+    @Override
+    public synchronized void commitTerminal(ExecutionRecord record, ExecutionEvent event) {
+        required(record.executionId());
+        if (record.finishedAt() == null
+                || !record.executionId().equals(event.executionId())
+                || record.status() != event.status())
+            throw new IllegalArgumentException("TERMINAL_RECORD_INVALID");
+        bounded(event.attributes(), limits.maxEventBytes());
+        var rows = events.getOrDefault(record.executionId(), List.of());
+        if (!rows.isEmpty() && rows.getLast().sequence() >= event.sequence())
+            throw new IllegalStateException("EVENT_ORDER_INVALID");
+        append(event);
+        executions.put(record.executionId(), record);
+    }
+
     @Override
     public synchronized Optional<ExecutionRecord> execution(String id) {
         expire();
@@ -140,6 +156,7 @@ public final class InMemoryObservationStore implements ExecutionRecordStore, Pay
 
     @Override
     public synchronized void appendContent(String id, ContentChunk chunk) {
+        chunk.validateResourceLimits();
         required(chunk.executionId());
         var node = nodes.get(id);
         if (node == null || !node.executionId().equals(chunk.executionId()))

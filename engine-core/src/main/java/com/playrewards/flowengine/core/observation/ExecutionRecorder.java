@@ -46,6 +46,8 @@ public final class ExecutionRecorder {
      */
     public synchronized void created(
             String id, ExecutionPlan plan, ExecutionRequest request, String parent) {
+        if (active.containsKey(id) || store.execution(id).isPresent())
+            throw new IllegalStateException("OBSERVATION_EXECUTION_ALREADY_EXISTS");
         String root = parent == null ? id : required(parent).record.rootExecutionId();
         var record =
                 new ExecutionRecord(
@@ -63,22 +65,31 @@ public final class ExecutionRecorder {
                         null,
                         null,
                         -1);
-        store.saveExecution(record);
         active.put(id, new Run(record));
-        emit(id, null, "CREATED", ExecutionStatus.CREATED, Map.of());
-        if (parent != null)
-            emit(
-                    parent,
-                    null,
-                    "CHILD_CREATED",
-                    ExecutionStatus.RUNNING,
-                    Map.of(
-                            "childExecutionId",
-                            id,
-                            "rootExecutionId",
-                            root,
-                            "flowId",
-                            plan.flowIdentity().flowId()));
+        try {
+            store.saveExecution(record);
+            emit(id, null, "CREATED", ExecutionStatus.CREATED, Map.of());
+            if (parent != null)
+                emit(
+                        parent,
+                        null,
+                        "CHILD_CREATED",
+                        ExecutionStatus.RUNNING,
+                        Map.of(
+                                "childExecutionId",
+                                id,
+                                "rootExecutionId",
+                                root,
+                                "flowId",
+                                plan.flowIdentity().flowId()));
+        } catch (RuntimeException failure) {
+            try {
+                failClosed(required(id), null);
+            } finally {
+                active.remove(id);
+            }
+            throw failure;
+        }
     }
 
     /** Records controller admission independently of the first node's queue and permit wait. */
@@ -101,67 +112,220 @@ public final class ExecutionRecorder {
      */
     public synchronized ExecutionResult finished(ExecutionResult result) {
         Run run = active.get(result.executionId());
-        if (run == null) return result;
-        String errorId = result.errorCode() == null ? null : run.errorId;
-        if (result.errorCode() != null && errorId == null) errorId = UUID.randomUUID().toString();
-        if (errorId != null
-                && run.record.parentExecutionId() != null
-                && active.containsKey(run.record.parentExecutionId()))
-            required(run.record.parentExecutionId()).errorId = errorId;
-        var value =
-                new ExecutionResult(
-                        result.executionId(),
-                        result.status(),
-                        result.result(),
-                        result.errorCode(),
-                        result.errorCode() == null
-                                ? null
-                                : "execution did not complete successfully",
-                        errorId,
-                        result.startedAt(),
-                        result.finishedAt());
-        String payload = savePayload(result.executionId(), result.result());
-        var r = run.record;
-        run.record =
-                new ExecutionRecord(
-                        r.executionId(),
-                        r.rootExecutionId(),
-                        r.parentExecutionId(),
-                        r.flowIdentity(),
-                        r.bundleHash(),
-                        r.mode(),
-                        r.purpose(),
-                        result.status(),
-                        r.startedAt(),
-                        result.finishedAt(),
-                        payload,
-                        errorId,
-                        result.errorCode(),
-                        r.eventCursor());
-        emit(
-                result.executionId(),
-                null,
-                switch (result.status()) {
-                    case SUCCEEDED -> "COMPLETED";
-                    case CANCELLED -> "CANCELLED";
-                    case WAITING_MANUAL -> "WAITING";
-                    default -> "FAILED";
-                },
-                result.status(),
-                errorId == null
-                        ? Map.of()
-                        : Map.of("errorId", errorId, "code", result.errorCode()));
+        if (run == null) {
+            var terminal =
+                    store.execution(result.executionId()).filter(r -> r.finishedAt() != null);
+            if (terminal.isEmpty())
+                throw new IllegalStateException("OBSERVATION_EXECUTION_NOT_ACTIVE");
+            var record = terminal.get();
+            return new ExecutionResult(
+                    record.executionId(),
+                    record.status(),
+                    record.status() == ExecutionStatus.SUCCEEDED
+                                    && record.resultPayloadRef() != null
+                            ? payloads.find(new PayloadReference(record.resultPayloadRef()))
+                                    .orElse(null)
+                            : null,
+                    record.errorCode(),
+                    record.errorCode() == null ? null : "execution did not complete successfully",
+                    record.errorId(),
+                    record.startedAt(),
+                    record.finishedAt());
+        }
         try {
-            store.flush(result.executionId());
+            if (strictAudit && run.auditFailed)
+                throw new IllegalStateException("OBSERVATION_AUDIT_FAILED");
+            String errorId = result.errorCode() == null ? null : result.errorId();
+            if (result.errorCode() != null && errorId == null)
+                errorId = UUID.randomUUID().toString();
+            var value =
+                    new ExecutionResult(
+                            result.executionId(),
+                            result.status(),
+                            result.result(),
+                            result.errorCode(),
+                            result.errorCode() == null
+                                    ? null
+                                    : "execution did not complete successfully",
+                            errorId,
+                            result.startedAt(),
+                            result.finishedAt());
+            String payload = savePayload(result.executionId(), result.result());
+            var r = run.record;
+            run.record =
+                    new ExecutionRecord(
+                            r.executionId(),
+                            r.rootExecutionId(),
+                            r.parentExecutionId(),
+                            r.flowIdentity(),
+                            r.bundleHash(),
+                            r.mode(),
+                            r.purpose(),
+                            result.status(),
+                            r.startedAt(),
+                            result.finishedAt(),
+                            payload,
+                            errorId,
+                            result.errorCode(),
+                            r.eventCursor());
+            try {
+                store.flush(result.executionId());
+            } catch (RuntimeException failure) {
+                warn(failure);
+            }
+            var terminal =
+                    new ExecutionEvent(
+                            result.executionId() + ":" + (++run.sequence),
+                            result.executionId(),
+                            switch (result.status()) {
+                                case SUCCEEDED -> "COMPLETED";
+                                case CANCELLED -> "CANCELLED";
+                                case WAITING_MANUAL -> "WAITING";
+                                default -> "FAILED";
+                            },
+                            result.status(),
+                            null,
+                            null,
+                            null,
+                            0,
+                            run.sequence,
+                            clock.instant(),
+                            errorId == null
+                                    ? Map.of()
+                                    : Map.of("errorId", errorId, "code", result.errorCode()));
+            run.record = terminalRecord(run.record, value, payload, run.sequence);
+            synchronized (bus) {
+                store.commitTerminal(run.record, terminal);
+                bus.deliverCommitted(terminal);
+            }
+            forwardCommitted(run.record, terminal);
+            return value;
+        } catch (RuntimeException failure) {
+            return failClosed(run, result);
         } finally {
             active.remove(result.executionId());
         }
-        return value;
+    }
+
+    private ExecutionRecord terminalRecord(
+            ExecutionRecord record, ExecutionResult result, String payload, long cursor) {
+        return new ExecutionRecord(
+                record.executionId(),
+                record.rootExecutionId(),
+                record.parentExecutionId(),
+                record.flowIdentity(),
+                record.bundleHash(),
+                record.mode(),
+                record.purpose(),
+                result.status(),
+                record.startedAt(),
+                result.finishedAt(),
+                payload,
+                result.errorId(),
+                result.errorCode(),
+                cursor);
+    }
+
+    /** 补偿记录带 finishedAt，可被宿主保留策略回收；清理不依赖补偿写入是否成功。 */
+    private ExecutionResult failClosed(Run run, ExecutionResult selected) {
+        boolean preserveFailure = selected != null && selected.errorCode() != null;
+        var result =
+                new ExecutionResult(
+                        run.record.executionId(),
+                        preserveFailure ? selected.status() : ExecutionStatus.FAILED,
+                        null,
+                        preserveFailure ? selected.errorCode() : "OBSERVATION_AUDIT_FAILED",
+                        "critical observation could not be committed",
+                        preserveFailure && selected.errorId() != null
+                                ? selected.errorId()
+                                : UUID.randomUUID().toString(),
+                        run.record.startedAt(),
+                        clock.instant());
+        var record = terminalRecord(run.record, result, null, ++run.sequence);
+        var event =
+                new ExecutionEvent(
+                        record.executionId() + ":" + run.sequence,
+                        record.executionId(),
+                        "FAILED",
+                        result.status(),
+                        null,
+                        null,
+                        null,
+                        0,
+                        run.sequence,
+                        clock.instant(),
+                        Map.of("errorId", result.errorId(), "code", result.errorCode()));
+        try {
+            synchronized (bus) {
+                store.commitTerminal(record, event);
+                bus.deliverCommitted(event);
+            }
+            forwardCommitted(record, event);
+        } catch (RuntimeException unavailable) {
+            try {
+                synchronized (bus) {
+                    store.saveExecution(record);
+                    bus.publish(event);
+                }
+                forwardCommitted(record, event);
+            } catch (RuntimeException ignored) {
+                warnings.incrementAndGet();
+            }
+        }
+        return result;
+    }
+
+    /** 子终态已提交后不可回滚；转发失败只污染父观察边界，不修改已提交的子结果。 */
+    private void forwardCommitted(ExecutionRecord record, ExecutionEvent event) {
+        try {
+            forward(
+                    record,
+                    null,
+                    event.eventType(),
+                    event.status(),
+                    event.sequence(),
+                    event.attributes());
+        } catch (RuntimeException failure) {
+            warnings.incrementAndGet();
+            Run parent = active.get(record.parentExecutionId());
+            if (parent != null) parent.auditFailed = true;
+        }
     }
 
     /** Returns a monotonic, payload-free count suitable for a host monitoring gauge. */
     public long warningCount() {
         return warnings.get();
+    }
+
+    /** 将调度器实际仲裁的根因绑定到结果，不按错误码或观察到达先后猜测失败节点。 */
+    public synchronized ExecutionResult identify(ExecutionResult result, Object cause) {
+        if (result.errorCode() == null || cause == null) return result;
+        return new ExecutionResult(
+                result.executionId(),
+                result.status(),
+                result.result(),
+                result.errorCode(),
+                result.errorMessage(),
+                errorIdentity(result.executionId(), cause),
+                result.startedAt(),
+                result.finishedAt());
+    }
+
+    private String errorIdentity(String executionId, Object cause) {
+        Run run = required(executionId);
+        Run root = active.getOrDefault(run.record.rootExecutionId(), run);
+        return root.causes.computeIfAbsent(cause, ignored -> UUID.randomUUID().toString());
+    }
+
+    /** 子 END 转为调用节点异常时显式保留根因，不能因新异常对象而断开错误关联。 */
+    public synchronized void inheritCause(String executionId, Object original, Object propagated) {
+        var run = required(executionId);
+        var root = active.getOrDefault(run.record.rootExecutionId(), run);
+        root.causes.put(
+                propagated,
+                original instanceof ExecutionResult result && result.errorId() != null
+                        ? result.errorId()
+                        : errorIdentity(executionId, original));
     }
 
     private Run required(String id) {
@@ -211,16 +375,34 @@ public final class ExecutionRecorder {
                         r.errorCode(),
                         sequence);
         store.saveExecution(run.record);
+        forward(r, node, type, status, sequence, attrs);
+    }
+
+    private void forward(
+            ExecutionRecord r,
+            NodeExecutionRecord node,
+            String type,
+            ExecutionStatus status,
+            long sequence,
+            Map<String, Object> attrs) {
+        String id = r.executionId();
         // Forward child observations using the parent's cursor without falsifying child identity or
         // status.
         // Nested children remain discoverable in one root stream while retaining their own event
         // tables.
         if (r.parentExecutionId() != null && active.containsKey(r.parentExecutionId())) {
             Map<String, Object> forwarded = new LinkedHashMap<>(attrs);
-            forwarded.put("childExecutionId", id);
-            forwarded.put("childEventId", id + ":" + sequence);
-            forwarded.put("childEventType", type);
-            forwarded.put("childStatus", status.name());
+            forwarded.putIfAbsent("originExecutionId", id);
+            forwarded.putIfAbsent("originEventId", id + ":" + sequence);
+            forwarded.putIfAbsent("originEventType", type);
+            forwarded.putIfAbsent("childExecutionId", id);
+            forwarded.putIfAbsent("childEventId", id + ":" + sequence);
+            forwarded.putIfAbsent("childEventType", type);
+            forwarded.putIfAbsent("childStatus", status.name());
+            var path = new ArrayList<Object>();
+            if (attrs.get("forwardingPath") instanceof List<?> previous) path.addAll(previous);
+            path.add(id);
+            forwarded.put("forwardingPath", path);
             emit(
                     r.parentExecutionId(),
                     node,
@@ -252,7 +434,8 @@ public final class ExecutionRecorder {
     private static final class Run {
         private ExecutionRecord record;
         private long sequence = -1;
-        private String errorId;
+        private final Map<Object, String> causes = new IdentityHashMap<>();
+        private boolean auditFailed;
 
         private Run(ExecutionRecord record) {
             this.record = record;
@@ -344,7 +527,8 @@ public final class ExecutionRecorder {
                             new NodeExecutionException(
                                     result.terminalOutcome().errorCode(),
                                     "END failure",
-                                    result.terminalOutcome().status()));
+                                    result.terminalOutcome().status()),
+                            result.terminalOutcome());
                     return;
                 }
                 transition(
@@ -362,6 +546,10 @@ public final class ExecutionRecorder {
          * Associates a safe error identity with this attempt and the owning execution's root cause.
          */
         public void failed(Throwable failure) {
+            failed(failure, failure);
+        }
+
+        private void failed(Throwable failure, Object cause) {
             synchronized (ExecutionRecorder.this) {
                 if (record.finishedAt() != null) return;
                 boolean cancelled =
@@ -371,14 +559,7 @@ public final class ExecutionRecorder {
                         failure instanceof NodeExecutionException n
                                 ? n.code()
                                 : cancelled ? "EXECUTION_CANCELLED" : "INTERNAL";
-                String id =
-                        active.containsKey(executionId) && required(executionId).errorId != null
-                                ? required(executionId).errorId
-                                : UUID.randomUUID().toString();
-                if (!cancelled
-                        && active.containsKey(executionId)
-                        && required(executionId).errorId == null)
-                    required(executionId).errorId = id;
+                String id = errorIdentity(executionId, cause);
                 transition(
                         cancelled
                                 ? ExecutionStatus.CANCELLED
@@ -389,7 +570,12 @@ public final class ExecutionRecorder {
                         null,
                         id,
                         code);
-                diagnostic("node failed", ExecutionLogLevel.ERROR, id);
+                try {
+                    diagnostic("node failed", ExecutionLogLevel.ERROR, id);
+                } catch (RuntimeException auditFailure) {
+                    // 原始失败已经确定；诊断异常不能将调度器的仲裁根因替换为日志故障。
+                    required(executionId).auditFailed = true;
+                }
             }
         }
 
@@ -408,6 +594,7 @@ public final class ExecutionRecorder {
          * Rebinds producer identity and stores content separately from its replayable reference.
          */
         public void content(ContentChunk incoming) {
+            incoming.validateResourceLimits();
             synchronized (ExecutionRecorder.this) {
                 if (record.finishedAt() != null || !active.containsKey(executionId)) return;
                 var chunk =

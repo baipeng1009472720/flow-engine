@@ -226,6 +226,7 @@ public final class ExecutionService {
      * including child flows.
      */
     public ExecutionEvent streamEvent(String tenant, ExecutionEvent event) {
+        if (!eventVisible(tenant, event)) return null;
         Object rawReference = event.attributes().get("contentPayloadRef");
         if (!(rawReference instanceof String reference)) return event;
         var ref = new PayloadReference(reference);
@@ -250,6 +251,28 @@ public final class ExecutionService {
                 event.sequence(),
                 event.occurredAt(),
                 attributes);
+    }
+
+    /** 转发不授予子流程权限；真实来源与每层转发路径均须单独 READ 授权。 */
+    public boolean eventVisible(String tenant, ExecutionEvent event) {
+        Set<String> owners = new HashSet<>();
+        owners.add(event.executionId());
+        for (String key : List.of("originExecutionId", "childExecutionId")) {
+            if (event.attributes().get(key) instanceof String id) owners.add(id);
+        }
+        if (event.attributes().get("forwardingPath") instanceof List<?> path) {
+            for (Object id : path) if (id instanceof String value) owners.add(value);
+        }
+        try {
+            for (String id : owners) {
+                var owner = store.execution(id);
+                if (owner.isEmpty()) return false;
+                authorize(tenant, owner.get().flowIdentity(), Action.READ);
+            }
+            return true;
+        } catch (SecurityException denied) {
+            return false;
+        }
     }
 
     public Map<String, Object> cancel(HttpServletRequest http, String id) {
@@ -340,11 +363,16 @@ public final class ExecutionService {
      * payload permission.
      */
     public ExecutionRecord waitFor(Started started) throws Exception {
-        started.handle()
-                .completion()
-                .toCompletableFuture()
-                .get(maxDuration.toMillis() + 5000, TimeUnit.MILLISECONDS);
-        return store.execution(started.handle().executionId()).orElseThrow();
+        var completed =
+                started.handle()
+                        .completion()
+                        .toCompletableFuture()
+                        .get(maxDuration.toMillis() + 5000, TimeUnit.MILLISECONDS);
+        var record = store.execution(started.handle().executionId()).orElseThrow();
+        if (record.status() != completed.status()
+                || !Objects.equals(record.errorId(), completed.errorId()))
+            throw new IllegalStateException("OBSERVATION_RESULT_UNAVAILABLE");
+        return record;
     }
 
     public record Started(ExecutionHandle handle, String responseMode) {}

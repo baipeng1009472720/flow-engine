@@ -31,6 +31,340 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 class ExecutionRecorderTest {
     @Test
+    void error_log_failure_does_not_replace_the_already_observed_business_cause() {
+        var store = new InMemoryObservationStore();
+        var records = faultStore(store, "appendLog");
+        var recorder =
+                new ExecutionRecorder(
+                        records,
+                        store,
+                        new BoundedExecutionEventBus(records, 2, 32),
+                        Clock.systemUTC(),
+                        true);
+        var plan = new FlowCompiler().compile(ExecutionRequestContractTest.bundle());
+        recorder.created(
+                "business-first",
+                plan,
+                new ExecutionRequest(
+                        "test:flow",
+                        ExecutionMode.EPHEMERAL,
+                        ExecutionPurpose.TRIAL,
+                        Map.of(),
+                        Map.of(),
+                        null,
+                        "key",
+                        "tenant",
+                        Instant.now().plusSeconds(5),
+                        Map.of()),
+                null);
+        var attempt =
+                recorder.queued("business-first", plan.nodesById().get("start"), ScopePath.root());
+        var failure = new NodeExecutionException("BUSINESS_REJECTED", "private");
+        assertDoesNotThrow(() -> attempt.failed(failure));
+        var result =
+                recorder.finished(
+                        recorder.identify(
+                                new ExecutionResult(
+                                        "business-first",
+                                        ExecutionStatus.FAILED,
+                                        null,
+                                        "BUSINESS_REJECTED",
+                                        "safe",
+                                        null,
+                                        Instant.now(),
+                                        Instant.now()),
+                                failure));
+        assertEquals("BUSINESS_REJECTED", result.errorCode());
+        assertEquals(store.nodes("business-first").getFirst().errorId(), result.errorId());
+    }
+
+    @Test
+    void repeated_failed_admissions_are_reclaimed_under_a_one_execution_budget() {
+        var now = new java.util.concurrent.atomic.AtomicReference<>(Instant.now());
+        Clock clock =
+                new Clock() {
+                    public ZoneId getZone() {
+                        return ZoneOffset.UTC;
+                    }
+
+                    public Clock withZone(ZoneId zone) {
+                        return this;
+                    }
+
+                    public Instant instant() {
+                        return now.get();
+                    }
+                };
+        var store = new InMemoryObservationStore(1, 32, Duration.ofSeconds(1), clock);
+        var records = faultStore(store, "append");
+        var recorder =
+                new ExecutionRecorder(
+                        records, store, new BoundedExecutionEventBus(records, 2, 16), clock, true);
+        var plan = new FlowCompiler().compile(ExecutionRequestContractTest.bundle());
+        for (int index = 0; index < 4; index++) {
+            String id = "failed-admission-" + index;
+            assertThrows(
+                    IllegalStateException.class,
+                    () ->
+                            recorder.created(
+                                    id,
+                                    plan,
+                                    new ExecutionRequest(
+                                            "test:flow",
+                                            ExecutionMode.EPHEMERAL,
+                                            ExecutionPurpose.TRIAL,
+                                            Map.of(),
+                                            Map.of(),
+                                            null,
+                                            id,
+                                            "tenant",
+                                            now.get().plusSeconds(5),
+                                            Map.of()),
+                                    null));
+            assertNotNull(store.execution(id).orElseThrow().finishedAt());
+            now.set(now.get().plusSeconds(2));
+            assertTrue(store.execution(id).isEmpty());
+        }
+    }
+
+    @Test
+    void oversized_content_metadata_is_rejected_before_drain_or_store_side_effects() {
+        var chunk = new ContentChunk("content-size", "start", "root", 0, "x".repeat(70000), null);
+        var accepted = new AtomicInteger();
+        var cancelled = new AtomicInteger();
+        try (var drain = new ContentDrain(ignored -> accepted.incrementAndGet())) {
+            drain.onSubscribe(
+                    new Flow.Subscription() {
+                        public void request(long count) {}
+
+                        public void cancel() {
+                            cancelled.incrementAndGet();
+                        }
+                    });
+            drain.onNext(chunk);
+            assertEquals(0, accepted.get());
+            assertEquals(1, cancelled.get());
+        }
+        var store = new InMemoryObservationStore();
+        var plan = new FlowCompiler().compile(ExecutionRequestContractTest.bundle());
+        var recorder =
+                new ExecutionRecorder(
+                        store,
+                        store,
+                        new BoundedExecutionEventBus(store, 2, 16),
+                        Clock.systemUTC(),
+                        true);
+        recorder.created(
+                "content-size",
+                plan,
+                new ExecutionRequest(
+                        "test:flow",
+                        ExecutionMode.EPHEMERAL,
+                        ExecutionPurpose.TRIAL,
+                        Map.of(),
+                        Map.of(),
+                        null,
+                        "key",
+                        "tenant",
+                        Instant.now().plusSeconds(5),
+                        Map.of()),
+                null);
+        recorder.queued("content-size", plan.nodesById().get("start"), ScopePath.root());
+        String node = store.nodes("content-size").getFirst().nodeExecutionId();
+        assertThrows(IllegalArgumentException.class, () -> store.appendContent(node, chunk));
+        assertTrue(store.content(node).isEmpty());
+    }
+
+    @Test
+    void failed_created_append_and_terminal_payload_do_not_leave_active_or_unfinished_rows()
+            throws Exception {
+        for (String fault : List.of("append", "payload")) {
+            var store = new InMemoryObservationStore();
+            ExecutionRecordStore records = faultStore(store, fault);
+            PayloadStore payloads =
+                    fault.equals("payload")
+                            ? new PayloadStore() {
+                                public PayloadReference store(String id, Object value) {
+                                    throw new IllegalStateException("private");
+                                }
+
+                                public Optional<Object> find(PayloadReference ref) {
+                                    return Optional.empty();
+                                }
+                            }
+                            : store;
+            var recorder =
+                    new ExecutionRecorder(
+                            records,
+                            payloads,
+                            new BoundedExecutionEventBus(records, 2, 32),
+                            Clock.systemUTC(),
+                            true);
+            var plan = new FlowCompiler().compile(ExecutionRequestContractTest.bundle());
+            var request =
+                    new ExecutionRequest(
+                            "test:flow",
+                            ExecutionMode.EPHEMERAL,
+                            ExecutionPurpose.TRIAL,
+                            Map.of(),
+                            Map.of(),
+                            null,
+                            "key",
+                            "tenant",
+                            Instant.now().plusSeconds(5),
+                            Map.of());
+            try {
+                recorder.created(fault, plan, request, null);
+                recorder.finished(
+                        new ExecutionResult(
+                                fault,
+                                ExecutionStatus.SUCCEEDED,
+                                "value",
+                                null,
+                                null,
+                                null,
+                                Instant.now(),
+                                Instant.now()));
+            } catch (IllegalStateException expected) {
+            }
+            var active = ExecutionRecorder.class.getDeclaredField("active");
+            active.setAccessible(true);
+            assertTrue(((Map<?, ?>) active.get(recorder)).isEmpty(), fault);
+            assertNotNull(store.execution(fault).orElseThrow().finishedAt(), fault);
+            assertEquals(ExecutionStatus.FAILED, store.execution(fault).orElseThrow().status());
+        }
+    }
+
+    @Test
+    void strict_flush_failure_never_exposes_success_terminal() throws Exception {
+        var store = new InMemoryObservationStore();
+        var records = faultStore(store, "flush");
+        var recorder =
+                new ExecutionRecorder(
+                        records,
+                        store,
+                        new BoundedExecutionEventBus(records, 2, 64),
+                        Clock.systemUTC(),
+                        true);
+        try (var scheduler =
+                new DagScheduler(
+                        NodeExecutorRegistry.builtIns(),
+                        ConcurrencyGovernor.defaults(),
+                        Clock.systemUTC(),
+                        recorder)) {
+            var result =
+                    scheduler
+                            .schedule(
+                                    new FlowCompiler()
+                                            .compile(ExecutionRequestContractTest.bundle()),
+                                    new ExecutionRequest(
+                                            "test:flow",
+                                            ExecutionMode.EPHEMERAL,
+                                            ExecutionPurpose.TRIAL,
+                                            Map.of(),
+                                            Map.of(),
+                                            null,
+                                            "key",
+                                            "tenant",
+                                            Instant.now().plusSeconds(5),
+                                            Map.of()))
+                            .completion()
+                            .toCompletableFuture()
+                            .get(5, TimeUnit.SECONDS);
+            assertEquals(ExecutionStatus.FAILED, result.status());
+            assertEquals(
+                    result.status(), store.execution(result.executionId()).orElseThrow().status());
+            assertEquals("OBSERVATION_AUDIT_FAILED", result.errorCode());
+            assertTrue(
+                    store.readAfter(result.executionId(), -1).stream()
+                            .noneMatch(e -> e.eventType().equals("COMPLETED")));
+        }
+    }
+
+    private ExecutionRecordStore faultStore(InMemoryObservationStore store, String fault) {
+        return (ExecutionRecordStore)
+                java.lang.reflect.Proxy.newProxyInstance(
+                        getClass().getClassLoader(),
+                        new Class<?>[] {ExecutionRecordStore.class},
+                        (proxy, method, args) -> {
+                            if (method.getName().equals(fault))
+                                throw new IllegalStateException("private");
+                            try {
+                                return method.invoke(store, args);
+                            } catch (java.lang.reflect.InvocationTargetException failure) {
+                                throw failure.getCause();
+                            }
+                        });
+    }
+
+    @Test
+    void independent_same_code_failures_keep_distinct_identity_and_selected_cause_wins() {
+        var store = new InMemoryObservationStore();
+        var recorder =
+                new ExecutionRecorder(
+                        store,
+                        store,
+                        new BoundedExecutionEventBus(store, 2, 32),
+                        Clock.systemUTC(),
+                        true);
+        var plan = new FlowCompiler().compile(ExecutionRequestContractTest.bundle());
+        var request =
+                new ExecutionRequest(
+                        "test:flow",
+                        ExecutionMode.EPHEMERAL,
+                        ExecutionPurpose.TRIAL,
+                        Map.of(),
+                        Map.of(),
+                        null,
+                        "key",
+                        "tenant",
+                        Instant.now().plusSeconds(5),
+                        Map.of());
+        recorder.created("two-causes", plan, request, null);
+        var first = recorder.queued("two-causes", plan.nodesById().get("start"), ScopePath.root());
+        var second =
+                recorder.queued(
+                        "two-causes",
+                        plan.nodesById().get("start"),
+                        ScopePath.root().child("branch-2"));
+        var earlier = new NodeExecutionException("SAME_CODE", "private earlier");
+        var winner = new NodeExecutionException("SAME_CODE", "private winner");
+        first.failed(earlier);
+        second.failed(winner);
+        var nodes = store.nodes("two-causes");
+        assertNotEquals(nodes.get(0).errorId(), nodes.get(1).errorId());
+        assertNotEquals(nodes.get(0).scopePath(), nodes.get(1).scopePath());
+        var selected =
+                recorder.identify(
+                        new ExecutionResult(
+                                "two-causes",
+                                ExecutionStatus.FAILED,
+                                null,
+                                "SAME_CODE",
+                                "safe",
+                                null,
+                                Instant.now(),
+                                Instant.now()),
+                        winner);
+        var completed = recorder.finished(selected);
+        assertEquals(nodes.get(1).errorId(), completed.errorId());
+        assertEquals(completed.errorId(), store.execution("two-causes").orElseThrow().errorId());
+        var repeated =
+                recorder.finished(
+                        new ExecutionResult(
+                                "two-causes",
+                                ExecutionStatus.SUCCEEDED,
+                                null,
+                                null,
+                                null,
+                                null,
+                                Instant.now(),
+                                Instant.now()));
+        assertEquals(completed.status(), repeated.status(), "terminal reentry must be stable");
+        assertEquals(completed.errorId(), repeated.errorId());
+    }
+
+    @Test
     void observation_admission_failure_does_not_leak_the_acquired_node_permit() throws Exception {
         var store = new InMemoryObservationStore();
         ExecutionRecordStore rejecting =
@@ -86,7 +420,7 @@ class ExecutionRecorderTest {
                     before,
                     permits.availablePermits(),
                     "observation capacity rejection must release the already acquired submission"
-                        + " permit");
+                            + " permit");
         }
     }
 

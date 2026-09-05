@@ -35,7 +35,9 @@ public class ExecutionSseController implements AutoCloseable {
         this.bus = bus;
     }
 
-    /** Creates a new execution once; reconnect cursors are rejected on this side-effecting route. */
+    /**
+     * Creates a new execution once; reconnect cursors are rejected on this side-effecting route.
+     */
     @PostMapping(value = "/v1/executions/stream", produces = "text/event-stream")
     public SseEmitter start(HttpServletRequest request) throws Exception {
         if (request.getHeader("Last-Event-ID") != null)
@@ -44,7 +46,9 @@ public class ExecutionSseController implements AutoCloseable {
         return stream(request, started.handle().executionId());
     }
 
-    /** Attaches replay and live delivery to an authorized existing execution without restarting it. */
+    /**
+     * Attaches replay and live delivery to an authorized existing execution without restarting it.
+     */
     @GetMapping(value = "/v1/executions/{id}/stream", produces = "text/event-stream")
     public SseEmitter stream(HttpServletRequest request, @PathVariable("id") String id) {
         service.execution(request, id, Action.READ);
@@ -69,14 +73,13 @@ public class ExecutionSseController implements AutoCloseable {
                                     emitter.send(SseEmitter.event().comment("keepalive"));
                                     continue;
                                 }
+                                var visible = service.streamEvent(tenant, event);
+                                if (visible == null) continue;
                                 emitter.send(
                                         SseEmitter.event()
                                                 .id(event.eventId())
                                                 .name(event.eventType())
-                                                .data(
-                                                        JSON.toJSONString(
-                                                                service.streamEvent(
-                                                                        tenant, event))));
+                                                .data(JSON.toJSONString(visible)));
                                 if (event.nodeId() == null
                                         && java.util.Set.of(
                                                         "COMPLETED",
@@ -99,7 +102,10 @@ public class ExecutionSseController implements AutoCloseable {
         return emitter;
     }
 
-    /** Stops network work during host shutdown; execution cleanup is independently owned by FlowEngine. */
+    /**
+     * Stops network work during host shutdown; execution cleanup is independently owned by
+     * FlowEngine.
+     */
     @Override
     public void close() {
         senders.shutdownNow();

@@ -322,7 +322,7 @@ public final class DagScheduler implements AutoCloseable {
                     executionId, plan, request, context, cancellation, registration,
                     runningNodes, structuralState);
             return result(executionId, outcome.status(), outcome.result(), outcome.errorCode(),
-                    outcome.errorMessage(), startedAt);
+                    outcome.errorMessage(), startedAt, outcome);
         } catch (ExecutionDeadlineExceededException exception) {
             lifecycleObserver.beforeControllerReasonSelection(CancellationHandle.Reason.DEADLINE);
             registration.selectReason(CancellationHandle.Reason.DEADLINE);
@@ -347,12 +347,12 @@ public final class DagScheduler implements AutoCloseable {
             lifecycleObserver.beforeControllerReasonSelection(CancellationHandle.Reason.FAILURE);
             registration.selectReason(CancellationHandle.Reason.FAILURE);
             return result(executionId, exception.terminalStatus(), null,
-                    exception.code(), exception.getMessage(), startedAt);
+                    exception.code(), exception.getMessage(), startedAt, exception);
         } catch (RuntimeException exception) {
             lifecycleObserver.beforeControllerReasonSelection(CancellationHandle.Reason.FAILURE);
             registration.selectReason(CancellationHandle.Reason.FAILURE);
             return result(executionId, ExecutionStatus.FAILED, null, "NODE_EXECUTION_FAILED",
-                    "node execution failed", startedAt);
+                    "node execution failed", startedAt, exception);
         }
     }
 
@@ -856,6 +856,7 @@ public final class DagScheduler implements AutoCloseable {
                 .map(Map.Entry::getKey).collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
         CancellationHandle childCancellation = cancellation.linkedChild();
         RegionOutcome child;
+        ExecutionResult observedChild = null;
         Instant childStartedAt = clock.instant();
         if (recorder != null) {
             recorder.created(childId, childPlan, childRequest, executionId);
@@ -867,25 +868,33 @@ public final class DagScheduler implements AutoCloseable {
                     null, subFlowDepth + 1, true);
             if (recorder != null) {
                 var terminal = child.terminalOutcome();
-                recorder.finished(result(childId, terminal == null ? ExecutionStatus.FAILED : terminal.status(),
+                observedChild = recorder.finished(result(childId, terminal == null ? ExecutionStatus.FAILED : terminal.status(),
                         terminal == null ? null : terminal.result(), terminal == null ? "SUB_FLOW_TERMINATED_WITHOUT_END" : terminal.errorCode(),
-                        terminal != null && terminal.status() == ExecutionStatus.SUCCEEDED ? null : "sub-flow failed", childStartedAt));
+                        terminal != null && terminal.status() == ExecutionStatus.SUCCEEDED ? null : "sub-flow failed", childStartedAt, terminal));
             }
         } catch (Exception failure) {
             if (recorder != null) recorder.finished(result(childId, ExecutionStatus.FAILED, null,
-                    failure instanceof NodeExecutionException n ? n.code() : "INTERNAL", "sub-flow failed", childStartedAt));
+                    failure instanceof NodeExecutionException n ? n.code() : "INTERNAL", "sub-flow failed", childStartedAt, failure));
             throw failure;
         } finally {
             childCancellation.detachFromParent();
         }
         NodeResult.TerminalOutcome outcome = child.terminalOutcome();
+        // 子终态已经提交并移除活跃身份；在子执行异常处理区之外传播审计降级结果。
+        if (outcome != null && observedChild != null && observedChild.status() != outcome.status()) {
+            var auditFailure = new NodeExecutionException(observedChild.errorCode(), "child audit failed");
+            recorder.inheritCause(executionId, observedChild, auditFailure);
+            throw auditFailure;
+        }
         if (outcome == null) {
             throw new NodeExecutionException("SUB_FLOW_TERMINATED_WITHOUT_END",
                     "child flow completed without reaching END");
         }
         if (outcome.status() != ExecutionStatus.SUCCEEDED) {
-            throw new NodeExecutionException(outcome.errorCode(),
+            var failure = new NodeExecutionException(outcome.errorCode(),
                     outcome.errorMessage() == null ? "child flow failed" : outcome.errorMessage());
+            if (recorder != null) recorder.inheritCause(executionId, outcome, failure);
+            throw failure;
         }
         return subFlow.mapSuccessfulResult(nodeContext, outcome.result());
     }
@@ -1281,6 +1290,12 @@ public final class DagScheduler implements AutoCloseable {
                     "OBSERVATION_AUDIT_FAILED", "critical observation could not be flushed",
                     result.errorId(), result.startedAt(), clock.instant());
         }
+    }
+
+    private ExecutionResult result(String executionId, ExecutionStatus status, Object value,
+            String errorCode, String errorMessage, Instant startedAt, Object cause) {
+        var result = result(executionId, status, value, errorCode, errorMessage, startedAt);
+        return recorder == null ? result : recorder.identify(result, cause);
     }
 
     private static String resourceKey(CompiledNode node) {

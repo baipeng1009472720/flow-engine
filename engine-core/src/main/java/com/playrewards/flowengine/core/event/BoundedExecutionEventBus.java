@@ -26,6 +26,11 @@ public final class BoundedExecutionEventBus {
      */
     public synchronized void publish(ExecutionEvent event) {
         store.append(event);
+        deliverCommitted(event);
+    }
+
+    /** 仅投递已由原子终态事务提交的事件，不再追加重复事件。 */
+    public synchronized void deliverCommitted(ExecutionEvent event) {
         for (var subscription : List.copyOf(subscribers)) {
             if (subscription.executionId.equals(event.executionId())
                     && !subscription.queue.offer(event)) {

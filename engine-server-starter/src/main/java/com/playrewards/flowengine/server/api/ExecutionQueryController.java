@@ -39,7 +39,9 @@ public class ExecutionQueryController {
                         .toList());
     }
 
-    /** Reads a bounded ordered event page; content stays behind independently authorized references. */
+    /**
+     * Reads a bounded ordered event page; content stays behind independently authorized references.
+     */
     @GetMapping(value = "/v1/executions/{id}/events", produces = "application/json")
     public String events(
             HttpServletRequest http,
@@ -47,7 +49,14 @@ public class ExecutionQueryController {
             @RequestParam(value = "afterSequence", defaultValue = "-1") long after,
             @RequestParam(value = "limit", defaultValue = "100") int limit) {
         service.execution(http, id, Action.READ);
-        return JSON.toJSONString(page(service.store().readAfter(id, after), 0, limit));
+        String tenant = service.streamTenant(http);
+        return JSON.toJSONString(
+                page(
+                        service.store().readAfter(id, after).stream()
+                                .filter(event -> service.eventVisible(tenant, event))
+                                .toList(),
+                        0,
+                        limit));
     }
 
     /** Resolves one opaque attempt identity after checking its execution permission. */
