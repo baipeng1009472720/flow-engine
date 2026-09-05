@@ -30,9 +30,18 @@ import java.util.concurrent.atomic.AtomicReference;
 class AuditFailureApiTest {
     @Autowired MockMvc mvc;
     @Autowired Faults faults;
+    @Autowired com.playrewards.flowengine.core.observation.ExecutionRecorder recorder;
 
     @ParameterizedTest
-    @ValueSource(strings = {"flush", "payload", "append", "commitTerminal", "child-flush"})
+    @ValueSource(
+            strings = {
+                "flush",
+                "payload",
+                "append",
+                "commitTerminal",
+                "child-flush",
+                "child-started"
+            })
     void wait_query_replay_and_stream_never_report_success_after_audit_failure(String fault)
             throws Exception {
         faults.operation.set(fault);
@@ -44,7 +53,7 @@ class AuditFailureApiTest {
                                             .contentType("application/json")
                                             .content(
                                                     "{\"flowReference\":\""
-                                                            + (fault.equals("child-flush")
+                                                            + (fault.startsWith("child-")
                                                                     ? "nested:parent"
                                                                     : "test:flow")
                                                             + "\"}"))
@@ -55,6 +64,18 @@ class AuditFailureApiTest {
             var summary = JSON.parseObject(wait);
             String id = summary.getString("executionId");
             assertEquals("FAILED", summary.getString("status"));
+            if (fault.equals("child-started")) {
+                String childId =
+                        faults.memory.readAfter(id, -1).stream()
+                                .filter(e -> e.eventType().equals("CHILD_CREATED"))
+                                .map(e -> (String) e.attributes().get("childExecutionId"))
+                                .findFirst()
+                                .orElseThrow();
+                assertNotNull(faults.memory.execution(childId).orElseThrow().finishedAt());
+                var field = recorder.getClass().getDeclaredField("active");
+                field.setAccessible(true);
+                assertTrue(((Map<?, ?>) field.get(recorder)).isEmpty());
+            }
             if (fault.equals("child-flush")) {
                 assertEquals("OBSERVATION_AUDIT_FAILED", summary.getString("errorCode"));
                 String childId =
@@ -141,6 +162,17 @@ class AuditFailureApiTest {
                             new Class<?>[] {ExecutionRecordStore.class},
                             (proxy, method, args) -> {
                                 String fault = faults.operation.get();
+                                if (fault.equals("child-started")
+                                        && method.getName().equals("append")
+                                        && ((ExecutionEvent) args[0]).eventType().equals("STARTED")
+                                        && faults.memory
+                                                        .execution(
+                                                                ((ExecutionEvent) args[0])
+                                                                        .executionId())
+                                                        .orElseThrow()
+                                                        .parentExecutionId()
+                                                != null)
+                                    throw new IllegalStateException("private child started");
                                 if (fault.equals("child-flush")
                                         && method.getName().equals("flush")
                                         && faults.memory

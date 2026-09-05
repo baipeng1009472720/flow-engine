@@ -453,7 +453,7 @@ public final class DagScheduler implements AutoCloseable {
             } catch (CancellationException exception) {
                 throw exception;
             } catch (ExecutionException exception) {
-                throw propagate(exception.getCause());
+                throw propagateObserved(executionId, exception.getCause());
             }
             if (completed.failure() != null) {
                 boolean rootRegion = isRootRegion(seedScope, boundaryNodeId, subFlowDepth);
@@ -479,7 +479,7 @@ public final class DagScheduler implements AutoCloseable {
                             "structured sibling cleanup did not finish before the deadline"));
                     logStructuredCleanupTimeout(executionId, seedScope);
                 }
-                throw propagate(completed.failure());
+                throw propagateObserved(executionId, completed.failure());
             }
             regionRunning.remove(completedFuture);
             Readiness state = readiness.get(completed.nodeId());
@@ -858,22 +858,27 @@ public final class DagScheduler implements AutoCloseable {
         RegionOutcome child;
         ExecutionResult observedChild = null;
         Instant childStartedAt = clock.instant();
-        if (recorder != null) {
-            recorder.created(childId, childPlan, childRequest, executionId);
-            recorder.started(childId);
-        }
+        boolean childObservationCreated = false;
         try {
+            if (recorder != null) {
+                recorder.created(childId, childPlan, childRequest, executionId);
+                childObservationCreated = true;
+                recorder.started(childId);
+            }
             child = executeRegion(childId, childPlan, childRequest, childContext,
                     childCancellation, allRunningNodes, structuralState, childScope, childStarts,
                     null, subFlowDepth + 1, true);
             if (recorder != null) {
                 var terminal = child.terminalOutcome();
-                observedChild = recorder.finished(result(childId, terminal == null ? ExecutionStatus.FAILED : terminal.status(),
+                var childResult = result(childId, terminal == null ? ExecutionStatus.FAILED : terminal.status(),
                         terminal == null ? null : terminal.result(), terminal == null ? "SUB_FLOW_TERMINATED_WITHOUT_END" : terminal.errorCode(),
-                        terminal != null && terminal.status() == ExecutionStatus.SUCCEEDED ? null : "sub-flow failed", childStartedAt, terminal));
+                        terminal != null && terminal.status() == ExecutionStatus.SUCCEEDED ? null : "sub-flow failed", childStartedAt, terminal);
+                // finished 自身负责 finally 清理，调用后不得在 catch 中再次使用子活跃身份。
+                childObservationCreated = false;
+                observedChild = recorder.finished(childResult);
             }
         } catch (Exception failure) {
-            if (recorder != null) recorder.finished(result(childId, ExecutionStatus.FAILED, null,
+            if (childObservationCreated) recorder.finished(result(childId, ExecutionStatus.FAILED, null,
                     failure instanceof NodeExecutionException n ? n.code() : "INTERNAL", "sub-flow failed", childStartedAt, failure));
             throw failure;
         } finally {
@@ -1314,6 +1319,14 @@ public final class DagScheduler implements AutoCloseable {
             throw error;
         }
         return new RuntimeException(failure);
+    }
+
+    /** 仅将本调度器新建的 checked 包装显式关联到已观察异常，不遍历业务 cause 链。 */
+    private RuntimeException propagateObserved(String executionId, Throwable failure) {
+        RuntimeException propagated = propagate(failure);
+        if (recorder != null && propagated != failure)
+            recorder.inheritCause(executionId, failure, propagated);
+        return propagated;
     }
 
     /**

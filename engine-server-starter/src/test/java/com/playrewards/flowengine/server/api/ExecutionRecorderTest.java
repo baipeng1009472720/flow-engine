@@ -31,6 +31,90 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 class ExecutionRecorderTest {
     @Test
+    void checked_stream_failure_keeps_identity_across_scheduler_wrapper() throws Exception {
+        var store = new InMemoryObservationStore();
+        var recorder =
+                new ExecutionRecorder(
+                        store,
+                        store,
+                        new BoundedExecutionEventBus(store, 2, 64),
+                        Clock.systemUTC(),
+                        true);
+        var subscriptions = new AtomicInteger();
+        NodeExecutor streamingStart =
+                new NodeExecutor() {
+                    public ComponentType supports() {
+                        return ComponentType.START;
+                    }
+
+                    public NodeInvocation execute(NodeExecutionContext context) {
+                        return new NodeInvocation(
+                                CompletableFuture.completedFuture(
+                                        NodeResult.continueWith(Map.of(), Set.of("NEXT"))),
+                                subscriber -> {
+                                    subscriptions.incrementAndGet();
+                                    subscriber.onSubscribe(
+                                            new Flow.Subscription() {
+                                                public void request(long n) {
+                                                    subscriber.onError(
+                                                            new java.io.IOException(
+                                                                    "private stream failure"));
+                                                }
+
+                                                public void cancel() {}
+                                            });
+                                });
+                    }
+                };
+        var registry =
+                new NodeExecutorRegistry(
+                        List.of(
+                                streamingStart,
+                                new com.playrewards.flowengine.core.node.builtin
+                                        .EndNodeExecutor()));
+        try (var engine =
+                new FlowEngine(
+                        registry, ConcurrencyGovernor.defaults(), Clock.systemUTC(), recorder)) {
+            var result =
+                    engine.execute(
+                                    new FlowCompiler()
+                                            .compile(ExecutionRequestContractTest.bundle()),
+                                    new ExecutionRequest(
+                                            "test:flow",
+                                            ExecutionMode.EPHEMERAL,
+                                            ExecutionPurpose.TRIAL,
+                                            Map.of(),
+                                            Map.of(),
+                                            null,
+                                            "key",
+                                            "tenant",
+                                            Instant.now().plusSeconds(5),
+                                            Map.of()))
+                            .completion()
+                            .toCompletableFuture()
+                            .get(5, TimeUnit.SECONDS);
+            assertEquals(1, subscriptions.get());
+            assertEquals(ExecutionStatus.FAILED, result.status());
+            var failed =
+                    store.nodes(result.executionId()).stream()
+                            .filter(node -> node.status() == ExecutionStatus.FAILED)
+                            .findFirst()
+                            .orElseThrow();
+            assertEquals(failed.errorId(), result.errorId());
+            assertTrue(
+                    store.logs(failed.nodeExecutionId()).stream()
+                            .anyMatch(log -> result.errorId().equals(log.errorId())));
+            assertTrue(
+                    store.readAfter(result.executionId(), -1).stream()
+                            .filter(event -> event.eventType().equals("NODE_FAILED"))
+                            .allMatch(
+                                    event ->
+                                            result.errorId()
+                                                    .equals(event.attributes().get("errorId"))));
+        }
+    }
+
+    @Test
     void error_log_failure_does_not_replace_the_already_observed_business_cause() {
         var store = new InMemoryObservationStore();
         var records = faultStore(store, "appendLog");
