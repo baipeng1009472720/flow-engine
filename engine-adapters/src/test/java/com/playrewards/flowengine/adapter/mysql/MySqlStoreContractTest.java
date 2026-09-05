@@ -30,6 +30,36 @@ class MySqlStoreContractTest {
     }
 
     @Test
+    void recoveryBatchExcludesLiveLeasesBeforeApplyingLimit() {
+        String tenant = "recovery-" + UUID.randomUUID();
+        var leases = new MySqlLeaseRepository(db, tenant);
+        var states = new MySqlExecutionStateStore(db, tenant);
+        for (String id : List.of("busy-1", "busy-2", "expired", "missing")) {
+            var lease = leases.acquire(id, "owner", Duration.ofMinutes(5)).orElseThrow();
+            states.save(new ExecutionState(id, 0, ExecutionStatus.RUNNING, Map.of()), 0, lease);
+            if (id.equals("expired")) assertTrue(leases.release(lease));
+        }
+        // Older live executions must not consume the bounded scan; absent leases are eligible too.
+        db.transaction(tx -> {
+            tx.update("UPDATE engine_execution_state SET updated_at='2000-01-01'"
+                    + " WHERE tenant_id=#{args[0]}", tenant);
+            tx.update("UPDATE engine_execution_state SET updated_at='1999-01-01'"
+                    + " WHERE tenant_id=#{args[0]} AND execution_id IN ('busy-1','busy-2')", tenant);
+            tx.update("DELETE FROM engine_lease WHERE tenant_id=#{args[0]}"
+                    + " AND execution_id='missing'", tenant);
+            return null;
+        });
+        // An identically named execution in another tenant must not hide the missing lease.
+        new MySqlLeaseRepository(db, tenant + "-other")
+                .acquire("missing", "other", Duration.ofMinutes(5)).orElseThrow();
+        var candidates = new MySqlTenantStoreRouter(db).recoverable(2);
+        assertEquals(Set.of(
+                new MySqlTenantStoreRouter.RecoveryCandidate(tenant, "expired"),
+                new MySqlTenantStoreRouter.RecoveryCandidate(tenant, "missing")),
+                new HashSet<>(candidates));
+    }
+
+    @Test
     void leasesFenceExpiredOwnersAndCheckpointCompareAndSet() throws Exception {
         String id = UUID.randomUUID().toString();
         var leases = new MySqlLeaseRepository(db, "tenant-a");

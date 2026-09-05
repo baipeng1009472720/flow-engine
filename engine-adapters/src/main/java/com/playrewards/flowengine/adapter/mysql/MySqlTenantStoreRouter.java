@@ -47,6 +47,8 @@ public final class MySqlTenantStoreRouter implements ExecutionRecordStore, Paylo
 
     /**
      * Bounded startup/takeover scan reads only strong state, including previously served tenants.
+     * Live leases are excluded before limiting so long-running owners cannot starve recovery.
+     * Candidates still acquire a fenced lease after scanning; this query does not grant ownership.
      */
     public List<RecoveryCandidate> recoverable(int limit) {
         if (limit < 1 || limit > 1000)
@@ -55,10 +57,14 @@ public final class MySqlTenantStoreRouter implements ExecutionRecordStore, Paylo
                 tx ->
                         tx
                                 .rows(
-                                        "SELECT tenant_id,execution_id FROM engine_execution_state"
-                                                + " WHERE status IN"
-                                                + " ('CREATED','RUNNING','WAITING_RETRY') ORDER BY"
-                                                + " updated_at LIMIT #{args[0]}",
+                                        "SELECT s.tenant_id,s.execution_id FROM engine_execution_state s"
+                                                + " WHERE s.status IN"
+                                                + " ('CREATED','RUNNING','WAITING_RETRY')"
+                                                + " AND NOT EXISTS (SELECT 1 FROM engine_lease l"
+                                                + " WHERE l.tenant_id=s.tenant_id"
+                                                + " AND l.execution_id=s.execution_id"
+                                                + " AND l.expires_at>CURRENT_TIMESTAMP(6)) ORDER BY"
+                                                + " s.updated_at,s.tenant_id,s.execution_id LIMIT #{args[0]}",
                                         limit)
                                 .stream()
                                 .map(
