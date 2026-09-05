@@ -1,7 +1,7 @@
 package com.playrewards.flowengine.core.node;
 
-import com.playrewards.flowengine.contract.bundle.OutputSlotContract;
 import com.playrewards.flowengine.contract.bundle.FlowIdentity;
+import com.playrewards.flowengine.contract.bundle.OutputSlotContract;
 import com.playrewards.flowengine.contract.component.ComponentType;
 import com.playrewards.flowengine.contract.execution.ExecutionRequest;
 import com.playrewards.flowengine.contract.json.JsonValues;
@@ -15,6 +15,7 @@ import com.playrewards.flowengine.spi.CancellationToken;
 import com.playrewards.flowengine.spi.ComponentInputs;
 import com.playrewards.flowengine.spi.ExecutionLogger;
 import com.playrewards.flowengine.spi.HttpNodeClient;
+
 import java.time.Clock;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -34,6 +35,18 @@ public final class NodeExecutionContext {
     private final ExecutionRequest request;
     private final Clock clock;
     private final ExecutionLogger executionLogger;
+    private java.util.function.Consumer<String> retryCheckpoint = code -> {};
+
+    /**
+     * Scheduler-owned retry persistence hook; executors call it before waiting or sending again.
+     */
+    public void onRetryCheckpoint(java.util.function.Consumer<String> checkpoint) {
+        retryCheckpoint = Objects.requireNonNull(checkpoint);
+    }
+
+    public void checkpointRetry(String safeCode) {
+        retryCheckpoint.accept(safeCode);
+    }
 
     /**
      * Creates the complete context after scheduler-side input binding resolution.
@@ -48,11 +61,27 @@ public final class NodeExecutionContext {
      * @param request original dynamic request
      * @param clock deadline time source
      */
-    public NodeExecutionContext(String executionId, ExecutionPlan plan, CompiledNode node,
-            ExecutionContext executionContext, ScopePath scopePath, ComponentInputs inputs,
-            CancellationHandle cancellation, ExecutionRequest request, Clock clock) {
-        this(executionId, plan, node, executionContext, scopePath, inputs, cancellation, request,
-                clock, ExecutionLogger.NOOP);
+    public NodeExecutionContext(
+            String executionId,
+            ExecutionPlan plan,
+            CompiledNode node,
+            ExecutionContext executionContext,
+            ScopePath scopePath,
+            ComponentInputs inputs,
+            CancellationHandle cancellation,
+            ExecutionRequest request,
+            Clock clock) {
+        this(
+                executionId,
+                plan,
+                node,
+                executionContext,
+                scopePath,
+                inputs,
+                cancellation,
+                request,
+                clock,
+                ExecutionLogger.NOOP);
     }
 
     /**
@@ -69,68 +98,97 @@ public final class NodeExecutionContext {
      * @param clock deadline time source
      * @param executionLogger node-scoped structured log sink
      */
-    public NodeExecutionContext(String executionId, ExecutionPlan plan, CompiledNode node,
-            ExecutionContext executionContext, ScopePath scopePath, ComponentInputs inputs,
-            CancellationHandle cancellation, ExecutionRequest request, Clock clock,
+    public NodeExecutionContext(
+            String executionId,
+            ExecutionPlan plan,
+            CompiledNode node,
+            ExecutionContext executionContext,
+            ScopePath scopePath,
+            ComponentInputs inputs,
+            CancellationHandle cancellation,
+            ExecutionRequest request,
+            Clock clock,
             ExecutionLogger executionLogger) {
         this.executionId = Objects.requireNonNull(executionId, "executionId must not be null");
         this.plan = Objects.requireNonNull(plan, "plan must not be null");
         this.node = Objects.requireNonNull(node, "node must not be null");
-        this.executionContext = Objects.requireNonNull(executionContext, "execution context must not be null");
+        this.executionContext =
+                Objects.requireNonNull(executionContext, "execution context must not be null");
         this.scopePath = Objects.requireNonNull(scopePath, "scope path must not be null");
         this.inputs = Objects.requireNonNull(inputs, "inputs must not be null");
         this.cancellation = Objects.requireNonNull(cancellation, "cancellation must not be null");
         this.request = Objects.requireNonNull(request, "request must not be null");
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
-        this.executionLogger = Objects.requireNonNull(executionLogger, "execution logger must not be null");
+        this.executionLogger =
+                Objects.requireNonNull(executionLogger, "execution logger must not be null");
     }
 
-    /** @return execution identity */
+    /**
+     * @return execution identity
+     */
     public String executionId() {
         return executionId;
     }
 
-    /** @return immutable tenant/flow/version identity of the currently executing plan */
+    /**
+     * @return immutable tenant/flow/version identity of the currently executing plan
+     */
     public FlowIdentity flowIdentity() {
         return plan.flowIdentity();
     }
 
-    /** @return compiled node being invoked */
+    /**
+     * @return compiled node being invoked
+     */
     public CompiledNode node() {
         return node;
     }
 
-    /** @return resolved required and optional declared input slots */
+    /**
+     * @return resolved required and optional declared input slots
+     */
     public ComponentInputs inputs() {
         return inputs;
     }
 
-    /** @return current immutable scope path */
+    /**
+     * @return current immutable scope path
+     */
     public ScopePath scopePath() {
         return scopePath;
     }
 
-    /** @return cancellation token safe to pass across the SPI boundary */
+    /**
+     * @return cancellation token safe to pass across the SPI boundary
+     */
     public CancellationToken cancellationToken() {
         return cancellation;
     }
 
-    /** @return original dynamic request for START and execution metadata */
+    /**
+     * @return original dynamic request for START and execution metadata
+     */
     public ExecutionRequest request() {
         return request;
     }
 
-    /** @return isolated execution value store */
+    /**
+     * @return isolated execution value store
+     */
     public ExecutionContext executionContext() {
         return executionContext;
     }
 
-    /** @return immutable external namespaces captured for this execution */
+    /**
+     * @return immutable external namespaces captured for this execution
+     */
     public Map<String, Map<String, Object>> externalScopes() {
         return executionContext.externalScopes();
     }
 
-    /** @return node-scoped structured logger, or the safe no-op default */
+    /**
+     * @return node-scoped structured logger, or the safe no-op default
+     */
     public ExecutionLogger executionLogger() {
         return executionLogger;
     }
@@ -139,7 +197,7 @@ public final class NodeExecutionContext {
      * Creates a redacted execution-root send marker for this exact node scope.
      *
      * <p>Only unprotected HTTP side effects should request this observer. Safe or idempotency-key
-     * protected calls use the no-op observer and remain ordinary deadline failures.</p>
+     * protected calls use the no-op observer and remain ordinary deadline failures.
      */
     public HttpNodeClient.SendObserver unprotectedSideEffectObserver() {
         return cancellation.sideEffectObserver(
@@ -150,24 +208,29 @@ public final class NodeExecutionContext {
      * Builds the current read-only Groovy {@code ctx} view.
      *
      * <p>VARIABLE keeps its public scalar {@code ctx.<nodeCode>} shape. Other nodes expose a map of
-     * named outputs, matching {@code ctx.<nodeCode>.<outputKey>}.</p>
+     * named outputs, matching {@code ctx.<nodeCode>.<outputKey>}.
      */
     public Map<String, Object> ctxView() {
         Map<String, Object> view = new LinkedHashMap<>();
         Map<String, CompiledNode> visibleNodes = new TreeMap<>();
-        plan.ancestorNodeIds(node.node().id()).forEach(nodeId -> {
-            CompiledNode ancestor = plan.nodesById().get(nodeId);
-            visibleNodes.put(ancestor.node().nodeCode(), ancestor);
-        });
-        executionContext.outputsByNode(scopePath, visibleNodes.keySet()).forEach((nodeCode, outputs) -> {
-            CompiledNode source = visibleNodes.get(nodeCode);
-            if (source.componentContract().componentType() == ComponentType.VARIABLE
-                    && outputs.size() == 1) {
-                view.put(nodeCode, outputs.values().iterator().next());
-            } else {
-                view.put(nodeCode, outputs);
-            }
-        });
+        plan.ancestorNodeIds(node.node().id())
+                .forEach(
+                        nodeId -> {
+                            CompiledNode ancestor = plan.nodesById().get(nodeId);
+                            visibleNodes.put(ancestor.node().nodeCode(), ancestor);
+                        });
+        executionContext
+                .outputsByNode(scopePath, visibleNodes.keySet())
+                .forEach(
+                        (nodeCode, outputs) -> {
+                            CompiledNode source = visibleNodes.get(nodeCode);
+                            if (source.componentContract().componentType() == ComponentType.VARIABLE
+                                    && outputs.size() == 1) {
+                                view.put(nodeCode, outputs.values().iterator().next());
+                            } else {
+                                view.put(nodeCode, outputs);
+                            }
+                        });
         return JsonValues.copyObject(view, "script ctx");
     }
 
@@ -177,7 +240,8 @@ public final class NodeExecutionContext {
     public ExecutionContext.ContextValue lookupSource(String sourceNodeId, String outputKey) {
         CompiledNode source = plan.nodesById().get(sourceNodeId);
         if (source == null) {
-            throw new NodeExecutionException("NODE_SOURCE_NOT_FOUND", "source node not found: " + sourceNodeId);
+            throw new NodeExecutionException(
+                    "NODE_SOURCE_NOT_FOUND", "source node not found: " + sourceNodeId);
         }
         return executionContext.lookupVisible(source.node().nodeCode(), scopePath, outputKey);
     }
@@ -190,11 +254,13 @@ public final class NodeExecutionContext {
     public OutputSlotContract requiredSourceOutputContract(String sourceNodeId, String outputKey) {
         CompiledNode source = plan.nodesById().get(sourceNodeId);
         if (source == null) {
-            throw new NodeExecutionException("NODE_SOURCE_NOT_FOUND", "source node not found: " + sourceNodeId);
+            throw new NodeExecutionException(
+                    "NODE_SOURCE_NOT_FOUND", "source node not found: " + sourceNodeId);
         }
         OutputSlotContract output = source.componentContract().outputSlots().get(outputKey);
         if (output == null) {
-            throw new NodeExecutionException("NODE_SOURCE_OUTPUT_NOT_FOUND",
+            throw new NodeExecutionException(
+                    "NODE_SOURCE_OUTPUT_NOT_FOUND",
                     "source output not found: " + sourceNodeId + "." + outputKey);
         }
         return output;

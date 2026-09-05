@@ -169,12 +169,14 @@ public class EngineAutoConfiguration {
             HttpNodeClient http,
             Clock clock,
             ConcurrencyGovernor governor,
-            ExecutionRecorder recorder) {
+            ExecutionRecorder recorder,
+            Optional<com.playrewards.flowengine.core.durable.DurableExecutionCoordinator> durable) {
         return new FlowEngine(
                 NodeExecutorRegistry.runtimeBuiltIns(scripts, components, locks, http, clock),
                 governor,
                 clock,
-                recorder);
+                recorder,
+                durable.orElse(null));
     }
 
     @Bean

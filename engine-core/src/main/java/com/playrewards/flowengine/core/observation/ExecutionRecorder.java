@@ -23,6 +23,22 @@ public final class ExecutionRecorder {
     private final boolean strictAudit;
     private final Map<String, Run> active = new HashMap<>();
     private final AtomicLong warnings = new AtomicLong();
+    private java.util.function.Function<String, ExecutionLease> leases = id -> null;
+
+    /**
+     * Bound by the composition root; durable terminal writes require the owning root's live fence.
+     */
+    public void executionLeases(java.util.function.Function<String, ExecutionLease> leases) {
+        this.leases = leases;
+    }
+
+    private void commitTerminal(ExecutionRecord record, ExecutionEvent event) {
+        if (record.mode() == ExecutionMode.DURABLE) {
+            ExecutionLease lease = leases.apply(record.executionId());
+            if (lease == null) throw new IllegalStateException("DURABLE_EXECUTION_LEASE_REQUIRED");
+            store.commitTerminal(record, event, lease);
+        } else store.commitTerminal(record, event);
+    }
 
     /**
      * Creates a host-owned observation boundary; strict audit promotes sink failures to execution
@@ -92,9 +108,34 @@ public final class ExecutionRecorder {
         }
     }
 
+    /** A strong pending terminal can complete a missing audit or reuse an already committed one. */
+    public synchronized void recoverForTerminal(String id) {
+        if (store.execution(id).filter(r -> r.finishedAt() != null).isEmpty()) recover(id);
+    }
+
     /** Records controller admission independently of the first node's queue and permit wait. */
     public synchronized void started(String id) {
         emit(id, null, "STARTED", ExecutionStatus.RUNNING, Map.of());
+    }
+
+    /**
+     * Reattaches audit identity after strong-state ownership is acquired; events never drive
+     * recovery.
+     */
+    public synchronized boolean recover(String id) {
+        if (active.containsKey(id)) return true;
+        var record = store.execution(id);
+        if (record.isEmpty()) return false;
+        var run = new Run(record.get());
+        run.sequence =
+                Math.max(
+                        record.get().eventCursor(),
+                        store.readAfter(id, -1).stream()
+                                .mapToLong(ExecutionEvent::sequence)
+                                .max()
+                                .orElse(-1));
+        active.put(id, run);
+        return true;
     }
 
     /**
@@ -103,7 +144,17 @@ public final class ExecutionRecorder {
      */
     public synchronized Attempt queued(String executionId, CompiledNode node, ScopePath scope) {
         var attempt = new Attempt(executionId, node, scope);
-        attempt.newRecord(1);
+        int number =
+                store.nodes(executionId).stream()
+                                .filter(
+                                        r ->
+                                                r.nodeId().equals(node.node().id())
+                                                        && r.scopePath().equals(scope.value()))
+                                .mapToInt(NodeExecutionRecord::attempt)
+                                .max()
+                                .orElse(0)
+                        + 1;
+        attempt.newRecord(number);
         return attempt;
     }
 
@@ -195,7 +246,7 @@ public final class ExecutionRecorder {
                                     : Map.of("errorId", errorId, "code", result.errorCode()));
             run.record = terminalRecord(run.record, value, payload, run.sequence);
             synchronized (bus) {
-                store.commitTerminal(run.record, terminal);
+                commitTerminal(run.record, terminal);
                 bus.deliverCommitted(terminal);
             }
             forwardCommitted(run.record, terminal);
@@ -257,7 +308,7 @@ public final class ExecutionRecorder {
                         Map.of("errorId", result.errorId(), "code", result.errorCode()));
         try {
             synchronized (bus) {
-                store.commitTerminal(record, event);
+                commitTerminal(record, event);
                 bus.deliverCommitted(event);
             }
             forwardCommitted(record, event);

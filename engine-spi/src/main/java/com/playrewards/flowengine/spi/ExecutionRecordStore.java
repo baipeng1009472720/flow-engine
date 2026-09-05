@@ -6,6 +6,14 @@ import java.util.*;
 
 /** Separate bounded observation tables; access authorization belongs to the host-facing service. */
 public interface ExecutionRecordStore extends ExecutionObservationStore {
+    /** Durable terminal audit validates the live root execution fence in the same transaction. */
+    default void commitTerminal(
+            ExecutionRecord record,
+            com.playrewards.flowengine.contract.execution.ExecutionEvent event,
+            ExecutionLease lease) {
+        throw new IllegalStateException("FENCED_TERMINAL_COMMIT_REQUIRED");
+    }
+
     /** 原子提交终态记录及终态事件；返回即关键记录已持久化。失败不得暴露部分成功终态。 宿主必须提供真实事务实现，不能使用 saveExecution + append 模拟原子性。 */
     default void commitTerminal(
             ExecutionRecord record,

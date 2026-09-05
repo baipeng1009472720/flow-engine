@@ -1,7 +1,6 @@
 package com.playrewards.flowengine.server.api;
 
 import com.alibaba.fastjson2.JSON;
-import com.playrewards.flowengine.server.security.ExecutionAccessPolicy.Action;
 
 import jakarta.servlet.http.HttpServletRequest;
 
@@ -20,7 +19,10 @@ public class ExecutionController {
         this.service = service;
     }
 
-    /** Starts one execution; WAIT exposes the terminal summary and ASYNC returns its stable identity. */
+    /**
+     * Starts one execution; WAIT exposes the terminal summary and ASYNC returns its stable
+     * identity.
+     */
     @PostMapping(value = "/v1/executions", produces = "application/json")
     public ResponseEntity<String> start(HttpServletRequest request) throws Exception {
         var started = service.start(request);
@@ -36,16 +38,21 @@ public class ExecutionController {
         return ResponseEntity.ok(JSON.toJSONString(service.summary(service.waitFor(started))));
     }
 
-    /** Requests explicit cancellation after per-flow authorization; repeated cancellation is harmless. */
+    /**
+     * Requests explicit cancellation after per-flow authorization; repeated cancellation is
+     * harmless.
+     */
     @PostMapping(value = "/v1/executions/{id}/cancel", produces = "application/json")
     public String cancel(HttpServletRequest request, @PathVariable("id") String id) {
         return JSON.toJSONString(service.cancel(request, id));
     }
 
-    /** Keeps the future resume route stable while refusing unsafe EPHEMERAL side-effect replay. */
+    /**
+     * Resumes authenticated durable state; EPHEMERAL and unconfirmed side effects cannot be
+     * replayed.
+     */
     @PostMapping(value = "/v1/executions/{id}/resume", produces = "application/json")
     public String resume(HttpServletRequest request, @PathVariable("id") String id) {
-        service.execution(request, id, Action.CANCEL);
-        throw new ApiException(409, "EPHEMERAL_RESUME_UNSUPPORTED", "CONFIGURATION");
+        return JSON.toJSONString(service.resume(request, id));
     }
 }

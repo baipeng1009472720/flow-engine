@@ -1,1 +1,2 @@
 com.playrewards.flowengine.server.config.EngineAutoConfiguration
+com.playrewards.flowengine.server.config.DurableAutoConfiguration

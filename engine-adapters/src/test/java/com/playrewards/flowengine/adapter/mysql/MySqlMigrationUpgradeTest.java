@@ -1,0 +1,54 @@
+package com.playrewards.flowengine.adapter.mysql;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import com.mysql.cj.jdbc.MysqlDataSource;
+
+import org.flywaydb.core.Flyway;
+import org.junit.jupiter.api.Test;
+import org.testcontainers.containers.MySQLContainer;
+import org.testcontainers.junit.jupiter.*;
+
+/**
+ * V1 stays immutable: an existing database upgrades to V2 without rewriting stored execution data.
+ */
+@Testcontainers
+class MySqlMigrationUpgradeTest {
+    @Container static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.4");
+
+    @Test
+    void upgradesExistingV1AndPreservesCheckpoint() {
+        var source = new MysqlDataSource();
+        source.setURL(MYSQL.getJdbcUrl());
+        source.setUser(MYSQL.getUsername());
+        source.setPassword(MYSQL.getPassword());
+        Flyway.configure()
+                .dataSource(source)
+                .locations("classpath:db/migration")
+                .target("1")
+                .load()
+                .migrate();
+        var db = new MySqlRuntimeDatabase(source);
+        db.transaction(
+                tx ->
+                        tx.update(
+                                "INSERT INTO"
+                                    + " engine_execution_state(tenant_id,execution_id,revision,status,checkpoint)"
+                                    + " VALUES('upgrade','execution',1,'RUNNING','{}')"));
+        db.migrate();
+        assertEquals(
+                1,
+                new MySqlExecutionStateStore(db, "upgrade")
+                        .find("execution")
+                        .orElseThrow()
+                        .revision());
+        long count =
+                db.transaction(
+                        tx ->
+                                MySqlRuntimeDatabase.number(
+                                        tx.row("SELECT COUNT(*) AS n FROM engine_business_lock")
+                                                .orElseThrow(),
+                                        "n"));
+        assertEquals(0L, count);
+    }
+}

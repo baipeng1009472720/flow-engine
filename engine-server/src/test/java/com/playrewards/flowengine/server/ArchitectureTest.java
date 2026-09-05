@@ -106,9 +106,10 @@ final class ArchitectureTest {
     }
 
     private static ArchRule adaptersLayerRule() {
+        // 约束本工程模块，不把已批准的 mybatis-plus.core / flyway.core 当作引擎 core。
         return noClasses()
                 .that().resideInAnyPackage("..adapter..")
                 .should().dependOnClassesThat()
-                .resideInAnyPackage("..core..", "..server..");
+                .resideInAnyPackage("com.playrewards.flowengine.core..", "com.playrewards.flowengine.server..");
     }
 }

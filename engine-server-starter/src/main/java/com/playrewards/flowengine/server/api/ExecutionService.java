@@ -64,8 +64,8 @@ public final class ExecutionService {
     }
 
     /**
-     * Starts a trusted, compiled EPHEMERAL flow. A body may reference a loader but cannot supply a
-     * bundle or class.
+     * Starts a trusted, compiled flow in a configured mode. A body may reference a loader but
+     * cannot supply a bundle or class.
      */
     public Started start(HttpServletRequest http) throws Exception {
         String tenant = access.tenantId(http);
@@ -111,7 +111,7 @@ public final class ExecutionService {
                                         : maxDuration)
                         .toString());
         ExecutionRequest request = json.to(ExecutionRequest.class);
-        if (request.mode() != ExecutionMode.EPHEMERAL)
+        if (request.mode() != ExecutionMode.EPHEMERAL && !engine.supportsDurable())
             throw new ApiException(409, "EXECUTION_MODE_UNSUPPORTED", "CONFIGURATION");
         if (!request.deadline().isAfter(Instant.now())
                 || request.deadline().isAfter(Instant.now().plus(maxDuration)))
@@ -277,8 +277,25 @@ public final class ExecutionService {
 
     public Map<String, Object> cancel(HttpServletRequest http, String id) {
         execution(http, id, Action.CANCEL);
-        var handle = handles.get(id);
-        return Map.of("executionId", id, "cancelRequested", handle != null && handle.cancel());
+        return Map.of("executionId", id, "cancelRequested", engine.cancel(id));
+    }
+
+    /** Authorizes the actual owning flow before resuming its immutable strong checkpoint. */
+    public Map<String, Object> resume(HttpServletRequest http, String id) {
+        var record = execution(http, id, Action.CANCEL);
+        if (record.mode() != ExecutionMode.DURABLE)
+            throw new ApiException(409, "EPHEMERAL_RESUME_UNSUPPORTED", "CONFIGURATION");
+        try {
+            var handle = engine.resume(id, record.flowIdentity().tenantId());
+            handles.put(id, handle);
+            handle.completion().whenComplete((value, error) -> handles.remove(id, handle));
+            return Map.of("executionId", id, "status", "ACCEPTED");
+        } catch (IllegalStateException failure) {
+            if ("DURABLE_EXECUTION_ALREADY_ACTIVE".equals(failure.getMessage())
+                    || "DURABLE_EXECUTION_LEASE_BUSY".equals(failure.getMessage()))
+                return Map.of("executionId", id, "status", "RUNNING");
+            throw failure;
+        }
     }
 
     public ExecutionRecordStore store() {
