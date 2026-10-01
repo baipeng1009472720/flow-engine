@@ -77,6 +77,22 @@ public final class MySqlRuntimeDatabase {
     }
 
     /**
+     * 以 READ COMMITTED 运行一个短事务，供分批保留清理使用。
+     *
+     * <p>RC 下范围 DELETE 只锁定实际命中的过期行而不加间隙锁，避免清理阻塞或死锁正在插入新观察记录
+     * 的写事务；调用方仍需自行限制单批行数。
+     */
+    <T> T readCommittedTransaction(Function<Tx, T> action) {
+        return transaction(
+                sessions,
+                tx -> {
+                    // 必须是事务内第一条语句：SET TRANSACTION 只作用于随后开启的这一个事务。
+                    tx.update("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+                    return action.apply(tx);
+                });
+    }
+
+    /**
      * Bypasses a saturated workload pool for lease renewal. The coordinator must keep this control
      * path bounded independently; it is intentionally unavailable outside the MySQL adapter.
      */
@@ -124,10 +140,10 @@ public final class MySqlRuntimeDatabase {
     /** Process-local storage admission values; no tenant or payload identity is exposed. */
     public record CapacitySnapshot(int inFlight, int limit) {}
 
-    private static <T> T transaction(SqlSessionFactory factory, Function<Tx, T> action) {
+    private <T> T transaction(SqlSessionFactory factory, Function<Tx, T> action) {
         try (var session = factory.openSession(false)) {
             try {
-                T value = action.apply(new Tx(session.getMapper(RuntimeMapper.class)));
+                T value = action.apply(new Tx(this, session.getMapper(RuntimeMapper.class)));
                 session.commit();
                 return value;
             } catch (RuntimeException failure) {
@@ -140,10 +156,17 @@ public final class MySqlRuntimeDatabase {
     }
 
     static final class Tx {
+        private final MySqlRuntimeDatabase database;
         private final RuntimeMapper mapper;
 
-        Tx(RuntimeMapper mapper) {
+        Tx(MySqlRuntimeDatabase database, RuntimeMapper mapper) {
+            this.database = database;
             this.mapper = mapper;
+        }
+
+        /** 当前事务所属的数据库，仅供适配器内需要独立短事务的边界（如容量计数播种）使用。 */
+        MySqlRuntimeDatabase database() {
+            return database;
         }
 
         int update(String sql, Object... args) {

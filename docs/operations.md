@@ -68,6 +68,17 @@ DURABLE 默认工作池最多 16 个活动连接并保留最多 16 个 idle 连�
 - 执行租约为 15 秒，约每 5 秒续租。checkpoint 写入验证 owner、fencing token 和 revision CAS。
 - 同租户 Payload、状态和观察容量写入先经过固定 64 stripe 的进程内队列，再获取数据库容量行锁；数据库锁仍负责跨 JVM 正确性。进程内同时 admission 上限固定为 256，可通过 `capacitySnapshot()` 读取无身份信息的当前 in-flight/limit；上限已满返回 `RUNTIME_STORAGE_CAPACITY_BUSY`，等待 stripe 锁时被中断返回 `RUNTIME_STORAGE_CAPACITY_INTERRUPTED`，两种情况都不会借用数据库连接。
 - 每执行仅保留最近两个完整 checkpoint；正在使用的 pinned Payload 不参与普通到期清理。
+- 观察记录保留（V5 增加 `engine_execution.expires_at` 及按创建时间/不透明 ID 的索引）：
+
+  | 属性 | 默认 | 说明 |
+  | --- | ---: | --- |
+  | `flow-engine.observation.executions.retention` | 7d | DURABLE 终态执行（含节点、事件、日志、非固定 Payload） |
+  | `flow-engine.observation.executions.ephemeral-retention` | 1d | EPHEMERAL（含试运行）终态执行 |
+  | `flow-engine.observation.executions.stale-retention` | 1d | EPHEMERAL 非终态执行自最后更新起；回收崩溃遗留记录 |
+  | `flow-engine.observation.{events,logs,content}.retention` | 1h | 按创建时间独立过期 |
+  | `flow-engine.observation.cleanup.interval` / `batch-size` / `max-batches` | 1m / 500 / 20 | 周期清理；每批独立 READ COMMITTED 短事务 |
+
+  DURABLE 非终态与 `WAITING_MANUAL` 永不按保留期删除；DURABLE 强状态（state、checkpoint、pinned Payload）不由该清理器处理。写入热路径不再执行过期删除；容量已满时先同步清理该租户一批过期记录再重试一次，仍满才返回 `RUNTIME_STORAGE_CAPACITY_EXCEEDED`。
 - 自动恢复每秒扫描最多 100 条可恢复记录。旧 owner 被 `SIGKILL` 后，新实例必须等待数据库租约过期，随后从已提交的不可变 plan/request 恢复。
 - 已提交节点结果不重放；未知非幂等副作用进入 `WAITING_MANUAL`，不得自动猜测成功或失败。
 

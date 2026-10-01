@@ -14,7 +14,7 @@ import java.util.*;
 public final class MySqlTenantStoreRouter implements ExecutionRecordStore, PayloadStore {
     private final MySqlRuntimeDatabase db;
     private final Map<String, Integer> capacities;
-    private final Map<String, Duration> retentions;
+    private final MySqlRetentionPolicy policy;
     private final int payloadMaxBytes;
     private final Duration payloadRetention;
 
@@ -31,9 +31,35 @@ public final class MySqlTenantStoreRouter implements ExecutionRecordStore, Paylo
             Map<String, Duration> retentions,
             int payloadMaxBytes,
             Duration payloadRetention) {
+        this(
+                db,
+                capacities,
+                MySqlRetentionPolicy.defaults()
+                        .withRowRetention(
+                                retentions.getOrDefault("engine_event", Duration.ofHours(1)),
+                                retentions.getOrDefault("engine_log", Duration.ofHours(1)),
+                                retentions.getOrDefault("engine_content", Duration.ofHours(1))),
+                payloadMaxBytes,
+                payloadRetention);
+    }
+
+    /**
+     * 使用完整保留策略构造路由；所有租户共享相同上限与保留期。
+     *
+     * @param capacities 表名到租户行数上限
+     * @param policy 执行与行级保留策略，同时决定容量满时的过期清理范围
+     * @param payloadMaxBytes 单个 Payload 字节上限
+     * @param payloadRetention 非固定 Payload 保留期
+     */
+    public MySqlTenantStoreRouter(
+            MySqlRuntimeDatabase db,
+            Map<String, Integer> capacities,
+            MySqlRetentionPolicy policy,
+            int payloadMaxBytes,
+            Duration payloadRetention) {
         this.db = db;
         this.capacities = Map.copyOf(capacities);
-        this.retentions = Map.copyOf(retentions);
+        this.policy = Objects.requireNonNull(policy);
         this.payloadMaxBytes = payloadMaxBytes;
         this.payloadRetention = payloadRetention;
     }
@@ -79,7 +105,7 @@ public final class MySqlTenantStoreRouter implements ExecutionRecordStore, Paylo
     public record RecoveryCandidate(String tenantId, String executionId) {}
 
     private MySqlObservationStore records(String tenant) {
-        return new MySqlObservationStore(db, tenant, capacities, retentions);
+        return new MySqlObservationStore(db, tenant, capacities, policy);
     }
 
     private MySqlPayloadStore payloads(String tenant) {

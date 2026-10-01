@@ -52,7 +52,6 @@ public class DurableAutoConfiguration {
         capacities.put(
                 "engine_node_attempt",
                 env.getProperty("flow-engine.observation.max-nodes", Integer.class, 10000));
-        var retentions = new java.util.HashMap<String, Duration>();
         for (var entry :
                 java.util.Map.of(
                                 "engine_event",
@@ -61,27 +60,51 @@ public class DurableAutoConfiguration {
                                 "logs",
                                 "engine_content",
                                 "content")
-                        .entrySet()) {
+                        .entrySet())
             capacities.put(
                     entry.getKey(),
                     env.getProperty(
                             "flow-engine.observation." + entry.getValue() + ".max-count",
                             Integer.class,
                             10000));
-            retentions.put(
-                    entry.getKey(),
-                    org.springframework.boot.convert.DurationStyle.detectAndParse(
-                            env.getProperty(
-                                    "flow-engine.observation." + entry.getValue() + ".retention",
-                                    "1h")));
-        }
         return new MySqlTenantStoreRouter(
                 db,
                 capacities,
-                retentions,
+                retentionPolicy(env),
                 env.getProperty("flow-engine.payload.max-bytes", Integer.class, 1048576),
-                org.springframework.boot.convert.DurationStyle.detectAndParse(
-                        env.getProperty("flow-engine.observation.payloads.retention", "1h")));
+                duration(env, "flow-engine.observation.payloads.retention", "1h"));
+    }
+
+    /**
+     * 观察记录保留策略：DURABLE 终态默认 7 天，EPHEMERAL 终态与孤儿非终态默认 1 天，
+     * 事件/日志/内容沿用 1 小时默认值；全部可由 {@code flow-engine.observation.*} 覆盖。
+     */
+    static MySqlRetentionPolicy retentionPolicy(Environment env) {
+        return new MySqlRetentionPolicy(
+                duration(env, "flow-engine.observation.executions.retention", "7d"),
+                duration(env, "flow-engine.observation.executions.ephemeral-retention", "1d"),
+                duration(env, "flow-engine.observation.executions.stale-retention", "1d"),
+                duration(env, "flow-engine.observation.events.retention", "1h"),
+                duration(env, "flow-engine.observation.logs.retention", "1h"),
+                duration(env, "flow-engine.observation.content.retention", "1h"),
+                env.getProperty("flow-engine.observation.cleanup.batch-size", Integer.class, 500));
+    }
+
+    private static Duration duration(Environment env, String key, String fallback) {
+        return org.springframework.boot.convert.DurationStyle.detectAndParse(
+                env.getProperty(key, fallback));
+    }
+
+    /** 周期分批清理过期观察记录；每租户每类每周期最多 max-batches 批，避免长时间占用连接。 */
+    @Bean
+    @ConditionalOnMissingBean
+    ObservationRetentionLifecycle observationRetentionLifecycle(
+            MySqlRuntimeDatabase db, Environment env) {
+        var retention = new MySqlObservationRetention(db, retentionPolicy(env));
+        int batches = env.getProperty("flow-engine.observation.cleanup.max-batches", Integer.class, 20);
+        return new ObservationRetentionLifecycle(
+                () -> retention.purgeExpired(batches),
+                duration(env, "flow-engine.observation.cleanup.interval", "1m"));
     }
 
     @Bean

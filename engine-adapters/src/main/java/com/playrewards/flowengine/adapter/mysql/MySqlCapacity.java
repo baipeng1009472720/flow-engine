@@ -37,7 +37,13 @@ final class MySqlCapacity {
 
     /** 预留一行容量；语义见 {@link #tryReserve}。 */
     static void reserve(MySqlRuntimeDatabase.Tx tx, String tenant, String table, int capacity) {
-        if (!tryReserve(tx, tenant, table, 1, capacity))
+        reserve(tx, tenant, table, 1, capacity);
+    }
+
+    /** 预留多行容量，超过上限时抛出 {@code RUNTIME_STORAGE_CAPACITY_EXCEEDED} 使整个事务回滚。 */
+    static void reserve(
+            MySqlRuntimeDatabase.Tx tx, String tenant, String table, int rows, int capacity) {
+        if (!tryReserve(tx, tenant, table, rows, capacity))
             throw new IllegalStateException(EXCEEDED);
     }
 
@@ -47,7 +53,7 @@ final class MySqlCapacity {
      * @param tx 与业务行插入相同的事务；回滚时预留一并撤销
      * @param tenant 已认证租户
      * @param table 受容量约束的引擎表名（适配器内部常量）
-     * @param rows 本事务将新增的行数，0 时直接成功
+     * @param rows 本事务已插入（或将插入）的新行数，0 时直接成功
      * @param capacity 该表的租户行数上限
      * @return 预留成功返回 true；超过上限返回 false 且不改变计数
      */
@@ -55,24 +61,44 @@ final class MySqlCapacity {
             MySqlRuntimeDatabase.Tx tx, String tenant, String table, int rows, int capacity) {
         if (rows <= 0) return true;
         if (rows > capacity) return false;
-        if (increment(tx, tenant, table, rows, capacity)) return true;
-        // 计数行不存在时（新租户或升级后首次写入）以真实行数播种一次；INSERT IGNORE 保证并发只有一个生效。
+        // 先用不加锁的一致性读确认计数行存在：对不存在的主键执行 UPDATE 会在 RR 下持有间隙锁，
+        // 多个首次写入者随后插入同一间隙会互相死锁。
         if (tx.row(
                         "SELECT used FROM engine_capacity_usage WHERE tenant_id=#{args[0]} AND"
                                 + " table_name=#{args[1]}",
                         tenant,
                         table)
-                .isEmpty()) {
-            tx.update(
-                    "INSERT IGNORE INTO engine_capacity_usage(tenant_id,table_name,used) SELECT"
-                            + " #{args[0]},#{args[1]},COUNT(*) FROM "
-                            + table
-                            + " WHERE tenant_id=#{args[0]}",
-                    tenant,
-                    table);
-            return increment(tx, tenant, table, rows, capacity);
-        }
-        return false;
+                .isEmpty()) seed(tx.database(), tenant, table);
+        return increment(tx, tenant, table, rows, capacity);
+    }
+
+    /**
+     * 在独立短事务中以已提交行数播种计数行（新租户或升级后首次写入）。
+     *
+     * <p>独立事务看不到调用方尚未提交的插入，而调用方随后会对这些行自行递增，因此不会重复计数；
+     * 并发播种用 ON DUPLICATE KEY UPDATE 保持幂等。使用非池化控制连接，避免持有工作连接的调用方
+     * 再次向已满的工作池借连接而互相等待。
+     */
+    private static void seed(MySqlRuntimeDatabase db, String tenant, String table) {
+        db.controlTransaction(
+                seed -> {
+                    long existing =
+                            MySqlRuntimeDatabase.number(
+                                    seed.row(
+                                                    "SELECT COUNT(*) AS n FROM "
+                                                            + table
+                                                            + " WHERE tenant_id=#{args[0]}",
+                                                    tenant)
+                                            .orElseThrow(),
+                                    "n");
+                    return seed.update(
+                            "INSERT INTO engine_capacity_usage(tenant_id,table_name,used)"
+                                    + " VALUES(#{args[0]},#{args[1]},#{args[2]})"
+                                    + " ON DUPLICATE KEY UPDATE used=used",
+                            tenant,
+                            table,
+                            existing);
+                });
     }
 
     /**
@@ -82,6 +108,13 @@ final class MySqlCapacity {
      */
     static void release(MySqlRuntimeDatabase.Tx tx, String tenant, String table, int deleted) {
         if (deleted <= 0) return;
+        // 计数行缺失时无需释放：首次预留会按真实行数播种；对缺失主键 UPDATE 还会引入间隙锁。
+        if (tx.row(
+                        "SELECT used FROM engine_capacity_usage WHERE tenant_id=#{args[0]} AND"
+                                + " table_name=#{args[1]}",
+                        tenant,
+                        table)
+                .isEmpty()) return;
         tx.update(
                 "UPDATE engine_capacity_usage SET used=GREATEST(used-#{args[2]},0) WHERE"
                         + " tenant_id=#{args[0]} AND table_name=#{args[1]}",
