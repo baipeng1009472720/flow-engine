@@ -52,8 +52,13 @@ public final class MySqlPayloadStore implements PayloadStore {
             insertWithTenantLock(write, pinned);
         } catch (IllegalStateException full) {
             // 容量满时先回收本租户已过期的非固定 Payload，再完整重试一次；仍满则保持硬上限。
-            if (!MySqlCapacity.EXCEEDED.equals(full.getMessage())
-                    || MySqlObservationRetention.purgeExpiredPayloads(db, tenant) == 0) throw full;
+            if (!MySqlCapacity.EXCEEDED.equals(full.getMessage())) throw full;
+            // 仍无过期值时淘汰一批最早的终态执行（级联其非固定 Payload）；固定检查点值不参与淘汰。
+            if (MySqlObservationRetention.purgeExpiredPayloads(db, tenant) == 0
+                    && new MySqlObservationRetention(db, MySqlRetentionPolicy.defaults())
+                                    .evictOldestTerminal(tenant, 50)
+                                    .rows()
+                            == 0) throw full;
             insertWithTenantLock(write, pinned);
         }
         return new PayloadReference(write.reference());

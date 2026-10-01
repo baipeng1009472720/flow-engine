@@ -13,14 +13,17 @@ import java.util.function.Function;
  *
  * <p>写入热路径只做行级读写与增量容量预留，不再在每次写入时执行过期删除或 COUNT(*)，也不再获取租户
  * 互斥行锁；同一执行的事件顺序由 {@code engine_execution} 行上的 {@code FOR UPDATE} 游标校验保证。
- * 容量预留统一放在事务末尾并按表名排序，缩短计数行锁持有时间并固定加锁顺序。容量已满时先分批清理
- * 该租户的过期记录再重试一次，仍满才返回 {@code RUNTIME_STORAGE_CAPACITY_EXCEEDED}。
+ * 容量预留统一放在事务末尾并按表名排序，缩短计数行锁持有时间并固定加锁顺序。容量已满时先清理该租户
+ * 的过期记录，仍不足再淘汰最早的终态执行；只有活动执行占满容量时才返回
+ * {@code RUNTIME_STORAGE_CAPACITY_EXCEEDED}。
  *
  * <p>不负责：周期性保留清理（见 {@link MySqlObservationRetention}）、跨租户路由与授权、强一致检查点。
  */
 public final class MySqlObservationStore implements ExecutionRecordStore {
     private static final int DEFAULT_CAPACITY = 10000;
     private static final Duration DEFAULT_ROW_RETENTION = Duration.ofHours(1);
+    /** 容量压力下单轮淘汰的终态执行数与最大轮数，限制写路径上的额外延迟。 */
+    private static final int EVICTION_BATCH = 50, EVICTION_ROUNDS = 3;
 
     private final MySqlRuntimeDatabase db;
     private final String tenant;
@@ -509,19 +512,32 @@ public final class MySqlObservationStore implements ExecutionRecordStore {
     }
 
     /**
-     * 执行一次观察写事务；容量已满时先清理本租户一批过期记录，再完整重试一次。
+     * 执行一次观察写事务；容量已满时先清理本租户过期记录，仍不足再淘汰最早的终态执行后完整重试。
      *
-     * <p>重试是整个事务重放而非局部补写，因此不会产生部分成功；清理不到任何过期记录时直接返回原始
-     * 容量错误，保持硬上限语义。
+     * <p>重试是整个事务重放而非局部补写，因此不会产生部分成功；活动执行占满容量、没有可回收记录时
+     * 返回原始容量错误，保持硬上限语义。
      */
     private <T> T write(Function<MySqlRuntimeDatabase.Tx, T> action) {
         try {
             return db.transaction(action);
         } catch (IllegalStateException failure) {
             if (!MySqlCapacity.EXCEEDED.equals(failure.getMessage())) throw failure;
-            if (new MySqlObservationRetention(db, policy).purgeTenant(tenant, 1).total() == 0)
-                throw failure;
-            return db.transaction(action);
+        }
+        var retention = new MySqlObservationRetention(db, policy);
+        // 先清理过期记录；仍无可回收时再按最早过期淘汰一小批终态执行，最多三轮后保持硬上限。
+        boolean freed = retention.purgeTenant(tenant, 1).total() > 0;
+        for (int round = 0; ; round++) {
+            if (!freed) {
+                if (round >= EVICTION_ROUNDS
+                        || retention.evictOldestTerminal(tenant, EVICTION_BATCH).total() == 0)
+                    throw new IllegalStateException(MySqlCapacity.EXCEEDED);
+            }
+            try {
+                return db.transaction(action);
+            } catch (IllegalStateException failure) {
+                if (!MySqlCapacity.EXCEEDED.equals(failure.getMessage())) throw failure;
+                freed = false;
+            }
         }
     }
 

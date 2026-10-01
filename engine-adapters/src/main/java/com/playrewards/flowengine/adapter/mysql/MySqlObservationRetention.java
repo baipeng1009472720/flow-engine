@@ -82,19 +82,62 @@ public final class MySqlObservationRetention {
         return new PurgeResult(executions, rows);
     }
 
-    private PurgeResult purgeExecutionBatch(MySqlRuntimeDatabase.Tx tx, String tenant) {
-        List<String> ids =
-                tx
-                        .rows(
-                                "SELECT execution_id FROM engine_execution WHERE"
-                                        + " tenant_id=#{args[0]} AND"
-                                        + " expires_at<CURRENT_TIMESTAMP(6) ORDER BY expires_at"
-                                        + " LIMIT #{args[1]}",
+    /**
+     * 容量压力淘汰：在没有过期记录可清理时，按 {@code expires_at} 从早到晚淘汰一批已结束的执行。
+     *
+     * <p>只选择终态（SUCCEEDED/FAILED/CANCELLED）且带过期时间的执行，EPHEMERAL 终态的过期时间更早
+     * 因而优先被淘汰；活动执行、DURABLE 非终态与 WAITING_MANUAL 永不淘汰，全部容量被它们占用时
+     * 写入仍按硬上限拒绝。
+     *
+     * @param tenant 已认证租户
+     * @param limit 本批最多淘汰的执行数
+     * @return 删除统计
+     */
+    PurgeResult evictOldestTerminal(String tenant, int limit) {
+        return db.readCommittedTransaction(
+                tx ->
+                        deleteExecutions(
+                                tx,
                                 tenant,
-                                policy.batchSize())
-                        .stream()
-                        .map(r -> MySqlRuntimeDatabase.text(r, "execution_id"))
-                        .toList();
+                                ids(
+                                        tx,
+                                        "SELECT execution_id FROM engine_execution WHERE"
+                                                + " tenant_id=#{args[0]} AND expires_at IS NOT NULL"
+                                                + " AND status IN ('SUCCEEDED','FAILED','CANCELLED')"
+                                                + " ORDER BY expires_at LIMIT #{args[1]}",
+                                        tenant,
+                                        limit),
+                                "status IN ('SUCCEEDED','FAILED','CANCELLED')"));
+    }
+
+    private static List<String> ids(
+            MySqlRuntimeDatabase.Tx tx, String sql, String tenant, int limit) {
+        return tx.rows(sql, tenant, limit).stream()
+                .map(r -> MySqlRuntimeDatabase.text(r, "execution_id"))
+                .toList();
+    }
+
+    private PurgeResult purgeExecutionBatch(MySqlRuntimeDatabase.Tx tx, String tenant) {
+        return deleteExecutions(
+                tx,
+                tenant,
+                ids(
+                        tx,
+                        "SELECT execution_id FROM engine_execution WHERE tenant_id=#{args[0]} AND"
+                                + " expires_at<CURRENT_TIMESTAMP(6) ORDER BY expires_at LIMIT"
+                                + " #{args[1]}",
+                        tenant,
+                        policy.batchSize()),
+                "expires_at<CURRENT_TIMESTAMP(6)");
+    }
+
+    /**
+     * 级联删除一批执行及其观察数据。
+     *
+     * @param guard 删除执行行时再次校验的条件（适配器内部常量），两步之间状态变化的执行不删除执行行
+     */
+    private static PurgeResult deleteExecutions(
+            MySqlRuntimeDatabase.Tx tx, String tenant, List<String> ids, String guard) {
         if (ids.isEmpty()) return new PurgeResult(0, 0);
         var released = new TreeMap<String, Integer>();
         List<String> nodes = new ArrayList<>();
@@ -140,11 +183,12 @@ public final class MySqlObservationRetention {
                                     + ")",
                             args(tenant, chunk)),
                     Integer::sum);
-            // 再次校验 expires_at：两步之间被续期的记录不删除执行行本身。
+            // 再次校验选择条件：两步之间被续期或改变状态的记录不删除执行行本身。
             int deleted =
                     tx.update(
-                            "DELETE FROM engine_execution WHERE tenant_id=#{args[0]} AND"
-                                    + " expires_at<CURRENT_TIMESTAMP(6) AND execution_id IN ("
+                            "DELETE FROM engine_execution WHERE tenant_id=#{args[0]} AND "
+                                    + guard
+                                    + " AND execution_id IN ("
                                     + placeholders(chunk.size(), 1)
                                     + ")",
                             args(tenant, chunk));

@@ -79,7 +79,7 @@ DURABLE 默认工作池最多 16 个活动连接并保留最多 16 个 idle 连�
   | `flow-engine.observation.{events,logs,content}.retention` | 1h | 按创建时间独立过期 |
   | `flow-engine.observation.cleanup.interval` / `batch-size` / `max-batches` | 1m / 500 / 20 | 周期清理；每批独立 READ COMMITTED 短事务 |
 
-  DURABLE 非终态与 `WAITING_MANUAL` 永不按保留期删除；DURABLE 强状态（state、checkpoint、pinned Payload）不由该清理器处理。写入热路径不再执行过期删除；容量已满时先同步清理该租户一批过期记录再重试一次，仍满才返回 `RUNTIME_STORAGE_CAPACITY_EXCEEDED`。
+  DURABLE 非终态与 `WAITING_MANUAL` 永不按保留期删除；DURABLE 强状态（state、checkpoint、pinned Payload）不由该清理器处理。写入热路径不再执行过期删除；容量已满时先同步清理该租户过期记录，仍无可回收时按 `expires_at` 从早到晚淘汰至多 3 批（每批 50 个）终态执行（EPHEMERAL 终态最先），只有活动执行占满容量时才返回 `RUNTIME_STORAGE_CAPACITY_EXCEEDED`。
 - 自动恢复每秒扫描最多 100 条可恢复记录。旧 owner 被 `SIGKILL` 后，新实例必须等待数据库租约过期，随后从已提交的不可变 plan/request 恢复。
 - 已提交节点结果不重放；未知非幂等副作用进入 `WAITING_MANUAL`，不得自动猜测成功或失败。
 

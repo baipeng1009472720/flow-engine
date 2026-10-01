@@ -114,15 +114,6 @@ class MySqlObservationRetentionTest {
         finishedWithNode(store, tenant, old);
         String running = UUID.randomUUID().toString();
         store.saveExecution(record(tenant, running, ExecutionMode.DURABLE, ExecutionStatus.RUNNING));
-        assertThrows(
-                IllegalStateException.class,
-                () ->
-                        store.saveExecution(
-                                record(
-                                        tenant,
-                                        UUID.randomUUID().toString(),
-                                        ExecutionMode.EPHEMERAL,
-                                        ExecutionStatus.RUNNING)));
         db.transaction(
                 tx ->
                         tx.update(
@@ -137,6 +128,33 @@ class MySqlObservationRetentionTest {
         assertTrue(store.execution(running).isPresent());
         assertEquals(2L, usage(tenant, "engine_execution"));
         assertEquals(0L, usage(tenant, "engine_node_attempt"));
+    }
+
+    @Test
+    void fullCapacityEvictsOldestTerminalExecutionsButNeverActiveOnes() {
+        String tenant = "evict-" + UUID.randomUUID();
+        var store =
+                new MySqlObservationStore(
+                        db, tenant, Map.of("engine_event", 3), MySqlRetentionPolicy.defaults());
+        String finished = UUID.randomUUID().toString();
+        store.saveExecution(record(tenant, finished, ExecutionMode.EPHEMERAL, ExecutionStatus.RUNNING));
+        store.append(MySqlCapacityCounterTest.event(finished, 0));
+        store.commitTerminal(
+                record(tenant, finished, ExecutionMode.EPHEMERAL, ExecutionStatus.SUCCEEDED),
+                terminal(finished, 1));
+        String active = UUID.randomUUID().toString();
+        store.saveExecution(record(tenant, active, ExecutionMode.DURABLE, ExecutionStatus.RUNNING));
+        store.append(MySqlCapacityCounterTest.event(active, 0));
+        // 表已满且没有任何过期记录：淘汰最早可过期的终态执行，而不是让新执行写入失败。
+        store.append(MySqlCapacityCounterTest.event(active, 1));
+        assertTrue(store.execution(finished).isEmpty());
+        assertEquals(2, store.readAfter(active, -1).size());
+        store.append(MySqlCapacityCounterTest.event(active, 2));
+        // 只剩活动执行占满容量时保持硬上限。
+        assertThrows(
+                IllegalStateException.class,
+                () -> store.append(MySqlCapacityCounterTest.event(active, 3)));
+        assertEquals(3L, usage(tenant, "engine_event"));
     }
 
     private void finishedWithNode(MySqlObservationStore store, String tenant, String id) {
