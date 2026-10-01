@@ -174,14 +174,27 @@ public final class MySqlObservationRetention {
         return deleted;
     }
 
+    /**
+     * 回收一个租户的一批已过期非固定 Payload；供 Payload 写入在容量满时调用。
+     *
+     * @return 删除行数
+     */
+    static int purgeExpiredPayloads(MySqlRuntimeDatabase db, String tenant) {
+        return db.readCommittedTransaction(tx -> purgePayloads(tx, tenant, 500));
+    }
+
     private int purgePayloads(MySqlRuntimeDatabase.Tx tx, String tenant) {
+        return purgePayloads(tx, tenant, policy.batchSize());
+    }
+
+    private static int purgePayloads(MySqlRuntimeDatabase.Tx tx, String tenant, int batchSize) {
         int deleted =
                 tx.update(
                         "DELETE FROM engine_payload WHERE tenant_id=#{args[0]} AND pinned=FALSE AND"
                                 + " expires_at<CURRENT_TIMESTAMP(6) ORDER BY expires_at LIMIT"
                                 + " #{args[1]}",
                         tenant,
-                        policy.batchSize());
+                        batchSize);
         MySqlCapacity.release(tx, tenant, "engine_payload", deleted);
         return deleted;
     }

@@ -98,14 +98,30 @@ public final class MySqlExecutionStateStore implements FencedExecutionStateStore
         // expiry cleanup and checkpoint cleanup can lock the expiry and execution indexes in
         // opposite order and deadlock even though they target different executions.
         MySqlCapacity.lock(tx, tenant);
-        int released = tx.update(
-                "DELETE p FROM engine_payload p LEFT JOIN engine_checkpoint c ON"
-                    + " c.tenant_id=p.tenant_id AND c.execution_id=p.execution_id AND"
-                    + " JSON_UNQUOTE(JSON_EXTRACT(c.checkpoint,'$.document'))=p.payload_id WHERE"
-                    + " p.tenant_id=#{args[0]} AND p.execution_id=#{args[1]} AND p.pinned=TRUE AND"
-                    + " c.revision IS NULL",
-                tenant,
-                value.executionId());
+        // 先用一致性读找出不再被任何保留检查点引用的固定 Payload，再按主键删除：主键等值删除只加记录锁，
+        // 不会像范围 DELETE 那样持有 ix_payload_execution 的间隙锁，从而不与写后缓冲批量插入的
+        // 同一执行的非固定 Payload 形成死锁。
+        List<String> unreferenced =
+                tx
+                        .rows(
+                                "SELECT p.payload_id FROM engine_payload p LEFT JOIN engine_checkpoint"
+                                    + " c ON c.tenant_id=p.tenant_id AND c.execution_id=p.execution_id"
+                                    + " AND JSON_UNQUOTE(JSON_EXTRACT(c.checkpoint,'$.document'))=p.payload_id"
+                                    + " WHERE p.tenant_id=#{args[0]} AND p.execution_id=#{args[1]} AND"
+                                    + " p.pinned=TRUE AND c.revision IS NULL",
+                                tenant,
+                                value.executionId())
+                        .stream()
+                        .map(r -> MySqlRuntimeDatabase.text(r, "payload_id"))
+                        .toList();
+        int released = 0;
+        for (String payloadId : unreferenced)
+            released +=
+                    tx.update(
+                            "DELETE FROM engine_payload WHERE tenant_id=#{args[0]} AND"
+                                    + " payload_id=#{args[1]} AND pinned=TRUE",
+                            tenant,
+                            payloadId);
         MySqlCapacity.release(tx, tenant, "engine_payload", released);
         return new ExecutionState(value.executionId(), revision + 1, value.status(), value.state());
     }

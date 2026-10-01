@@ -11,6 +11,9 @@ import java.util.*;
  * Opaque tenant-owned bounded values; pinned recovery payloads do not expire with observation data.
  */
 public final class MySqlPayloadStore implements PayloadStore {
+    /** 每租户 Payload 行数上限。 */
+    static final int CAPACITY = 10000;
+
     private final MySqlRuntimeDatabase db;
     private final String tenant;
     private final int maxBytes;
@@ -41,36 +44,67 @@ public final class MySqlPayloadStore implements PayloadStore {
     }
 
     private PayloadReference store(String id, Object payload, boolean pinned) {
-        String body = JSON.toJSONString(JsonValues.copyValue(payload, "payload"));
-        int size = body.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
-        if (size > maxBytes) throw new IllegalArgumentException("PAYLOAD_TOO_LARGE");
-        String ref = UUID.randomUUID().toString();
+        var prepared = prepare(id, payload, maxBytes);
+        var write =
+                new ObservationWrite.StorePayload(
+                        UUID.randomUUID().toString(), id, prepared.body(), prepared.size());
+        try {
+            insertWithTenantLock(write, pinned);
+        } catch (IllegalStateException full) {
+            // 容量满时先回收本租户已过期的非固定 Payload，再完整重试一次；仍满则保持硬上限。
+            if (!MySqlCapacity.EXCEEDED.equals(full.getMessage())
+                    || MySqlObservationRetention.purgeExpiredPayloads(db, tenant) == 0) throw full;
+            insertWithTenantLock(write, pinned);
+        }
+        return new PayloadReference(write.reference());
+    }
+
+    private void insertWithTenantLock(ObservationWrite.StorePayload write, boolean pinned) {
         db.capacityTransaction(
                 tenant,
                 tx -> {
+                    // 固定 Payload 与检查点清理共享租户互斥，保持既有加锁顺序；过期清理已移出热路径。
                     MySqlCapacity.lock(tx, tenant);
-                    MySqlCapacity.release(
-                            tx,
-                            tenant,
-                            "engine_payload",
-                            tx.update(
-                                    "DELETE FROM engine_payload WHERE tenant_id=#{args[0]} AND"
-                                            + " pinned=FALSE AND expires_at<CURRENT_TIMESTAMP(6)",
-                                    tenant));
-                    MySqlCapacity.reserve(tx, tenant, "engine_payload", 10000);
-                    return tx.update(
-                            "INSERT INTO engine_payload"
-                                + " VALUES(#{args[0]},#{args[1]},#{args[2]},#{args[3]},#{args[4]},#{args[5]},TIMESTAMPADD(MICROSECOND,#{args[6]},CURRENT_TIMESTAMP(6)),#{args[7]})",
-                            tenant,
-                            ref,
-                            id,
-                            MySqlIdempotencyStore.digest(body),
-                            size,
-                            body,
-                            retention.toMillis() * 1000,
-                            pinned);
+                    insert(tx, tenant, write, pinned, retention);
+                    MySqlCapacity.reserve(tx, tenant, "engine_payload", CAPACITY);
+                    return null;
                 });
-        return new PayloadReference(ref);
+    }
+
+    /**
+     * 在调用线程完成深拷贝、序列化和大小校验，使超限立即以 {@code PAYLOAD_TOO_LARGE} 拒绝。
+     *
+     * @return 序列化文本及其 UTF-8 字节数
+     */
+    static Prepared prepare(String executionId, Object payload, int maxBytes) {
+        Objects.requireNonNull(executionId, "executionId");
+        String body = JSON.toJSONString(JsonValues.copyValue(payload, "payload"));
+        int size = body.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        if (size > maxBytes) throw new IllegalArgumentException("PAYLOAD_TOO_LARGE");
+        return new Prepared(body, size);
+    }
+
+    /** 已校验的 Payload 文本。 */
+    record Prepared(String body, int size) {}
+
+    /** 插入一行 Payload；调用方负责在同一事务内预留 {@code engine_payload} 容量。 */
+    static void insert(
+            MySqlRuntimeDatabase.Tx tx,
+            String tenant,
+            ObservationWrite.StorePayload write,
+            boolean pinned,
+            Duration retention) {
+        tx.update(
+                "INSERT INTO engine_payload"
+                    + " VALUES(#{args[0]},#{args[1]},#{args[2]},#{args[3]},#{args[4]},#{args[5]},TIMESTAMPADD(MICROSECOND,#{args[6]},CURRENT_TIMESTAMP(6)),#{args[7]})",
+                tenant,
+                write.reference(),
+                write.executionId(),
+                MySqlIdempotencyStore.digest(write.body()),
+                write.size(),
+                write.body(),
+                retention.toMillis() * 1000,
+                pinned);
     }
 
     public Optional<Object> find(PayloadReference ref) {

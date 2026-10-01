@@ -10,13 +10,26 @@ import java.util.*;
  * Internal owner routing for a multi-tenant host. API authorization still runs in ExecutionService;
  * opaque IDs resolve to exactly one tenant or fail closed. No caller-selected default tenant
  * exists.
+ *
+ * <p>启用写后缓冲时：执行首次落库（容量预留需先于副作用）、带 finishedAt 的记录与终态事件同步提交；
+ * 其余诊断写入进入按执行划分的有序通道异步批量提交。所有读取先排空相关通道，保证读己之写；
+ * {@link #flush} 与终态提交前排空并报告失败；{@link #close} 排空全部通道。
  */
-public final class MySqlTenantStoreRouter implements ExecutionRecordStore, PayloadStore {
+public final class MySqlTenantStoreRouter
+        implements ExecutionRecordStore, PayloadStore, AutoCloseable {
+    private static final int IDENTITY_CACHE = 65536;
+    private static final Set<String> TERMINAL_EVENTS =
+            Set.of("COMPLETED", "FAILED", "CANCELLED", "WAITING");
     private final MySqlRuntimeDatabase db;
     private final Map<String, Integer> capacities;
     private final MySqlRetentionPolicy policy;
     private final int payloadMaxBytes;
     private final Duration payloadRetention;
+    private final ObservationWriteBehind buffer;
+    /** executionId → tenant；只缓存已确认存在的执行，用于跳过路由查询并判断是否已首次落库。 */
+    private final Map<String, String> tenants = lru();
+    /** nodeExecutionId / payloadId → executionId，用于按不透明 ID 读取前排空所属通道。 */
+    private final Map<String, String> owners = lru();
 
     public MySqlTenantStoreRouter(MySqlRuntimeDatabase db) {
         this(db, Map.of(), Map.of(), 1048576, Duration.ofHours(1));
@@ -57,11 +70,59 @@ public final class MySqlTenantStoreRouter implements ExecutionRecordStore, Paylo
             MySqlRetentionPolicy policy,
             int payloadMaxBytes,
             Duration payloadRetention) {
+        this(db, capacities, policy, payloadMaxBytes, payloadRetention, null);
+    }
+
+    /**
+     * 启用观察写后缓冲的构造。
+     *
+     * @param writeBehind 写线程数、全局待写上限与单批上限；为 null 时全部同步写入
+     */
+    public MySqlTenantStoreRouter(
+            MySqlRuntimeDatabase db,
+            Map<String, Integer> capacities,
+            MySqlRetentionPolicy policy,
+            int payloadMaxBytes,
+            Duration payloadRetention,
+            WriteBehind writeBehind) {
         this.db = db;
         this.capacities = Map.copyOf(capacities);
         this.policy = Objects.requireNonNull(policy);
         this.payloadMaxBytes = payloadMaxBytes;
         this.payloadRetention = payloadRetention;
+        this.buffer =
+                writeBehind == null
+                        ? null
+                        : new ObservationWriteBehind(
+                                (tenant, batch) ->
+                                        records(tenant).applyBatch(batch, payloadRetention),
+                                writeBehind.writers(),
+                                writeBehind.maxPending(),
+                                writeBehind.maxBatch());
+    }
+
+    /**
+     * 写后缓冲参数。
+     *
+     * @param writers 后台写线程（即后台最多占用的连接数）
+     * @param maxPending 全局待写条数上限，超过后由提交者同步排空
+     * @param maxBatch 单事务最多合并条数
+     */
+    public record WriteBehind(int writers, int maxPending, int maxBatch) {
+        public WriteBehind {
+            if (writers < 1 || maxPending < 1 || maxBatch < 1)
+                throw new IllegalArgumentException("write-behind bounds invalid");
+        }
+    }
+
+    private static Map<String, String> lru() {
+        return Collections.synchronizedMap(
+                new LinkedHashMap<>(1024, 0.75f, true) {
+                    @Override
+                    protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+                        return size() > IDENTITY_CACHE;
+                    }
+                });
     }
 
     public DurableStores durableStores(String tenant) {
@@ -131,8 +192,13 @@ public final class MySqlTenantStoreRouter implements ExecutionRecordStore, Paylo
     }
 
     private String executionTenant(String id) {
-        return tenant("engine_execution", "execution_id", id)
-                .orElseThrow(() -> new IllegalStateException("EXECUTION_NOT_FOUND"));
+        String cached = tenants.get(id);
+        if (cached != null) return cached;
+        String tenant =
+                tenant("engine_execution", "execution_id", id)
+                        .orElseThrow(() -> new IllegalStateException("EXECUTION_NOT_FOUND"));
+        tenants.put(id, tenant);
+        return tenant;
     }
 
     private String nodeTenant(String id) {
@@ -140,83 +206,151 @@ public final class MySqlTenantStoreRouter implements ExecutionRecordStore, Paylo
                 .orElseThrow(() -> new IllegalStateException("NODE_NOT_FOUND"));
     }
 
+    /** 读取或同步写入前排空一个执行的通道；失败保留给 flush 报告。 */
+    private void drain(String executionId) {
+        if (buffer != null && executionId != null) buffer.drain(executionId);
+    }
+
+    private void drainOwner(String opaqueId) {
+        if (buffer != null) drain(owners.get(opaqueId));
+    }
+
     public void saveExecution(ExecutionRecord r) {
-        records(r.flowIdentity().tenantId()).saveExecution(r);
+        String tenant = r.flowIdentity().tenantId();
+        if (buffer == null || r.finishedAt() != null || !tenant.equals(tenants.get(r.executionId()))) {
+            // 首次落库同步完成容量预留与租户绑定；带 finishedAt 的补偿记录同样不得滞留在缓冲中。
+            drain(r.executionId());
+            records(tenant).saveExecution(r);
+            tenants.put(r.executionId(), tenant);
+            return;
+        }
+        buffer.submit(tenant, new ObservationWrite.SaveExecution(r));
     }
 
     public Optional<ExecutionRecord> execution(String id) {
+        drain(id);
         return tenant("engine_execution", "execution_id", id)
                 .flatMap(t -> records(t).execution(id));
     }
 
     public void commitTerminal(ExecutionRecord r, ExecutionEvent e) {
+        drain(r.executionId());
         records(r.flowIdentity().tenantId()).commitTerminal(r, e);
+        completed(r.executionId());
     }
 
     public void commitTerminal(ExecutionRecord r, ExecutionEvent e, ExecutionLease l) {
+        drain(r.executionId());
         records(r.flowIdentity().tenantId()).commitTerminal(r, e, l);
+        completed(r.executionId());
+    }
+
+    private void completed(String executionId) {
+        if (buffer != null) buffer.complete(executionId);
     }
 
     public void append(ExecutionEvent e) {
-        records(executionTenant(e.executionId())).append(e);
+        String tenant = executionTenant(e.executionId());
+        if (buffer == null || (e.nodeId() == null && TERMINAL_EVENTS.contains(e.eventType()))) {
+            drain(e.executionId());
+            records(tenant).append(e);
+            return;
+        }
+        buffer.submit(tenant, new ObservationWrite.AppendEvent(e));
     }
 
     public List<ExecutionEvent> readAfter(String id, long cursor) {
+        drain(id);
         return tenant("engine_execution", "execution_id", id)
                 .map(t -> records(t).readAfter(id, cursor))
                 .orElse(List.of());
     }
 
     public void saveNode(NodeExecutionRecord r) {
-        records(executionTenant(r.executionId())).saveNode(r);
+        String tenant = executionTenant(r.executionId());
+        if (buffer == null) {
+            records(tenant).saveNode(r);
+            return;
+        }
+        owners.put(r.nodeExecutionId(), r.executionId());
+        buffer.submit(tenant, new ObservationWrite.SaveNode(r));
     }
 
     public Optional<NodeExecutionRecord> node(String id) {
+        drainOwner(id);
         return tenant("engine_node_attempt", "node_execution_id", id)
                 .flatMap(t -> records(t).node(id));
     }
 
     public List<NodeExecutionRecord> nodes(String id) {
+        drain(id);
         return tenant("engine_execution", "execution_id", id)
                 .map(t -> records(t).nodes(id))
                 .orElse(List.of());
     }
 
     public void appendLog(ExecutionLogRecord r) {
-        records(nodeTenant(r.nodeExecutionId())).appendLog(r);
+        if (buffer == null) {
+            records(nodeTenant(r.nodeExecutionId())).appendLog(r);
+            return;
+        }
+        buffer.submit(executionTenant(r.executionId()), new ObservationWrite.AppendLog(r));
     }
 
     public List<ExecutionLogRecord> logs(String id) {
+        drainOwner(id);
         return tenant("engine_node_attempt", "node_execution_id", id)
                 .map(t -> records(t).logs(id))
                 .orElse(List.of());
     }
 
     public void appendContent(String id, ContentChunk c) {
-        records(nodeTenant(id)).appendContent(id, c);
+        if (buffer == null) {
+            records(nodeTenant(id)).appendContent(id, c);
+            return;
+        }
+        buffer.submit(executionTenant(c.executionId()), new ObservationWrite.AppendContent(id, c));
     }
 
     public List<ContentChunk> content(String id) {
+        drainOwner(id);
         return tenant("engine_node_attempt", "node_execution_id", id)
                 .map(t -> records(t).content(id))
                 .orElse(List.of());
     }
 
     public void flush(String id) {
-        records(executionTenant(id)).flush(id);
+        if (buffer != null) buffer.flush(id);
     }
 
     public PayloadReference store(String id, Object value) {
-        return payloads(executionTenant(id)).store(id, value);
+        String tenant = executionTenant(id);
+        if (buffer == null) return payloads(tenant).store(id, value);
+        // 序列化与大小校验在调用线程完成；引用立即可用，读取前会排空所属通道。
+        var prepared = MySqlPayloadStore.prepare(id, value, payloadMaxBytes);
+        var write =
+                new ObservationWrite.StorePayload(
+                        UUID.randomUUID().toString(), id, prepared.body(), prepared.size());
+        owners.put(write.reference(), id);
+        buffer.submit(tenant, write);
+        return new PayloadReference(write.reference());
     }
 
     public Optional<Object> find(PayloadReference ref) {
+        drainOwner(ref.value());
         return tenant("engine_payload", "payload_id", ref.value())
                 .flatMap(t -> payloads(t).find(ref));
     }
 
     public Optional<String> executionId(PayloadReference ref) {
+        drainOwner(ref.value());
         return tenant("engine_payload", "payload_id", ref.value())
                 .flatMap(t -> payloads(t).executionId(ref));
+    }
+
+    /** 排空全部写后通道并停止后台写线程；之后的写入在调用线程同步提交。 */
+    @Override
+    public void close() {
+        if (buffer != null) buffer.close();
     }
 }

@@ -127,6 +127,8 @@ public final class ExecutionRecorder {
         var record = store.execution(id);
         if (record.isEmpty()) return false;
         var run = new Run(record.get());
+        // 接管时一次性载入已提交的尝试历史；之后的排队序号只在内存中递增，不再逐节点回读存储。
+        store.nodes(id).forEach(n -> run.observeAttempt(n.nodeId(), n.scopePath(), n.attempt()));
         run.sequence =
                 Math.max(
                         record.get().eventCursor(),
@@ -144,15 +146,19 @@ public final class ExecutionRecorder {
      */
     public synchronized Attempt queued(String executionId, CompiledNode node, ScopePath scope) {
         var attempt = new Attempt(executionId, node, scope);
+        Run run = active.get(executionId);
         int number =
-                store.nodes(executionId).stream()
-                                .filter(
-                                        r ->
-                                                r.nodeId().equals(node.node().id())
-                                                        && r.scopePath().equals(scope.value()))
-                                .mapToInt(NodeExecutionRecord::attempt)
-                                .max()
-                                .orElse(0)
+                (run != null
+                                ? run.lastAttempt(node.node().id(), scope.value())
+                                : store.nodes(executionId).stream()
+                                        .filter(
+                                                r ->
+                                                        r.nodeId().equals(node.node().id())
+                                                                && r.scopePath()
+                                                                        .equals(scope.value()))
+                                        .mapToInt(NodeExecutionRecord::attempt)
+                                        .max()
+                                        .orElse(0))
                         + 1;
         attempt.newRecord(number);
         return attempt;
@@ -487,9 +493,19 @@ public final class ExecutionRecorder {
         private long sequence = -1;
         private final Map<Object, String> causes = new IdentityHashMap<>();
         private boolean auditFailed;
+        /** (nodeId, scopePath) → 已分配的最大尝试序号；活动执行的尝试身份只由本记录器分配。 */
+        private final Map<String, Integer> attempts = new HashMap<>();
 
         private Run(ExecutionRecord record) {
             this.record = record;
+        }
+
+        private int lastAttempt(String nodeId, String scope) {
+            return attempts.getOrDefault(nodeId + '\u0000' + scope, 0);
+        }
+
+        private void observeAttempt(String nodeId, String scope, int attempt) {
+            attempts.merge(nodeId + '\u0000' + scope, attempt, Math::max);
         }
     }
 
@@ -530,6 +546,8 @@ public final class ExecutionRecorder {
                             null);
             logSequence = 0;
             contentSequence = 0;
+            Run run = active.get(executionId);
+            if (run != null) run.observeAttempt(record.nodeId(), record.scopePath(), number);
             store.saveNode(record);
             emit(executionId, record, "NODE_QUEUED", ExecutionStatus.QUEUED, Map.of());
         }

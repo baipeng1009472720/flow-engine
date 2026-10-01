@@ -42,7 +42,8 @@ public class DurableAutoConfiguration {
         return db;
     }
 
-    @Bean
+    /** 关闭时由 Spring 调用 close() 排空写后通道；依赖它的记录器与引擎先于它销毁。 */
+    @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean(com.playrewards.flowengine.spi.ExecutionRecordStore.class)
     MySqlTenantStoreRouter durableObservationStore(MySqlRuntimeDatabase db, Environment env) {
         var capacities = new java.util.HashMap<String, Integer>();
@@ -72,7 +73,23 @@ public class DurableAutoConfiguration {
                 capacities,
                 retentionPolicy(env),
                 env.getProperty("flow-engine.payload.max-bytes", Integer.class, 1048576),
-                duration(env, "flow-engine.observation.payloads.retention", "1h"));
+                duration(env, "flow-engine.observation.payloads.retention", "1h"),
+                writeBehind(env));
+    }
+
+    /**
+     * 观察写后缓冲默认开启：诊断写入按执行通道异步批量提交，终态与首次落库仍同步。
+     * {@code flow-engine.observation.write-behind.enabled=false} 时退回逐条同步写入。
+     */
+    private static MySqlTenantStoreRouter.WriteBehind writeBehind(Environment env) {
+        if (!env.getProperty("flow-engine.observation.write-behind.enabled", Boolean.class, true))
+            return null;
+        return new MySqlTenantStoreRouter.WriteBehind(
+                env.getProperty("flow-engine.observation.write-behind.writers", Integer.class, 4),
+                env.getProperty(
+                        "flow-engine.observation.write-behind.max-pending", Integer.class, 20000),
+                env.getProperty(
+                        "flow-engine.observation.write-behind.max-batch", Integer.class, 256));
     }
 
     /**

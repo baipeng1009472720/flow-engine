@@ -331,6 +331,10 @@ public final class MySqlObservationStore implements ExecutionRecordStore {
 
     private void appendLog(MySqlRuntimeDatabase.Tx tx, ExecutionLogRecord r, Ledger ledger) {
         requireNode(tx, r.nodeExecutionId());
+        insertLog(tx, r, ledger);
+    }
+
+    private void insertLog(MySqlRuntimeDatabase.Tx tx, ExecutionLogRecord r, Ledger ledger) {
         tx.update(
                 "INSERT INTO engine_log(tenant_id,node_execution_id,sequence,body)"
                         + " VALUES(#{args[0]},#{args[1]},#{args[2]},#{args[3]})",
@@ -368,6 +372,11 @@ public final class MySqlObservationStore implements ExecutionRecordStore {
     private void appendContent(
             MySqlRuntimeDatabase.Tx tx, String id, ContentChunk chunk, Ledger ledger) {
         requireNode(tx, id);
+        insertContent(tx, id, chunk, ledger);
+    }
+
+    private void insertContent(
+            MySqlRuntimeDatabase.Tx tx, String id, ContentChunk chunk, Ledger ledger) {
         tx.update(
                 "INSERT INTO engine_content(tenant_id,node_execution_id,sequence,body)"
                         + " VALUES(#{args[0]},#{args[1]},#{args[2]},#{args[3]})",
@@ -398,6 +407,100 @@ public final class MySqlObservationStore implements ExecutionRecordStore {
                                 id,
                                 "sequence",
                                 ContentChunk.class));
+    }
+
+    /**
+     * 在一个事务内按顺序应用一批写后缓冲的观察写入。
+     *
+     * <p>同一批内对同一执行/节点尝试的多次快照只写最后一版，位置保持在首次出现处（后续写入只依赖其存在）；
+     * 同一执行的事件只锁定并读取一次游标，逐条校验严格递增后在事务末尾回写。所有新增行在末尾一次性
+     * 按表排序预留容量。任一写入失败则整批回滚，由调用方逐条重放定位失败项。
+     *
+     * @param writes 同一执行通道内按提交顺序排列的写入
+     * @param payloadRetention 非固定观察 Payload 的保留期
+     * @throws IllegalStateException 顺序冲突、引用缺失或容量已满
+     */
+    void applyBatch(List<ObservationWrite> writes, Duration payloadRetention) {
+        Map<String, ExecutionRecord> lastExecution = new HashMap<>();
+        Map<String, NodeExecutionRecord> lastNode = new HashMap<>();
+        for (var write : writes) {
+            if (write instanceof ObservationWrite.SaveExecution save) {
+                owned(save.record());
+                lastExecution.put(save.record().executionId(), save.record());
+            } else if (write instanceof ObservationWrite.SaveNode node)
+                lastNode.put(node.record().nodeExecutionId(), node.record());
+        }
+        write(
+                tx -> {
+                    var ledger = new Ledger();
+                    Set<String> savedExecutions = new HashSet<>(), savedNodes = new HashSet<>();
+                    Map<String, Long> cursors = new LinkedHashMap<>();
+                    for (var write : writes) {
+                        switch (write) {
+                            case ObservationWrite.SaveExecution save -> {
+                                String id = save.record().executionId();
+                                if (savedExecutions.add(id))
+                                    save(tx, lastExecution.get(id), ledger);
+                            }
+                            case ObservationWrite.SaveNode node -> {
+                                String id = node.record().nodeExecutionId();
+                                if (savedNodes.add(id)) saveNode(tx, lastNode.get(id), ledger);
+                            }
+                            case ObservationWrite.AppendEvent append ->
+                                    appendBuffered(tx, append.event(), cursors, ledger);
+                            case ObservationWrite.AppendLog log -> {
+                                if (!savedNodes.contains(log.record().nodeExecutionId()))
+                                    requireNode(tx, log.record().nodeExecutionId());
+                                insertLog(tx, log.record(), ledger);
+                            }
+                            case ObservationWrite.AppendContent content -> {
+                                if (!savedNodes.contains(content.nodeExecutionId()))
+                                    requireNode(tx, content.nodeExecutionId());
+                                insertContent(tx, content.nodeExecutionId(), content.chunk(), ledger);
+                            }
+                            case ObservationWrite.StorePayload payload -> {
+                                MySqlPayloadStore.insert(tx, tenant, payload, false, payloadRetention);
+                                ledger.add("engine_payload", 1);
+                            }
+                        }
+                    }
+                    for (var cursor : cursors.entrySet())
+                        tx.update(
+                                "UPDATE engine_execution SET event_cursor=#{args[2]} WHERE"
+                                        + " tenant_id=#{args[0]} AND execution_id=#{args[1]}",
+                                tenant,
+                                cursor.getKey(),
+                                cursor.getValue());
+                    ledger.reserve(tx);
+                    return null;
+                });
+    }
+
+    private void appendBuffered(
+            MySqlRuntimeDatabase.Tx tx, ExecutionEvent e, Map<String, Long> cursors, Ledger ledger) {
+        Long cursor = cursors.get(e.executionId());
+        if (cursor == null)
+            cursor =
+                    MySqlRuntimeDatabase.number(
+                            tx.row(
+                                            "SELECT event_cursor FROM engine_execution WHERE"
+                                                    + " tenant_id=#{args[0]} AND"
+                                                    + " execution_id=#{args[1]} FOR UPDATE",
+                                            tenant,
+                                            e.executionId())
+                                    .orElseThrow(
+                                            () -> new IllegalStateException("EXECUTION_NOT_FOUND")),
+                            "event_cursor");
+        if (e.sequence() <= cursor) throw new IllegalStateException("EVENT_SEQUENCE_CONFLICT");
+        tx.update(
+                "INSERT INTO engine_event(tenant_id,execution_id,sequence,body)"
+                        + " VALUES(#{args[0]},#{args[1]},#{args[2]},#{args[3]})",
+                tenant,
+                e.executionId(),
+                e.sequence(),
+                json(e));
+        cursors.put(e.executionId(), e.sequence());
+        ledger.add("engine_event", 1);
     }
 
     @Override
@@ -481,7 +584,14 @@ public final class MySqlObservationStore implements ExecutionRecordStore {
 
         void reserve(MySqlRuntimeDatabase.Tx tx) {
             for (var entry : rows.entrySet())
-                MySqlCapacity.reserve(tx, tenant, entry.getKey(), entry.getValue(), capacity(entry.getKey()));
+                MySqlCapacity.reserve(
+                        tx,
+                        tenant,
+                        entry.getKey(),
+                        entry.getValue(),
+                        entry.getKey().equals("engine_payload")
+                                ? MySqlPayloadStore.CAPACITY
+                                : capacity(entry.getKey()));
         }
     }
 }

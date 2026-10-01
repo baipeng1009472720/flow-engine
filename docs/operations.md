@@ -66,6 +66,7 @@ DURABLE 默认工作池最多 16 个活动连接并保留最多 16 个 idle 连�
 - Flyway 启动时执行只追加 migration。V3 为 `engine_payload(tenant_id, execution_id, pinned, payload_id)` 增加 checkpoint 清理索引；V4 新增 `engine_capacity_usage` 增量容量计数并按现有行数播种；禁止改写已发布 migration。
 - 容量上限不再每次 `COUNT(*)`：写入在同一事务内执行 `UPDATE engine_capacity_usage SET used=used+k WHERE used+k<=上限`，删除按实际影响行数递减。计数行锁持有到提交，因此并发下提交点 `used` 恒等于真实行数、不会超限（误差为 0）。滚动升级期间若旧版本进程仍在写入，会造成计数偏差，需一次性停旧版本后再启动新版本。
 - 执行租约为 15 秒，约每 5 秒续租。checkpoint 写入验证 owner、fencing token 和 revision CAS。
+- 观察写后缓冲（`flow-engine.observation.write-behind.*`，默认开启：`writers=4`、`max-pending=20000`、`max-batch=256`）：执行首次落库、带 `finishedAt` 的记录和终态事件同步提交；节点状态、生命周期事件、日志、内容流和非固定 Payload 进入按执行划分的有序通道，由后台写线程合并为单事务提交。同一执行内顺序不变，不同执行互不等待；所有读取（含 SSE 回放）先排空所属通道；`flush`/终态提交前排空并报告异步失败（严格审计下执行转为 `OBSERVATION_AUDIT_FAILED`）；全局待写超过上限时提交者同步排空（背压，不丢弃）；Spring 关闭时 `close()` 排空全部通道。进程被 `SIGKILL` 时最多丢失尚未提交的诊断写入，终态记录、DURABLE 检查点不受影响；恢复后事件序号从已提交游标继续。
 - 同租户 Payload、状态和观察容量写入先经过固定 64 stripe 的进程内队列，再获取数据库容量行锁；数据库锁仍负责跨 JVM 正确性。进程内同时 admission 上限固定为 256，可通过 `capacitySnapshot()` 读取无身份信息的当前 in-flight/limit；上限已满返回 `RUNTIME_STORAGE_CAPACITY_BUSY`，等待 stripe 锁时被中断返回 `RUNTIME_STORAGE_CAPACITY_INTERRUPTED`，两种情况都不会借用数据库连接。
 - 每执行仅保留最近两个完整 checkpoint；正在使用的 pinned Payload 不参与普通到期清理。
 - 观察记录保留（V5 增加 `engine_execution.expires_at` 及按创建时间/不透明 ID 的索引）：
