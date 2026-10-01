@@ -1,5 +1,7 @@
 package com.playrewards.flowengine.server.recovery;
 
+import com.playrewards.flowengine.server.TestMySql;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 import com.mysql.cj.jdbc.MysqlDataSource;
@@ -16,8 +18,6 @@ import com.playrewards.flowengine.spi.*;
 
 import org.junit.jupiter.api.*;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
-import org.testcontainers.containers.MySQLContainer;
-import org.testcontainers.junit.jupiter.*;
 
 import java.time.*;
 import java.util.*;
@@ -27,9 +27,8 @@ import java.util.concurrent.atomic.*;
 /**
  * A new Spring context and scheduler resume from committed MySQL state, never observation events.
  */
-@Testcontainers
 class DurableRecoveryTest {
-    @Container static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.4");
+    static final TestMySql MYSQL = TestMySql.start();
     MySqlRuntimeDatabase db;
 
     @BeforeEach

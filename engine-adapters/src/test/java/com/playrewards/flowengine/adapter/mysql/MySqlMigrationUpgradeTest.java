@@ -6,13 +6,10 @@ import com.mysql.cj.jdbc.MysqlDataSource;
 
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MySQLContainer;
-import org.testcontainers.junit.jupiter.*;
 
 /** V1 stays immutable: an existing database upgrades to latest without rewriting runtime data. */
-@Testcontainers
 class MySqlMigrationUpgradeTest {
-    @Container static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.4");
+    static final TestMySql MYSQL = TestMySql.start();
 
     @Test
     void upgradesExistingV1AndAddsPayloadExecutionIndexWithoutLosingCheckpoint() {

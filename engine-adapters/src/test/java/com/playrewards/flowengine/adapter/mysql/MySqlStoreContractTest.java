@@ -7,16 +7,13 @@ import com.playrewards.flowengine.contract.execution.ExecutionStatus;
 import com.playrewards.flowengine.spi.*;
 
 import org.junit.jupiter.api.*;
-import org.testcontainers.containers.MySQLContainer;
-import org.testcontainers.junit.jupiter.*;
 
 import java.time.*;
 import java.util.*;
 
 /** Real MySQL contracts: no in-memory replacement or Docker-unavailable skip. */
-@Testcontainers
 class MySqlStoreContractTest {
-    @Container static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.4");
+    static final TestMySql MYSQL = TestMySql.start();
     MySqlRuntimeDatabase db;
 
     @BeforeEach

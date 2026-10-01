@@ -1,5 +1,7 @@
 package com.playrewards.flowengine.server.api;
 
+import com.playrewards.flowengine.server.TestMySql;
+
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
@@ -12,17 +14,14 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
-import org.testcontainers.containers.MySQLContainer;
-import org.testcontainers.junit.jupiter.*;
 
 /** Real MySQL behind the authenticated Task 9 HTTP boundary; mode does not bypass tenant checks. */
-@Testcontainers
 @SpringBootTest(
         classes = ExecutionRequestContractTest.Host.class,
         properties = "flow-engine.durable.enabled=true")
 @AutoConfigureMockMvc
 class DurableApiTest {
-    @Container static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.4");
+    static final TestMySql MYSQL = TestMySql.start();
 
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
