@@ -894,6 +894,42 @@ class SandboxedGroovyRuntimeTest {
         assertEquals(expected, runtime.activeInvocationCount());
     }
 
+    @Test
+    void ordinary_runtime_errors_are_not_reported_as_sandbox_violations_and_carry_line_numbers() {
+        Map<String, Object> ctx = Map.of("items", List.of(1, 2), "text", "abc", "state", Map.of());
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            for (String script : List.of(
+                    "def a = 1\nreturn ctx.missing.value",
+                    "def a = 1\nreturn ctx.items[5]",
+                    "def a = 1\nreturn ctx.text - 1",
+                    "def a = 1\nreturn ctx.state.days + 1")) {
+                ScriptExecutionException failure = scriptFailure(runtime, script, ctx);
+                assertEquals("SCRIPT_RUNTIME_ERROR", failure.code(), script);
+                assertTrue(failure.getMessage().contains("line 2"), failure.getMessage());
+                // 只给出脚本行号与原因，不包含宿主类名、文件路径或输入值。
+                assertFalse(failure.getMessage().contains("/"), failure.getMessage());
+                assertFalse(failure.getMessage().contains("abc"), failure.getMessage());
+            }
+            // 宿主运行时异常保持既有错误码，仅补充脚本行号与异常类型。
+            ScriptExecutionException division = scriptFailure(runtime, "def a = 1\nreturn 1 / 0", ctx);
+            assertEquals("SCRIPT_RUNTIME_FAILED", division.code());
+            assertEquals("script execution failed at line 2: ArithmeticException", division.getMessage());
+            assertEquals("SCRIPT_SECURITY_VIOLATION",
+                    scriptFailure(runtime, "return new File('x')", ctx).code());
+            assertEquals("SCRIPT_SECURITY_VIOLATION",
+                    scriptFailure(runtime, "return ctx.text.allWhitespace", ctx).code());
+        }
+    }
+
+    private static ScriptExecutionException scriptFailure(
+            ScriptRuntime runtime, String script, Map<String, Object> ctx) {
+        CompletionException failure = assertThrows(CompletionException.class,
+                () -> runtime.execute(invocation(script, Map.of(), ctx,
+                        entry -> { }, () -> false, Instant.now().plusSeconds(2)))
+                        .toCompletableFuture().join());
+        return (ScriptExecutionException) failure.getCause();
+    }
+
     private static void assertScriptCode(ScriptRuntime runtime, String script, String code) {
         assertScriptCode(runtime, script, code, Map.of(), Map.of());
     }

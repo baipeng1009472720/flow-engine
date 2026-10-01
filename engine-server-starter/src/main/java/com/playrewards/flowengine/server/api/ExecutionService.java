@@ -334,7 +334,11 @@ public final class ExecutionService {
             error.put("code", record.errorCode());
             error.put("errorId", record.errorId());
             error.put("category", errorCategory(record.errorCode()));
-            error.put("message", "execution did not complete successfully");
+            // 失败摘要由观察边界在终态时选定（END 业务消息或“节点 + 错误码 + 安全消息”）；旧记录无该字段时回退固定文案。
+            error.put(
+                    "message",
+                    Objects.requireNonNullElse(
+                            record.errorMessage(), "execution did not complete successfully"));
             error.put("retryable", false);
             error.put("executionId", record.executionId());
             error.put("details", Map.of());

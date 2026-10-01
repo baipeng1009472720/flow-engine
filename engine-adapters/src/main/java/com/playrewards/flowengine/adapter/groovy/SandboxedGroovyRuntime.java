@@ -271,9 +271,11 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
         }
         ScriptInvocation invocation = control.invocation();
         LoggingWriter output = null;
+        Class<?> scriptClass = null;
         try {
             control.throwIfStopped();
             CachedScript compiled = compiled(invocation.script(), clock.instant());
+            scriptClass = compiled.scriptClass();
             control.throwIfStopped();
             output = new LoggingWriter(invocation.logger(), maxLogLineBytes,
                     maxLogTotalBytes, maxLogEntries);
@@ -324,7 +326,8 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                     || invocation.cancellationToken().isCancellationRequested()) {
                 control.cancelFromWorker();
             } else {
-                control.fail(new ScriptExecutionException(
+                ScriptExecutionException runtimeError = scriptRuntimeError(failure, scriptClass);
+                control.fail(runtimeError != null ? runtimeError : new ScriptExecutionException(
                         "SCRIPT_RUNTIME_FAILED", "script execution failed"));
             }
         } finally {
@@ -451,6 +454,10 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
         if (receiver == null && safe) {
             return null;
         }
+        if (receiver == null) {
+            // 读取空值的属性是脚本数据错误（等价 NPE），不是越权访问宿主对象。
+            throw new ScriptDataException("null value has no property '" + key + "'");
+        }
         if (!(receiver instanceof Map<?, ?> map)) {
             throw new SecurityException("script sandbox property receiver must be a JSON object");
         }
@@ -469,6 +476,9 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
     /** Reads only an exact JSON object key or JSON array index, without Groovy getAt dispatch. */
     public static Object readJsonIndex(Object receiver, Object index) {
         operationBudget().consume(1);
+        if (receiver == null) {
+            throw new ScriptDataException("null value cannot be indexed");
+        }
         if (receiver instanceof Map<?, ?> map) {
             if (!(index instanceof String key)) {
                 throw new SecurityException("script sandbox JSON object index must be a string");
@@ -478,7 +488,8 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
         if (receiver instanceof List<?> list) {
             int position = exactListIndex(index);
             if (position < 0 || position >= list.size()) {
-                throw new SecurityException("script sandbox JSON array index is outside the list");
+                throw new ScriptDataException("list index " + position + " is out of range (size "
+                        + list.size() + ")");
             }
             return list.get(position);
         }
@@ -496,7 +507,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
             throw new SecurityException("script sandbox JSON array index must be an integer");
         }
         if (index < Integer.MIN_VALUE || index > Integer.MAX_VALUE) {
-            throw new SecurityException("script sandbox JSON array index is outside the list");
+            throw new ScriptDataException("list index is out of range");
         }
         return (int) index;
     }
@@ -523,7 +534,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
     /** Executes unary numeric allocation only after reserving its projected result. */
     public static Object applyBudgetedUnary(int operator, Object value) {
         if (!(value instanceof Number number)) {
-            throw new SecurityException("script sandbox unary operand must be a JSON number");
+            throw new ScriptDataException("unary operand must be a number but was " + jsonType(value));
         }
         OperationBudget budget = operationBudget();
         long digits = numericAllocationBytes(number);
@@ -544,6 +555,9 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
      * @return bounded JSON-compatible collection result
      */
     public static Object applyBudgetedCollection(String method, Object receiver, Closure<?> closure) {
+        if (receiver == null) {
+            throw new ScriptDataException("null value has no method '" + method + "'");
+        }
         if (!(receiver instanceof List<?> values)) {
             throw new SecurityException("script sandbox collection receiver must be a JSON list");
         }
@@ -567,6 +581,9 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
      * @return converted text using stable locale-independent rules
      */
     public static Object applyBudgetedStringMethod(String method, Object receiver, Object... arguments) {
+        if (receiver == null) {
+            throw new ScriptDataException("null value has no method '" + method + "'");
+        }
         if (!(receiver instanceof String text)) {
             throw new SecurityException("script sandbox string method requires a JSON string");
         }
@@ -611,6 +628,9 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
 
     /** Executes an allowlisted numeric method after reserving its projected result. */
     public static Object applyBudgetedNumericMethod(String method, Object receiver, Object... arguments) {
+        if (receiver == null) {
+            throw new ScriptDataException("null value has no method '" + method + "'");
+        }
         if (!(receiver instanceof Number number)) {
             throw new SecurityException("script sandbox numeric method requires a JSON number");
         }
@@ -707,7 +727,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
             String rightText = scalarText(right);
             return leftText + rightText;
         }
-        throw new SecurityException("script sandbox plus operands must be JSON numbers, text or lists");
+        throw new ScriptDataException("cannot apply '+' to " + jsonType(left) + " and " + jsonType(right));
     }
 
     private static Object budgetedMultiply(Object left, Object right, OperationBudget budget) {
@@ -728,12 +748,13 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
             }
             return Collections.unmodifiableList(result);
         }
-        throw new SecurityException("script sandbox multiply operands must be JSON numbers, text or lists");
+        throw new ScriptDataException("cannot apply '*' to " + jsonType(left) + " and " + jsonType(right));
     }
 
     private static Object budgetedNumeric(int operator, Object left, Object right, OperationBudget budget) {
         if (!(left instanceof Number leftNumber) || !(right instanceof Number rightNumber)) {
-            throw new SecurityException("script sandbox numeric operator requires JSON numbers");
+            throw new ScriptDataException("arithmetic operator requires numbers but got "
+                    + jsonType(left) + " and " + jsonType(right));
         }
         long leftDigits = numericAllocationBytes(leftNumber);
         long rightDigits = numericAllocationBytes(rightNumber);
@@ -1048,6 +1069,95 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
         } catch (NoSuchAlgorithmException impossible) {
             throw new IllegalStateException("SHA-256 is unavailable", impossible);
         }
+    }
+
+    /**
+     * 脚本对 JSON 数据的普通运行时错误（空值访问、越界、类型不匹配）。
+     *
+     * <p>与 {@link SecurityException} 区分：它不代表试图越过沙箱，只说明脚本逻辑与输入数据不匹配，
+     * 对外映射为 {@code SCRIPT_RUNTIME_ERROR}。消息只包含脚本自身的键名与 JSON 类型名，不包含输入值。
+     */
+    static final class ScriptDataException extends RuntimeException {
+        ScriptDataException(String reason) {
+            // 保留调用栈：行号从栈中脚本类的帧解析，栈本身从不对外输出。
+            super(reason);
+        }
+    }
+
+    /** 只返回 JSON 类型名，避免把输入值写入错误消息。 */
+    private static String jsonType(Object value) {
+        if (value == null) return "null";
+        if (value instanceof String) return "string";
+        if (value instanceof Number) return "number";
+        if (value instanceof Boolean) return "boolean";
+        if (value instanceof List<?>) return "list";
+        if (value instanceof Map<?, ?>) return "object";
+        return "unsupported value";
+    }
+
+    /** 宿主类型的普通运行时异常：以类型简名描述，消息文本可能包含输入值，因此不对外输出。 */
+    private static final Set<Class<? extends Throwable>> SCRIPT_RUNTIME_TYPES = Set.of(
+            NullPointerException.class, ClassCastException.class, ArithmeticException.class,
+            IndexOutOfBoundsException.class, NumberFormatException.class,
+            IllegalArgumentException.class, UnsupportedOperationException.class,
+            groovy.lang.MissingMethodException.class, groovy.lang.MissingPropertyException.class);
+
+    /**
+     * 把脚本内的普通运行时失败转换为带行号的安全错误；无法归因到脚本代码时返回 null（保持原通用错误）。
+     *
+     * @param failure 脚本执行抛出的异常
+     * @param scriptClass 本次执行的已编译脚本类，用于在调用栈中定位脚本行号
+     */
+    private static ScriptExecutionException scriptRuntimeError(Throwable thrown, Class<?> scriptClass) {
+        // Groovy 反射调用可能把真实异常包在 InvokerInvocationException 等外层中，沿 cause 链寻找。
+        Throwable failure = thrown;
+        while (failure != null && !(failure instanceof ScriptDataException)
+                && !isScriptRuntimeType(failure)) {
+            failure = failure.getCause() == failure ? null : failure.getCause();
+        }
+        if (failure == null) {
+            return null;
+        }
+        boolean data = failure instanceof ScriptDataException;
+        String reason = data ? failure.getMessage() : failure.getClass().getSimpleName();
+        int line = scriptLine(failure, scriptClass);
+        if (line < 0 && !data) {
+            return null;
+        }
+        String at = line > 0 ? " at line " + line : "";
+        // 兼容：宿主运行时异常沿用既有 SCRIPT_RUNTIME_FAILED，只补充行号与异常类型；新码
+        // SCRIPT_RUNTIME_ERROR 只用于此前被误报为沙箱违规的 JSON 数据错误。
+        return data
+                ? new ScriptExecutionException("SCRIPT_RUNTIME_ERROR",
+                        "script runtime error" + at + ": " + reason)
+                : new ScriptExecutionException("SCRIPT_RUNTIME_FAILED",
+                        "script execution failed" + at + ": " + reason);
+    }
+
+    private static boolean isScriptRuntimeType(Throwable failure) {
+        for (Class<? extends Throwable> type : SCRIPT_RUNTIME_TYPES) {
+            if (type.isInstance(failure)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static int scriptLine(Throwable failure, Class<?> scriptClass) {
+        if (scriptClass == null) {
+            return -1;
+        }
+        String name = scriptClass.getName();
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            for (StackTraceElement frame : current.getStackTrace()) {
+                // 闭包编译为 Script$_run_closure1 等内部类，同样属于脚本源码。
+                if ((frame.getClassName().equals(name) || frame.getClassName().startsWith(name + "$"))
+                        && frame.getLineNumber() > 0) {
+                    return frame.getLineNumber();
+                }
+            }
+        }
+        return -1;
     }
 
     private static boolean isSecurityFailure(Throwable failure) {

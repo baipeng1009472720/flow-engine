@@ -139,6 +139,10 @@ node engine-server/scripts/verify-task14-durable-capacity.mjs
 | `EXECUTION_CAPACITY_EXCEEDED` | active/waiting 高水位、单租户/流程/组件限制；不要直接扩容队列 |
 | `RECOVERY_PAYLOAD_MISSING` | pinned Payload 是否被误清理、V3 migration 是否生效 |
 | `WAITING_MANUAL` | 未完成 SIDE_EFFECT 的外部幂等账本和人工处置记录 |
+| `SCRIPT_RUNTIME_ERROR`（新增） | 脚本对 JSON 数据的普通错误：空值取属性/方法、列表越界、运算类型不匹配；消息含脚本行号与 JSON 类型名，不含输入值 |
+| `SCRIPT_RUNTIME_FAILED` | 语义不变（宿主运行时异常）；消息现补充 `at line N: 异常类型` |
+| `SCRIPT_SECURITY_VIOLATION` | 仅表示真正的沙箱违规（宿主类/反射/文件/网络、非 JSON 接收者的 getter 等） |
+| 执行失败摘要 | `ExecutionRecord.errorMessage`/结果 `errorMessage`/查询 `error.message`：失败 END 原样透传配置的业务消息；其它为 `node <nodeCode> failed with <CODE>: <节点消息>`；`NodeExecutionRecord.errorMessage` 与 `NODE_FAILED`/终态事件 `message` 属性同步提供。未知异常只给错误码，不输出异常原文 |
 | SSE 断线 | 使用最后确认的 `Last-Event-ID` GET 重连；不要重发 POST |
 | 连接池卡顿 | 引擎状态池与业务池是否隔离、idle 是否为 16、MySQL/Docker 建连延迟 |
 

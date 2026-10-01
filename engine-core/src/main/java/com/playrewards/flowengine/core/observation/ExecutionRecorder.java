@@ -1,5 +1,6 @@
 package com.playrewards.flowengine.core.observation;
 
+import com.playrewards.flowengine.contract.component.ComponentType;
 import com.playrewards.flowengine.contract.execution.*;
 import com.playrewards.flowengine.core.compile.*;
 import com.playrewards.flowengine.core.event.BoundedExecutionEventBus;
@@ -16,6 +17,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * ctx.
  */
 public final class ExecutionRecorder {
+    private static final String GENERIC_FAILURE = "execution did not complete successfully";
+    private static final int MAX_MESSAGE_CHARS = 512;
     private final ExecutionRecordStore store;
     private final PayloadStore payloads;
     private final BoundedExecutionEventBus bus;
@@ -184,7 +187,9 @@ public final class ExecutionRecorder {
                                     .orElse(null)
                             : null,
                     record.errorCode(),
-                    record.errorCode() == null ? null : "execution did not complete successfully",
+                    record.errorCode() == null
+                            ? null
+                            : Objects.requireNonNullElse(record.errorMessage(), GENERIC_FAILURE),
                     record.errorId(),
                     record.startedAt(),
                     record.finishedAt());
@@ -201,9 +206,7 @@ public final class ExecutionRecorder {
                             result.status(),
                             result.result(),
                             result.errorCode(),
-                            result.errorCode() == null
-                                    ? null
-                                    : "execution did not complete successfully",
+                            result.errorCode() == null ? null : failureMessage(run, result, errorId),
                             errorId,
                             result.startedAt(),
                             result.finishedAt());
@@ -224,7 +227,8 @@ public final class ExecutionRecorder {
                             payload,
                             errorId,
                             result.errorCode(),
-                            r.eventCursor());
+                            r.eventCursor(),
+                            value.errorMessage());
             try {
                 store.flush(result.executionId());
             } catch (RuntimeException failure) {
@@ -249,7 +253,13 @@ public final class ExecutionRecorder {
                             clock.instant(),
                             errorId == null
                                     ? Map.of()
-                                    : Map.of("errorId", errorId, "code", result.errorCode()));
+                                    : Map.of(
+                                            "errorId",
+                                            errorId,
+                                            "code",
+                                            result.errorCode(),
+                                            "message",
+                                            value.errorMessage()));
             run.record = terminalRecord(run.record, value, payload, run.sequence);
             synchronized (bus) {
                 commitTerminal(run.record, terminal);
@@ -280,8 +290,40 @@ public final class ExecutionRecorder {
                 payload,
                 result.errorId(),
                 result.errorCode(),
-                cursor);
+                cursor,
+                result.errorMessage());
     }
+
+    /**
+     * 选择对外失败摘要：根因节点为失败 END 时原样透传其业务消息；其它节点失败组合“节点编码 + 错误码 +
+     * 节点给出的安全消息”；没有节点归因（截止时间、取消等）时使用调度器给出的固定安全文案。
+     */
+    private String failureMessage(Run run, ExecutionResult result, String errorId) {
+        Run root = active.getOrDefault(run.record.rootExecutionId(), run);
+        FailureDetail detail = errorId == null ? null : root.failures.get(errorId);
+        String message;
+        if (detail != null && detail.componentType() == ComponentType.END && detail.message() != null)
+            message = detail.message();
+        else if (detail != null)
+            message =
+                    "node "
+                            + detail.nodeCode()
+                            + " failed with "
+                            + detail.code()
+                            + (detail.message() == null ? "" : ": " + detail.message());
+        else message = result.errorMessage();
+        return bounded(message == null || message.isBlank() ? GENERIC_FAILURE : message);
+    }
+
+    /** 公开消息长度上限，防止节点把大段文本写入每条执行摘要。 */
+    private static String bounded(String message) {
+        String text = message.strip();
+        return text.length() <= MAX_MESSAGE_CHARS ? text : text.substring(0, MAX_MESSAGE_CHARS) + "…";
+    }
+
+    /** 根因节点失败的可公开描述，按 errorId 关联到执行结果。 */
+    private record FailureDetail(
+            String nodeCode, ComponentType componentType, String code, String message) {}
 
     /** 补偿记录带 finishedAt，可被宿主保留策略回收；清理不依赖补偿写入是否成功。 */
     private ExecutionResult failClosed(Run run, ExecutionResult selected) {
@@ -430,7 +472,8 @@ public final class ExecutionRecorder {
                         r.resultPayloadRef(),
                         r.errorId(),
                         r.errorCode(),
-                        sequence);
+                        sequence,
+                        r.errorMessage());
         store.saveExecution(run.record);
         forward(r, node, type, status, sequence, attrs);
     }
@@ -495,6 +538,8 @@ public final class ExecutionRecorder {
         private boolean auditFailed;
         /** (nodeId, scopePath) → 已分配的最大尝试序号；活动执行的尝试身份只由本记录器分配。 */
         private final Map<String, Integer> attempts = new HashMap<>();
+        /** errorId → 失败节点描述；只登记在根执行上，与 causes 的根因身份共用。 */
+        private final Map<String, FailureDetail> failures = new HashMap<>();
 
         private Run(ExecutionRecord record) {
             this.record = record;
@@ -543,6 +588,7 @@ public final class ExecutionRecorder {
                             null,
                             null,
                             null,
+                            null,
                             null);
             logSequence = 0;
             contentSequence = 0;
@@ -579,7 +625,8 @@ public final class ExecutionRecorder {
                                 savePayload(executionId, value),
                                 record.outputPayloadRef(),
                                 record.errorId(),
-                                record.errorCode());
+                                record.errorCode(),
+                                record.errorMessage());
                 store.saveNode(record);
             }
         }
@@ -595,9 +642,11 @@ public final class ExecutionRecorder {
                     failed(
                             new NodeExecutionException(
                                     result.terminalOutcome().errorCode(),
-                                    "END failure",
+                                    Objects.requireNonNullElse(
+                                            result.terminalOutcome().errorMessage(), "END failure"),
                                     result.terminalOutcome().status()),
-                            result.terminalOutcome());
+                            result.terminalOutcome(),
+                            result.terminalOutcome().errorMessage());
                     return;
                 }
                 transition(
@@ -615,10 +664,14 @@ public final class ExecutionRecorder {
          * Associates a safe error identity with this attempt and the owning execution's root cause.
          */
         public void failed(Throwable failure) {
-            failed(failure, failure);
+            // 只有声明为安全细节的节点异常才公开消息；未知异常文本可能含宿主路径或输入值。
+            failed(
+                    failure,
+                    failure,
+                    failure instanceof NodeExecutionException n ? n.getMessage() : null);
         }
 
-        private void failed(Throwable failure, Object cause) {
+        private void failed(Throwable failure, Object cause, String publicMessage) {
             synchronized (ExecutionRecorder.this) {
                 if (record.finishedAt() != null) return;
                 boolean cancelled =
@@ -629,6 +682,17 @@ public final class ExecutionRecorder {
                                 ? n.code()
                                 : cancelled ? "EXECUTION_CANCELLED" : "INTERNAL";
                 String id = errorIdentity(executionId, cause);
+                String message =
+                        publicMessage == null || publicMessage.isBlank()
+                                ? null
+                                : bounded(publicMessage);
+                Run run = required(executionId);
+                active.getOrDefault(run.record.rootExecutionId(), run)
+                        .failures
+                        .putIfAbsent(
+                                id,
+                                new FailureDetail(
+                                        record.nodeCode(), record.componentType(), code, message));
                 transition(
                         cancelled
                                 ? ExecutionStatus.CANCELLED
@@ -638,7 +702,8 @@ public final class ExecutionRecorder {
                         null,
                         null,
                         id,
-                        code);
+                        code,
+                        message);
                 try {
                     diagnostic("node failed", ExecutionLogLevel.ERROR, id);
                 } catch (RuntimeException auditFailure) {
@@ -759,6 +824,16 @@ public final class ExecutionRecorder {
 
         private void transition(
                 ExecutionStatus status, String input, String output, String errorId, String code) {
+            transition(status, input, output, errorId, code, null);
+        }
+
+        private void transition(
+                ExecutionStatus status,
+                String input,
+                String output,
+                String errorId,
+                String code,
+                String message) {
             Instant started = record.startedAt();
             if (status == ExecutionStatus.RUNNING && started == null) started = clock.instant();
             boolean ended = status != ExecutionStatus.RUNNING && status != ExecutionStatus.QUEUED;
@@ -778,7 +853,8 @@ public final class ExecutionRecorder {
                             input == null ? record.inputPayloadRef() : input,
                             output == null ? record.outputPayloadRef() : output,
                             errorId,
-                            code);
+                            code,
+                            message);
             store.saveNode(record);
             if (active.containsKey(executionId))
                 emit(
@@ -793,7 +869,11 @@ public final class ExecutionRecorder {
                             default -> "NODE_FAILED";
                         },
                         status,
-                        errorId == null ? Map.of() : Map.of("errorId", errorId, "code", code));
+                        errorId == null
+                                ? Map.of()
+                                : message == null
+                                        ? Map.of("errorId", errorId, "code", code)
+                                        : Map.of("errorId", errorId, "code", code, "message", message));
         }
 
         /** Resolves an inactive incoming branch without claiming the executor ran. */
