@@ -98,7 +98,7 @@ public final class MySqlExecutionStateStore implements FencedExecutionStateStore
         // expiry cleanup and checkpoint cleanup can lock the expiry and execution indexes in
         // opposite order and deadlock even though they target different executions.
         MySqlCapacity.lock(tx, tenant);
-        tx.update(
+        int released = tx.update(
                 "DELETE p FROM engine_payload p LEFT JOIN engine_checkpoint c ON"
                     + " c.tenant_id=p.tenant_id AND c.execution_id=p.execution_id AND"
                     + " JSON_UNQUOTE(JSON_EXTRACT(c.checkpoint,'$.document'))=p.payload_id WHERE"
@@ -106,6 +106,7 @@ public final class MySqlExecutionStateStore implements FencedExecutionStateStore
                     + " c.revision IS NULL",
                 tenant,
                 value.executionId());
+        MySqlCapacity.release(tx, tenant, "engine_payload", released);
         return new ExecutionState(value.executionId(), revision + 1, value.status(), value.state());
     }
 

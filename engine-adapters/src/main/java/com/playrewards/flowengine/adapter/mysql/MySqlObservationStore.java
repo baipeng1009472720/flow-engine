@@ -321,13 +321,17 @@ public final class MySqlObservationStore implements ExecutionRecordStore {
     private void prune(MySqlRuntimeDatabase.Tx tx) {
         MySqlCapacity.lock(tx, tenant);
         for (String table : List.of("engine_event", "engine_log", "engine_content"))
-            tx.update(
-                    "DELETE FROM "
-                            + table
-                            + " WHERE tenant_id=#{args[0]} AND"
-                            + " created_at<TIMESTAMPADD(MICROSECOND,-#{args[1]},CURRENT_TIMESTAMP(6))",
+            MySqlCapacity.release(
+                    tx,
                     tenant,
-                    retentions.getOrDefault(table, retention).toMillis() * 1000);
+                    table,
+                    tx.update(
+                            "DELETE FROM "
+                                    + table
+                                    + " WHERE tenant_id=#{args[0]} AND"
+                                    + " created_at<TIMESTAMPADD(MICROSECOND,-#{args[1]},CURRENT_TIMESTAMP(6))",
+                            tenant,
+                            retentions.getOrDefault(table, retention).toMillis() * 1000));
     }
 
     private <T> Optional<T> one(

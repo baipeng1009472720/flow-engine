@@ -49,10 +49,14 @@ public final class MySqlPayloadStore implements PayloadStore {
                 tenant,
                 tx -> {
                     MySqlCapacity.lock(tx, tenant);
-                    tx.update(
-                            "DELETE FROM engine_payload WHERE tenant_id=#{args[0]} AND pinned=FALSE"
-                                    + " AND expires_at<CURRENT_TIMESTAMP(6)",
-                            tenant);
+                    MySqlCapacity.release(
+                            tx,
+                            tenant,
+                            "engine_payload",
+                            tx.update(
+                                    "DELETE FROM engine_payload WHERE tenant_id=#{args[0]} AND"
+                                            + " pinned=FALSE AND expires_at<CURRENT_TIMESTAMP(6)",
+                                    tenant));
                     MySqlCapacity.reserve(tx, tenant, "engine_payload", 10000);
                     return tx.update(
                             "INSERT INTO engine_payload"
