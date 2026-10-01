@@ -8,7 +8,9 @@ import com.alibaba.fastjson2.JSON;
 import com.playrewards.flowengine.contract.bundle.*;
 import com.playrewards.flowengine.contract.component.*;
 import com.playrewards.flowengine.contract.flow.*;
+import com.playrewards.flowengine.contract.protocol.ProtocolSchema;
 import com.playrewards.flowengine.server.security.ExecutionAccessPolicy;
+import com.playrewards.flowengine.server.security.ExecutionAccessPolicy.CapturedAuthorization;
 import com.playrewards.flowengine.spi.FlowBundleLoader;
 
 import jakarta.servlet.http.HttpServletRequest;
@@ -19,6 +21,7 @@ import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.*;
+import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.util.*;
@@ -59,8 +62,10 @@ class ExecutionRequestContractTest {
                         999,
                         java.time.Instant.now(),
                         Map.of("contentPayloadRef", reference));
+        var request = new MockHttpServletRequest();
+        request.setUserPrincipal(() -> "tenant");
         assertFalse(
-                JSON.toJSONString(service.streamEvent("tenant", event))
+                JSON.toJSONString(service.streamEvent(service.capture(request), event))
                         .contains("private-stream-value"));
         mvc.perform(get("/v1/payloads/" + reference).principal(() -> "tenant"))
                 .andExpect(status().isForbidden());
@@ -72,17 +77,22 @@ class ExecutionRequestContractTest {
         @Bean
         ExecutionAccessPolicy access() {
             return new ExecutionAccessPolicy() {
-                public String tenantId(HttpServletRequest request) {
+                public CapturedAuthorization capture(HttpServletRequest request) {
                     if (request.getUserPrincipal() == null) throw new SecurityException();
-                    return request.getUserPrincipal().getName();
+                    return new TestAuthorization(request.getUserPrincipal().getName());
                 }
 
-                public void authorize(String tenant, FlowIdentity flow, Action action) {
-                    if (!tenant.equals(flow.tenantId()) || action == Action.PAYLOAD)
+                public void authorize(
+                        CapturedAuthorization caller, FlowIdentity flow, Action action) {
+                    if (!(caller instanceof TestAuthorization authorization)
+                            || !authorization.tenantId().equals(flow.tenantId())
+                            || action == Action.PAYLOAD)
                         throw new SecurityException();
                 }
             };
         }
+
+        private record TestAuthorization(String tenantId) implements CapturedAuthorization {}
 
         @Bean
         FlowBundleLoader loader() {
@@ -92,7 +102,7 @@ class ExecutionRequestContractTest {
                 }
 
                 public ExecutableFlowBundle load(String reference) {
-                    return bundle();
+                    return reference.equals("test:scope") ? bundleWithExternalScope() : bundle();
                 }
             };
         }
@@ -169,6 +179,23 @@ class ExecutionRequestContractTest {
                     .andExpect(status().isBadRequest());
     }
 
+    @Test
+    void validates_external_scope_schema_from_immutable_contract_maps() throws Exception {
+        mvc.perform(
+                        post("/v1/executions")
+                                .principal(() -> "tenant")
+                                .contentType("application/json")
+                                .content(
+                                        """
+                                        {
+                                          "flowReference":"test:scope",
+                                          "externalScopes":{"play":{"campaign":"fall"}}
+                                        }
+                                        """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("SUCCEEDED"));
+    }
+
     static ExecutableFlowBundle bundle() {
         var caps = new ComponentCapabilities(ComponentEffect.PURE, true, false, false, 4);
         return new ExecutableFlowBundle(
@@ -206,6 +233,32 @@ class ExecutionRequestContractTest {
                                         caps)),
                         Map.of(),
                         Map.of(),
+                        null,
+                        null)
+                .withCalculatedHash();
+    }
+
+    static ExecutableFlowBundle bundleWithExternalScope() {
+        ExecutableFlowBundle base = bundle();
+        return new ExecutableFlowBundle(
+                        base.contractVersion(),
+                        base.flowIdentity(),
+                        base.flowDefinition(),
+                        base.componentContracts(),
+                        base.protocolSchemas(),
+                        Map.of(
+                                "play",
+                                new ProtocolSchema(
+                                        "play",
+                                        "v1",
+                                        Map.of(
+                                                "type", "object",
+                                                "properties",
+                                                        Map.of(
+                                                                "campaign",
+                                                                Map.of("type", "string")),
+                                                "required", List.of("campaign"),
+                                                "additionalProperties", false))),
                         null,
                         null)
                 .withCalculatedHash();

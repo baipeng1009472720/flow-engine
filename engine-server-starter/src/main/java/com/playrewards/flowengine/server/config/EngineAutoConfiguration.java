@@ -73,12 +73,13 @@ public class EngineAutoConfiguration {
     @ConditionalOnMissingBean
     ExecutionAccessPolicy executionAccessPolicy() {
         return new ExecutionAccessPolicy() {
-            public String tenantId(jakarta.servlet.http.HttpServletRequest request) {
+            public CapturedAuthorization capture(
+                    jakarta.servlet.http.HttpServletRequest request) {
                 throw new SecurityException();
             }
 
             public void authorize(
-                    String tenant,
+                    CapturedAuthorization caller,
                     com.playrewards.flowengine.contract.bundle.FlowIdentity flow,
                     Action action) {
                 throw new SecurityException();

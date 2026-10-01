@@ -70,11 +70,30 @@ public final class FlowCompiler {
      */
     public ExecutionPlan compile(ExecutableFlowBundle bundle) {
         Objects.requireNonNull(bundle, "bundle must not be null");
-        return compile(bundle, new LinkedHashSet<>(), new HashMap<>());
+        return compile(bundle, new LinkedHashSet<>(), new HashMap<>(), relatedFlowResolver);
+    }
+
+    /**
+     * Compiles one request with a resolver bound to its exact root reference.
+     *
+     * <p>A request resolver takes precedence without mutating this reusable compiler. Passing
+     * {@code null} preserves the host resolver configured at startup.</p>
+     *
+     * @param bundle exact root bundle
+     * @param requestResolver resolver scoped to the current request, or null
+     * @return immutable execution plan including related sub-flow plans
+     */
+    public ExecutionPlan compile(
+            ExecutableFlowBundle bundle, RelatedFlowResolver requestResolver) {
+        Objects.requireNonNull(bundle, "bundle must not be null");
+        RelatedFlowResolver effective =
+                requestResolver == null ? relatedFlowResolver : requestResolver;
+        return compile(bundle, new LinkedHashSet<>(), new HashMap<>(), effective);
     }
 
     private ExecutionPlan compile(ExecutableFlowBundle bundle, LinkedHashSet<FlowIdentity> ancestors,
-            Map<FlowIdentity, ExecutionPlan> compiledPlans) {
+            Map<FlowIdentity, ExecutionPlan> compiledPlans,
+            RelatedFlowResolver resolver) {
         List<CompilationIssue> issues = new ArrayList<>();
         issues.addAll(BundleHashValidator.issues(bundle));
 
@@ -105,7 +124,7 @@ public final class FlowCompiler {
         Map<String, Map<String, InputBinding>> bindingsByNode = parseAndValidateBindings(
                 nodesById, contractsByNode, graph, issues);
         Map<String, ExecutionPlan> subFlowPlans = resolveSubFlows(
-                bundle, nodesById, contractsByNode, ancestors, compiledPlans, issues);
+                bundle, nodesById, contractsByNode, ancestors, compiledPlans, resolver, issues);
 
         if (!issues.isEmpty()) {
             issues.sort(ISSUE_ORDER);
@@ -693,6 +712,7 @@ public final class FlowCompiler {
     private Map<String, ExecutionPlan> resolveSubFlows(ExecutableFlowBundle parent,
             Map<String, FlowNode> nodes, Map<String, CompiledComponentContract> contracts,
             LinkedHashSet<FlowIdentity> ancestors, Map<FlowIdentity, ExecutionPlan> compiledPlans,
+            RelatedFlowResolver resolver,
             List<CompilationIssue> issues) {
         LinkedHashSet<FlowIdentity> lineage = new LinkedHashSet<>(ancestors);
         lineage.add(parent.flowIdentity());
@@ -714,7 +734,7 @@ public final class FlowCompiler {
                         "SUB_FLOW 禁止直接或间接递归调用: " + targetFlowId));
                 continue;
             }
-            if (relatedFlowResolver == null) {
+            if (resolver == null) {
                 issues.add(issue("FLOW_SUB_FLOW_TARGET_NOT_FOUND", node.id(), "config.targetFlowId",
                         "未配置同版本子流程解析器: " + targetFlowId));
                 continue;
@@ -726,14 +746,14 @@ public final class FlowCompiler {
             }
             try {
                 ExecutableFlowBundle child = Objects.requireNonNull(
-                        relatedFlowResolver.resolve(parent.flowIdentity(), targetFlowId),
+                        resolver.resolve(parent.flowIdentity(), targetFlowId),
                         "related flow resolver returned null");
                 if (!child.flowIdentity().equals(targetIdentity)) {
                     issues.add(issue("FLOW_SUB_FLOW_IDENTITY_MISMATCH", node.id(), "config.targetFlowId",
                             "解析到的子流程必须与父流程同租户同版本且 flowId 精确匹配"));
                     continue;
                 }
-                result.put(node.id(), compile(child, lineage, compiledPlans));
+                result.put(node.id(), compile(child, lineage, compiledPlans, resolver));
             } catch (FlowCompilationException exception) {
                 issues.addAll(exception.issues());
             } catch (RuntimeException exception) {

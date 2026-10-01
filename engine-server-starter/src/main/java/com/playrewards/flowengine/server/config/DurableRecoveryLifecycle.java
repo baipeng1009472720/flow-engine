@@ -8,19 +8,23 @@ import org.springframework.context.SmartLifecycle;
 import java.util.concurrent.*;
 
 /** Bounded repeated strong-state scan allows takeover after a dead owner's lease expires. */
-final class DurableRecoveryLifecycle implements SmartLifecycle {
+public final class DurableRecoveryLifecycle implements SmartLifecycle {
     private final MySqlTenantStoreRouter stores;
     private final FlowEngine engine;
     private ScheduledExecutorService worker;
     private volatile boolean running;
+    private volatile long generation;
 
-    DurableRecoveryLifecycle(MySqlTenantStoreRouter stores, FlowEngine engine) {
+    /** Creates the same recovery scanner used by host auto-configuration and process probes. */
+    public DurableRecoveryLifecycle(MySqlTenantStoreRouter stores, FlowEngine engine) {
         this.stores = stores;
         this.engine = engine;
     }
 
-    public void start() {
+    public synchronized void start() {
+        if (running) return;
         running = true;
+        long workerGeneration = ++generation;
         worker =
                 Executors.newSingleThreadScheduledExecutor(
                         r -> {
@@ -28,13 +32,14 @@ final class DurableRecoveryLifecycle implements SmartLifecycle {
                             t.setDaemon(true);
                             return t;
                         });
-        worker.scheduleWithFixedDelay(this::recover, 0, 1, TimeUnit.SECONDS);
+        worker.scheduleWithFixedDelay(
+                () -> recover(workerGeneration), 0, 1, TimeUnit.SECONDS);
     }
 
-    private void recover() {
+    private void recover(long workerGeneration) {
         try {
             for (var candidate : stores.recoverable(100)) {
-                if (!running) return;
+                if (!isCurrent(workerGeneration)) return;
                 try {
                     engine.resume(candidate.executionId(), candidate.tenantId());
                 } catch (IllegalStateException busy) {
@@ -49,14 +54,23 @@ final class DurableRecoveryLifecycle implements SmartLifecycle {
                 }
             }
         } catch (RuntimeException failure) {
-            System.getLogger(getClass().getName())
-                    .log(System.Logger.Level.WARNING, "Durable recovery scan failed");
+            if (isCurrent(workerGeneration))
+                System.getLogger(getClass().getName())
+                        .log(System.Logger.Level.WARNING, "Durable recovery scan failed");
         }
     }
 
-    public void stop() {
+    private boolean isCurrent(long workerGeneration) {
+        return running && generation == workerGeneration;
+    }
+
+    public synchronized void stop() {
         running = false;
-        if (worker != null) worker.shutdownNow();
+        generation++;
+        if (worker != null) {
+            worker.shutdownNow();
+            worker = null;
+        }
     }
 
     public boolean isRunning() {

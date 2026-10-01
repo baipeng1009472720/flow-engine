@@ -445,6 +445,34 @@ class CancellationAndDeadlineTest {
     }
 
     @Test
+    void concurrency_snapshot_reports_active_and_waiting_permit_acquisitions() throws Exception {
+        ConcurrencyGovernor governor = new ConcurrencyGovernor(1, 1, 1, 1, 1, Clock.systemUTC());
+        ConcurrencyGovernor.PermitRequest request = new ConcurrencyGovernor.PermitRequest(
+                "tenant", "flow", "component", "resource");
+        CancellationHandle neverCancelled = new CancellationHandle();
+        CompletableFuture<ConcurrencyGovernor.Permit> waiting;
+
+        try (ConcurrencyGovernor.Permit ignored = governor.acquire(
+                request, neverCancelled, Instant.now().plusSeconds(5))) {
+            waiting = CompletableFuture.supplyAsync(() -> governor.acquire(
+                    request, neverCancelled, Instant.now().plusSeconds(5)));
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (governor.snapshot().waitingAcquisitions() != 1
+                    && System.nanoTime() < deadline) {
+                Thread.sleep(10);
+            }
+            assertEquals(
+                    new ConcurrencyGovernor.Snapshot(1, 1, 2), governor.snapshot());
+        }
+
+        try (ConcurrencyGovernor.Permit ignored = waiting.get(2, TimeUnit.SECONDS)) {
+            assertEquals(
+                    new ConcurrencyGovernor.Snapshot(1, 0, 1), governor.snapshot());
+        }
+        assertEquals(new ConcurrencyGovernor.Snapshot(0, 0, 0), governor.snapshot());
+    }
+
+    @Test
     void component_contract_max_concurrency_is_enforced_without_blocking_other_components() {
         ConcurrencyGovernor governor = new ConcurrencyGovernor(4, 4, 4, 4, 4, Clock.systemUTC());
         CancellationHandle neverCancelled = new CancellationHandle();

@@ -4,15 +4,19 @@ import { randomBytes } from 'node:crypto';
 import { readFile, mkdtemp, copyFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
 
 // Only creates and removes its own disposable MySQL container. Credentials stay in process env.
 const docker = process.env.FLOW_PROBE_DOCKER || 'docker';
 const label = `flow-recovery-probe-${randomBytes(6).toString('hex')}`;
 const password = randomBytes(24).toString('hex');
 const xml = await readFile('engine-server-starter/target/surefire-reports/TEST-com.playrewards.flowengine.server.recovery.DurableRecoveryTest.xml', 'utf8');
-const classpath = xml.match(/<property name="java.class.path" value="([^"]+)"/)[1]
+const reportClasspath = xml.match(/<property name="java.class.path" value="([^"]+)"/)[1]
   .replaceAll('&amp;', '&').replaceAll('&quot;', '"');
+const currentModules = [
+  'engine-contract', 'engine-spi', 'engine-core', 'engine-adapters', 'engine-server-starter', 'engine-server',
+].map(module => resolve(module, 'target/classes'));
+const classpath = [...currentModules, reportClasspath].join(delimiter);
 const classes = await mkdtemp(join(tmpdir(), 'flow-recovery-probe-'));
 let container;
 const children = new Set();

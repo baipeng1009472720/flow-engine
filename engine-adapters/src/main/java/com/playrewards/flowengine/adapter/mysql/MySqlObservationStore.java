@@ -51,7 +51,8 @@ public final class MySqlObservationStore implements ExecutionRecordStore {
 
     public void saveExecution(ExecutionRecord record) {
         owned(record);
-        db.transaction(
+        db.capacityTransaction(
+                tenant,
                 tx -> {
                     save(tx, record);
                     return null;
@@ -89,7 +90,8 @@ public final class MySqlObservationStore implements ExecutionRecordStore {
         owned(record);
         if (!record.executionId().equals(event.executionId()) || record.status() != event.status())
             throw new IllegalStateException("TERMINAL_EVENT_MISMATCH");
-        db.transaction(
+        db.capacityTransaction(
+                tenant,
                 tx -> {
                     save(tx, record);
                     append(tx, event);
@@ -98,7 +100,8 @@ public final class MySqlObservationStore implements ExecutionRecordStore {
     }
 
     public void append(ExecutionEvent event) {
-        db.transaction(
+        db.capacityTransaction(
+                tenant,
                 tx -> {
                     append(tx, event);
                     return null;
@@ -111,7 +114,8 @@ public final class MySqlObservationStore implements ExecutionRecordStore {
                 || record.status() != event.status()
                 || !record.rootExecutionId().equals(lease.executionId()))
             throw new IllegalStateException("TERMINAL_EVENT_MISMATCH");
-        db.transaction(
+        db.capacityTransaction(
+                tenant,
                 tx -> {
                     MySqlLeaseRepository.validate(tx, tenant, lease.executionId(), lease);
                     save(tx, record);
@@ -166,7 +170,8 @@ public final class MySqlObservationStore implements ExecutionRecordStore {
     }
 
     public void saveNode(NodeExecutionRecord r) {
-        db.transaction(
+        db.capacityTransaction(
+                tenant,
                 tx -> {
                     prune(tx);
                     if (one(
@@ -237,7 +242,8 @@ public final class MySqlObservationStore implements ExecutionRecordStore {
     }
 
     public void appendLog(ExecutionLogRecord r) {
-        db.transaction(
+        db.capacityTransaction(
+                tenant,
                 tx -> {
                     prune(tx);
                     MySqlCapacity.reserve(tx, tenant, "engine_log", capacity("engine_log"));
@@ -272,7 +278,8 @@ public final class MySqlObservationStore implements ExecutionRecordStore {
     }
 
     public void appendContent(String id, ContentChunk chunk) {
-        db.transaction(
+        db.capacityTransaction(
+                tenant,
                 tx -> {
                     prune(tx);
                     MySqlCapacity.reserve(tx, tenant, "engine_content", capacity("engine_content"));
@@ -313,7 +320,6 @@ public final class MySqlObservationStore implements ExecutionRecordStore {
     /** Diagnostic retention never deletes strong checkpoints or their pinned values. */
     private void prune(MySqlRuntimeDatabase.Tx tx) {
         MySqlCapacity.lock(tx, tenant);
-        long micros = retention.toMillis() * 1000;
         for (String table : List.of("engine_event", "engine_log", "engine_content"))
             tx.update(
                     "DELETE FROM "
@@ -322,13 +328,6 @@ public final class MySqlObservationStore implements ExecutionRecordStore {
                             + " created_at<TIMESTAMPADD(MICROSECOND,-#{args[1]},CURRENT_TIMESTAMP(6))",
                     tenant,
                     retentions.getOrDefault(table, retention).toMillis() * 1000);
-        tx.update(
-                "DELETE n FROM engine_node_attempt n JOIN engine_execution e ON"
-                    + " e.tenant_id=n.tenant_id AND e.execution_id=n.execution_id WHERE"
-                    + " n.tenant_id=#{args[0]} AND e.status IN ('SUCCEEDED','FAILED','CANCELLED')"
-                    + " AND n.updated_at<TIMESTAMPADD(MICROSECOND,-#{args[1]},CURRENT_TIMESTAMP(6))",
-                tenant,
-                micros);
     }
 
     private <T> Optional<T> one(

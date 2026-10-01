@@ -45,7 +45,8 @@ public final class MySqlPayloadStore implements PayloadStore {
         int size = body.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
         if (size > maxBytes) throw new IllegalArgumentException("PAYLOAD_TOO_LARGE");
         String ref = UUID.randomUUID().toString();
-        db.transaction(
+        db.capacityTransaction(
+                tenant,
                 tx -> {
                     MySqlCapacity.lock(tx, tenant);
                     tx.update(

@@ -14,6 +14,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -35,6 +36,9 @@ public final class ConcurrencyGovernor {
     private final KeyedPermitPool flows;
     private final KeyedPermitPool components;
     private final KeyedPermitPool resources;
+    private final AtomicInteger activeAcquisitions = new AtomicInteger();
+    private final AtomicInteger waitingAcquisitions = new AtomicInteger();
+    private final AtomicInteger inFlightAcquisitions = new AtomicInteger();
 
     /**
      * Returns the process-shared finite governor used by default engine and scheduler wiring.
@@ -81,6 +85,9 @@ public final class ConcurrencyGovernor {
         Objects.requireNonNull(deadline, "deadline must not be null");
         List<LevelLease> levels = new ArrayList<>(5);
         List<LevelLease> acquired = new ArrayList<>(5);
+        inFlightAcquisitions.incrementAndGet();
+        waitingAcquisitions.incrementAndGet();
+        boolean waiting = true;
         try {
             levels.add(new LevelLease(global, () -> { }));
             levels.add(tenants.retain(new TenantKey(request.tenantId())));
@@ -92,13 +99,42 @@ public final class ConcurrencyGovernor {
                 acquireOne(level.semaphore(), cancellationToken, deadline);
                 acquired.add(level);
             }
-            return new Permit(levels);
+            waitingAcquisitions.decrementAndGet();
+            waiting = false;
+            activeAcquisitions.incrementAndGet();
+            return new Permit(
+                    levels,
+                    () -> {
+                        activeAcquisitions.decrementAndGet();
+                        inFlightAcquisitions.decrementAndGet();
+                    });
         } catch (RuntimeException exception) {
+            if (waiting) waitingAcquisitions.decrementAndGet();
+            inFlightAcquisitions.decrementAndGet();
             releasePermitsReverse(acquired);
             releaseReferencesReverse(levels);
             throw exception;
         }
     }
+
+    /**
+     * Returns current process-local permit activity for bounded capacity observation.
+     *
+     * @return active node invocations and callers waiting on any hierarchy level
+     */
+    public Snapshot snapshot() {
+        return new Snapshot(
+                activeAcquisitions.get(),
+                waitingAcquisitions.get(),
+                inFlightAcquisitions.get());
+    }
+
+    /**
+     * Process-local concurrency values with no tenant, flow or payload identity. The in-flight
+     * counter is the atomic source for capacity gates; active and waiting are diagnostic detail.
+     */
+    public record Snapshot(
+            int activeAcquisitions, int waitingAcquisitions, int inFlightAcquisitions) {}
 
     private void acquireOne(Semaphore semaphore, CancellationToken cancellationToken, Instant deadline) {
         while (true) {
@@ -164,10 +200,12 @@ public final class ConcurrencyGovernor {
     public static final class Permit implements AutoCloseable {
 
         private final List<LevelLease> levels;
+        private final Runnable releaseActivity;
         private final AtomicBoolean open = new AtomicBoolean(true);
 
-        private Permit(List<LevelLease> levels) {
+        private Permit(List<LevelLease> levels, Runnable releaseActivity) {
             this.levels = List.copyOf(levels);
+            this.releaseActivity = releaseActivity;
         }
 
         /** @return true until this permit has been closed */
@@ -178,8 +216,12 @@ public final class ConcurrencyGovernor {
         @Override
         public void close() {
             if (open.compareAndSet(true, false)) {
-                releasePermitsReverse(levels);
-                releaseReferencesReverse(levels);
+                try {
+                    releasePermitsReverse(levels);
+                    releaseReferencesReverse(levels);
+                } finally {
+                    releaseActivity.run();
+                }
             }
         }
     }

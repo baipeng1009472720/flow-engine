@@ -35,20 +35,28 @@ class DemoConfigurationTest {
                             request.setLocalAddr("127.0.0.1");
                             request.setRemoteAddr("127.0.0.1");
                             request.addHeader("X-Tenant-Id", "forged");
-                            assertEquals("demo", policy.tenantId(request));
+                            var caller = policy.capture(request);
+                            assertEquals("demo", caller.tenantId());
                             policy.authorize(
-                                    "demo",
+                                    caller,
                                     new FlowIdentity("demo", "main", "v1"),
                                     ExecutionAccessPolicy.Action.EXECUTE);
                             assertThrows(
                                     SecurityException.class,
                                     () ->
                                             policy.authorize(
-                                                    "demo",
+                                                    caller,
                                                     new FlowIdentity("other", "main", "v1"),
                                                     ExecutionAccessPolicy.Action.READ));
+                            assertThrows(
+                                    SecurityException.class,
+                                    () ->
+                                            policy.authorize(
+                                                    () -> "demo",
+                                                    new FlowIdentity("demo", "main", "v1"),
+                                                    ExecutionAccessPolicy.Action.READ));
                             request.setRemoteAddr("192.0.2.1");
-                            assertThrows(SecurityException.class, () -> policy.tenantId(request));
+                            assertThrows(SecurityException.class, () -> policy.capture(request));
                         });
     }
 }

@@ -9,6 +9,15 @@ import jakarta.servlet.http.HttpServletRequest;
  * no authority.
  */
 public interface ExecutionAccessPolicy {
+    /**
+     * Immutable, thread-safe authorization snapshot created from a trusted request. Implementations
+     * must not retain the servlet request or any thread-bound security context.
+     */
+    interface CapturedAuthorization {
+        /** Returns the trusted tenant used for engine-level isolation checks. */
+        String tenantId();
+    }
+
     enum Action {
         EXECUTE,
         READ,
@@ -18,11 +27,14 @@ public interface ExecutionAccessPolicy {
     }
 
     /**
-     * Resolves the authenticated tenant or throws SecurityException; never trust arbitrary request
-     * metadata.
+     * Authenticates on the request thread and captures every trusted claim needed by later
+     * authorization, including work performed on asynchronous sender threads.
      */
-    String tenantId(HttpServletRequest request);
+    CapturedAuthorization capture(HttpServletRequest request);
 
-    /** Authorizes the specific operation and flow, including independent full-payload access. */
-    void authorize(String tenantId, FlowIdentity flow, Action action);
+    /**
+     * Authorizes the specific operation and flow. The tenant is only an isolation key; policies
+     * must also apply the captured caller's permissions and reject snapshots they did not issue.
+     */
+    void authorize(CapturedAuthorization caller, FlowIdentity flow, Action action);
 }

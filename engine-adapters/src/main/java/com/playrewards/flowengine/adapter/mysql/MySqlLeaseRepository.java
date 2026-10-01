@@ -58,7 +58,7 @@ public final class MySqlLeaseRepository implements ExecutionLeaseRepository {
 
     public boolean heartbeat(ExecutionLease lease, Duration duration) {
         if (!tenant.equals(lease.tenantId())) return false;
-        return db.transaction(
+        return db.controlTransaction(
                 tx ->
                         tx.update(
                                         "UPDATE engine_lease SET"

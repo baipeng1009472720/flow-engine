@@ -4,6 +4,8 @@ import com.alibaba.fastjson2.JSON;
 
 import org.springframework.http.*;
 import org.springframework.web.bind.annotation.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.*;
 
@@ -13,6 +15,8 @@ import java.util.*;
  */
 @RestControllerAdvice(basePackages = "com.playrewards.flowengine.server.api")
 public class ExecutionErrors {
+    private static final Logger LOGGER = LoggerFactory.getLogger(ExecutionErrors.class);
+
     /** Classifies only recognized failures and suppresses unknown exception messages and stack traces. */
     @ExceptionHandler(Exception.class)
     public ResponseEntity<String> handle(Exception failure) {
@@ -37,6 +41,9 @@ public class ExecutionErrors {
             status = 429;
             code = "RESOURCE_LIMIT";
             category = "RESOURCE_LIMIT";
+        }
+        if (status == 500) {
+            LOGGER.error("Unhandled flow-engine API failure", failure);
         }
         var body = new LinkedHashMap<String, Object>();
         body.put("code", code);

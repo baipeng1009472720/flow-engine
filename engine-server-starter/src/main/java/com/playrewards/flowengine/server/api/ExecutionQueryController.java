@@ -2,6 +2,7 @@ package com.playrewards.flowengine.server.api;
 
 import com.alibaba.fastjson2.JSON;
 import com.playrewards.flowengine.server.security.ExecutionAccessPolicy.Action;
+import com.playrewards.flowengine.server.security.ExecutionAccessPolicy.CapturedAuthorization;
 
 import jakarta.servlet.http.HttpServletRequest;
 
@@ -48,12 +49,12 @@ public class ExecutionQueryController {
             @PathVariable("id") String id,
             @RequestParam(value = "afterSequence", defaultValue = "-1") long after,
             @RequestParam(value = "limit", defaultValue = "100") int limit) {
-        service.execution(http, id, Action.READ);
-        String tenant = service.streamTenant(http);
+        CapturedAuthorization caller = service.capture(http);
+        service.execution(caller, id, Action.READ);
         return JSON.toJSONString(
                 page(
                         service.store().readAfter(id, after).stream()
-                                .filter(event -> service.eventVisible(tenant, event))
+                                .filter(event -> service.eventVisible(caller, event))
                                 .toList(),
                         0,
                         limit));

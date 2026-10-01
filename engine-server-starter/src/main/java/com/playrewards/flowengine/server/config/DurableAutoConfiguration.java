@@ -29,7 +29,7 @@ public class DurableAutoConfiguration {
                         env.getRequiredProperty("flow-engine.durable.username"),
                         env.getRequiredProperty("flow-engine.durable.password"));
         source.setPoolMaximumActiveConnections(16);
-        source.setPoolMaximumIdleConnections(4);
+        source.setPoolMaximumIdleConnections(16);
         source.setPoolTimeToWait(5000);
         return source;
     }

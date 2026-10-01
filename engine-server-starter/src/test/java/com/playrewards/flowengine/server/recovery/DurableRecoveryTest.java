@@ -151,6 +151,32 @@ class DurableRecoveryTest {
     }
 
     @Test
+    void durableAutoConfigurationKeepsTheFullWorkloadPoolWarm() {
+        new org.springframework.boot.test.context.runner.ApplicationContextRunner()
+                .withConfiguration(
+                        org.springframework.boot.autoconfigure.AutoConfigurations.of(
+                                com.playrewards.flowengine.server.config.DurableAutoConfiguration
+                                        .class,
+                                com.playrewards.flowengine.server.config.EngineAutoConfiguration
+                                        .class))
+                .withPropertyValues(
+                        "flow-engine.durable.enabled=true",
+                        "flow-engine.durable.jdbc-url=" + MYSQL.getJdbcUrl(),
+                        "flow-engine.durable.username=" + MYSQL.getUsername(),
+                        "flow-engine.durable.password=" + MYSQL.getPassword())
+                .run(
+                        context -> {
+                            assertNull(context.getStartupFailure());
+                            var source =
+                                    context.getBean(
+                                            org.apache.ibatis.datasource.pooled.PooledDataSource
+                                                    .class);
+                            assertEquals(16, source.getPoolMaximumActiveConnections());
+                            assertEquals(16, source.getPoolMaximumIdleConnections());
+                        });
+    }
+
+    @Test
     void starterRoutesAuthenticatedTenantsToDurableStoresAndPersistsAudit() {
         new org.springframework.boot.test.context.runner.ApplicationContextRunner()
                 .withConfiguration(

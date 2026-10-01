@@ -45,7 +45,7 @@ public final class MySqlExecutionStateStore implements FencedExecutionStateStore
      * transaction.
      */
     public ExecutionState save(ExecutionState value, long revision, ExecutionLease lease) {
-        return db.transaction(tx -> save(tx, value, revision, lease));
+        return db.capacityTransaction(tenant, tx -> save(tx, value, revision, lease));
     }
 
     private ExecutionState save(
@@ -94,6 +94,10 @@ public final class MySqlExecutionStateStore implements FencedExecutionStateStore
                 tenant,
                 value.executionId(),
                 revision);
+        // Payload writes and both retention paths must enter through one tenant mutex. Otherwise
+        // expiry cleanup and checkpoint cleanup can lock the expiry and execution indexes in
+        // opposite order and deadlock even though they target different executions.
+        MySqlCapacity.lock(tx, tenant);
         tx.update(
                 "DELETE p FROM engine_payload p LEFT JOIN engine_checkpoint c ON"
                     + " c.tenant_id=p.tenant_id AND c.execution_id=p.execution_id AND"
@@ -113,7 +117,8 @@ public final class MySqlExecutionStateStore implements FencedExecutionStateStore
             ExecutionStatus to,
             Map<String, Object> checkpoint,
             ExecutionLease lease) {
-        return db.transaction(
+        return db.capacityTransaction(
+                tenant,
                 tx -> {
                     MySqlLeaseRepository.validate(tx, tenant, id, lease);
                     var current = read(tx, id);

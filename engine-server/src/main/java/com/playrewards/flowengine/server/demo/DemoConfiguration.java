@@ -3,6 +3,7 @@ package com.playrewards.flowengine.server.demo;
 import com.playrewards.flowengine.contract.bundle.FlowIdentity;
 import com.playrewards.flowengine.core.compile.RelatedFlowResolver;
 import com.playrewards.flowengine.server.security.ExecutionAccessPolicy;
+import com.playrewards.flowengine.server.security.ExecutionAccessPolicy.CapturedAuthorization;
 
 import jakarta.servlet.http.HttpServletRequest;
 
@@ -22,6 +23,8 @@ import java.util.Set;
 public class DemoConfiguration {
     private static final Set<String> LOOPBACK =
             Set.of("127.0.0.1", "::1", "[::1]", "0:0:0:0:0:0:0:1");
+
+    private record DemoAuthorization(String tenantId) implements CapturedAuthorization {}
 
     /** Rejects wildcard/default binding before publishing any unauthenticated demo adapters. */
     public DemoConfiguration(Environment environment) {
@@ -76,19 +79,21 @@ public class DemoConfiguration {
     public ExecutionAccessPolicy demoExecutionAccessPolicy() {
         return new ExecutionAccessPolicy() {
             @Override
-            public String tenantId(HttpServletRequest request) {
+            public CapturedAuthorization capture(HttpServletRequest request) {
                 // Ignore forwarded/tenant headers: only the actual socket endpoints establish local
                 // access.
                 if (!LOOPBACK.contains(request.getLocalAddr())
                         || !LOOPBACK.contains(request.getRemoteAddr())) {
                     throw new SecurityException("Local demo access required");
                 }
-                return "demo";
+                return new DemoAuthorization("demo");
             }
 
             @Override
-            public void authorize(String tenantId, FlowIdentity flow, Action action) {
-                if (!"demo".equals(tenantId)
+            public void authorize(
+                    CapturedAuthorization caller, FlowIdentity flow, Action action) {
+                if (!(caller instanceof DemoAuthorization authorization)
+                        || !"demo".equals(authorization.tenantId())
                         || flow == null
                         || !"demo".equals(flow.tenantId())
                         || !"v1".equals(flow.version())

@@ -3,6 +3,7 @@ package com.playrewards.flowengine.server.api;
 import com.alibaba.fastjson2.JSON;
 import com.playrewards.flowengine.core.event.BoundedExecutionEventBus;
 import com.playrewards.flowengine.server.security.ExecutionAccessPolicy.Action;
+import com.playrewards.flowengine.server.security.ExecutionAccessPolicy.CapturedAuthorization;
 
 import jakarta.servlet.http.HttpServletRequest;
 
@@ -42,8 +43,9 @@ public class ExecutionSseController implements AutoCloseable {
     public SseEmitter start(HttpServletRequest request) throws Exception {
         if (request.getHeader("Last-Event-ID") != null)
             throw new IllegalArgumentException("reconnect requires GET with executionId");
-        var started = service.start(request);
-        return stream(request, started.handle().executionId());
+        CapturedAuthorization caller = service.capture(request);
+        var started = service.start(request, caller);
+        return stream(request, started.handle().executionId(), caller);
     }
 
     /**
@@ -51,8 +53,12 @@ public class ExecutionSseController implements AutoCloseable {
      */
     @GetMapping(value = "/v1/executions/{id}/stream", produces = "text/event-stream")
     public SseEmitter stream(HttpServletRequest request, @PathVariable("id") String id) {
-        service.execution(request, id, Action.READ);
-        String tenant = service.streamTenant(request);
+        return stream(request, id, service.capture(request));
+    }
+
+    private SseEmitter stream(
+            HttpServletRequest request, String id, CapturedAuthorization caller) {
+        service.execution(caller, id, Action.READ);
         var subscription = bus.subscribe(id, request.getHeader("Last-Event-ID"));
         var emitter = new SseEmitter(310000L);
         emitter.onCompletion(subscription::close);
@@ -73,7 +79,7 @@ public class ExecutionSseController implements AutoCloseable {
                                     emitter.send(SseEmitter.event().comment("keepalive"));
                                     continue;
                                 }
-                                var visible = service.streamEvent(tenant, event);
+                                var visible = service.streamEvent(caller, event);
                                 if (visible == null) continue;
                                 emitter.send(
                                         SseEmitter.event()

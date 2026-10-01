@@ -9,6 +9,7 @@ import com.playrewards.flowengine.core.component.FlowBusinessComponentRegistry;
 import com.playrewards.flowengine.core.execution.*;
 import com.playrewards.flowengine.server.security.ExecutionAccessPolicy;
 import com.playrewards.flowengine.server.security.ExecutionAccessPolicy.Action;
+import com.playrewards.flowengine.server.security.ExecutionAccessPolicy.CapturedAuthorization;
 import com.playrewards.flowengine.spi.*;
 
 import jakarta.servlet.http.HttpServletRequest;
@@ -68,7 +69,12 @@ public final class ExecutionService {
      * cannot supply a bundle or class.
      */
     public Started start(HttpServletRequest http) throws Exception {
-        String tenant = access.tenantId(http);
+        return start(http, capture(http));
+    }
+
+    /** Starts a flow with the caller already captured by a streaming request. */
+    Started start(HttpServletRequest http, CapturedAuthorization caller) throws Exception {
+        String tenant = caller.tenantId();
         byte[] bytes = http.getInputStream().readNBytes(262145);
         if (bytes.length > 262144)
             throw new ApiException(413, "REQUEST_TOO_LARGE", "RESOURCE_LIMIT");
@@ -120,7 +126,7 @@ public final class ExecutionService {
         FlowBundleLoader loader = loaders.get(scheme);
         if (loader == null) throw new IllegalArgumentException("unsupported flow reference");
         ExecutableFlowBundle bundle = loader.load(request.flowReference());
-        authorize(tenant, bundle.flowIdentity(), Action.EXECUTE);
+        authorize(caller, bundle.flowIdentity(), Action.EXECUTE);
         if (request.contextReference() != null) {
             if (!request.externalScopes().isEmpty())
                 throw new IllegalArgumentException("ambiguous external scopes");
@@ -141,8 +147,12 @@ public final class ExecutionService {
                             request.metadata());
         }
         validateScopes(bundle, request);
-        ExecutionPlan plan = compiler.compile(bundle);
-        validateComponents(plan, tenant);
+        String rootReference = request.flowReference();
+        RelatedFlowResolver requestResolver = loader instanceof RelatedFlowBundleLoader related
+                ? (parent, target) -> related.loadRelated(rootReference, parent, target)
+                : null;
+        ExecutionPlan plan = compiler.compile(bundle, requestResolver);
+        validateComponents(plan, caller);
         ExecutionHandle handle = engine.execute(plan, request);
         handles.put(handle.executionId(), handle);
         handle.completion()
@@ -156,7 +166,7 @@ public final class ExecutionService {
         bundle.externalScopeSchemas()
                 .forEach(
                         (name, schema) -> {
-                            if (!JSONSchema.of(new JSONObject(schema.schema()))
+                            if (!JSONSchema.of(JSON.parseObject(JSON.toJSONString(schema.schema())))
                                     .validate(request.externalScopes().get(name))
                                     .isSuccess())
                                 throw new IllegalArgumentException(
@@ -164,8 +174,8 @@ public final class ExecutionService {
                         });
     }
 
-    private void validateComponents(ExecutionPlan plan, String tenant) {
-        authorize(tenant, plan.flowIdentity(), Action.EXECUTE);
+    private void validateComponents(ExecutionPlan plan, CapturedAuthorization caller) {
+        authorize(caller, plan.flowIdentity(), Action.EXECUTE);
         plan.nodesById()
                 .values()
                 .forEach(
@@ -177,63 +187,70 @@ public final class ExecutionService {
                                         node.componentContract().executorRef(),
                                         node.node().nodeCode());
                         });
-        plan.subFlowPlans().values().forEach(child -> validateComponents(child, tenant));
+        plan.subFlowPlans().values().forEach(child -> validateComponents(child, caller));
     }
 
-    private void authorize(String tenant, FlowIdentity flow, Action action) {
-        if (!tenant.equals(flow.tenantId())) throw new SecurityException();
-        access.authorize(tenant, flow, action);
+    private void authorize(CapturedAuthorization caller, FlowIdentity flow, Action action) {
+        if (caller == null
+                || caller.tenantId() == null
+                || flow == null
+                || !caller.tenantId().equals(flow.tenantId())) throw new SecurityException();
+        access.authorize(caller, flow, action);
+    }
+
+    /** Captures trusted authorization before an async handoff or multi-step query. */
+    CapturedAuthorization capture(HttpServletRequest request) {
+        CapturedAuthorization caller = access.capture(request);
+        if (caller == null || caller.tenantId() == null || caller.tenantId().isBlank())
+            throw new SecurityException();
+        return caller;
     }
 
     /**
      * Authorizes every lookup before returning a snapshot, including child execution identities.
      */
     public ExecutionRecord execution(HttpServletRequest http, String id, Action action) {
-        String tenant = access.tenantId(http);
+        return execution(capture(http), id, action);
+    }
+
+    /** Authorizes a lookup with a previously captured caller. */
+    ExecutionRecord execution(CapturedAuthorization caller, String id, Action action) {
         var record =
                 store.execution(id).orElseThrow(() -> new ApiException(404, "NOT_FOUND", "INPUT"));
-        authorize(tenant, record.flowIdentity(), action);
+        authorize(caller, record.flowIdentity(), action);
         return record;
     }
 
     public NodeExecutionRecord node(HttpServletRequest http, String id, Action action) {
-        access.tenantId(http);
+        CapturedAuthorization caller = capture(http);
         var node = store.node(id).orElseThrow(() -> new ApiException(404, "NOT_FOUND", "INPUT"));
-        execution(http, node.executionId(), action);
+        execution(caller, node.executionId(), action);
         return node;
     }
 
     public Object payload(HttpServletRequest http, String id) {
-        access.tenantId(http);
+        CapturedAuthorization caller = capture(http);
         var reference = new PayloadReference(id);
         String owner =
                 payloads.executionId(reference)
                         .orElseThrow(() -> new ApiException(404, "NOT_FOUND", "INPUT"));
-        execution(http, owner, Action.PAYLOAD);
+        execution(caller, owner, Action.PAYLOAD);
         return payloads.find(reference).orElse(null);
-    }
-
-    /**
-     * Captures trusted identity before async handoff; thread-local authentication is not read on
-     * sender workers.
-     */
-    public String streamTenant(HttpServletRequest request) {
-        return access.tenantId(request);
     }
 
     /**
      * Rehydrates content only after separate PAYLOAD authorization for its actual owning flow,
      * including child flows.
      */
-    public ExecutionEvent streamEvent(String tenant, ExecutionEvent event) {
-        if (!eventVisible(tenant, event)) return null;
+    public ExecutionEvent streamEvent(CapturedAuthorization caller, ExecutionEvent event) {
+        if (!eventVisible(caller, event)) return null;
         Object rawReference = event.attributes().get("contentPayloadRef");
         if (!(rawReference instanceof String reference)) return event;
         var ref = new PayloadReference(reference);
         var owner = payloads.executionId(ref).flatMap(store::execution);
         if (owner.isEmpty()) return event;
         try {
-            authorize(tenant, owner.get().flowIdentity(), Action.PAYLOAD);
+            authorize(caller, owner.get().flowIdentity(), Action.PAYLOAD);
         } catch (SecurityException denied) {
             return event;
         }
@@ -254,7 +271,7 @@ public final class ExecutionService {
     }
 
     /** 转发不授予子流程权限；真实来源与每层转发路径均须单独 READ 授权。 */
-    public boolean eventVisible(String tenant, ExecutionEvent event) {
+    public boolean eventVisible(CapturedAuthorization caller, ExecutionEvent event) {
         Set<String> owners = new HashSet<>();
         owners.add(event.executionId());
         for (String key : List.of("originExecutionId", "childExecutionId")) {
@@ -267,7 +284,7 @@ public final class ExecutionService {
             for (String id : owners) {
                 var owner = store.execution(id);
                 if (owner.isEmpty()) return false;
-                authorize(tenant, owner.get().flowIdentity(), Action.READ);
+                authorize(caller, owner.get().flowIdentity(), Action.READ);
             }
             return true;
         } catch (SecurityException denied) {

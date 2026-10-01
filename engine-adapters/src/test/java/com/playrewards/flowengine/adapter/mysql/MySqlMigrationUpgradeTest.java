@@ -9,15 +9,13 @@ import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.junit.jupiter.*;
 
-/**
- * V1 stays immutable: an existing database upgrades to V2 without rewriting stored execution data.
- */
+/** V1 stays immutable: an existing database upgrades to latest without rewriting runtime data. */
 @Testcontainers
 class MySqlMigrationUpgradeTest {
     @Container static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.4");
 
     @Test
-    void upgradesExistingV1AndPreservesCheckpoint() {
+    void upgradesExistingV1AndAddsPayloadExecutionIndexWithoutLosingCheckpoint() {
         var source = new MysqlDataSource();
         source.setURL(MYSQL.getJdbcUrl());
         source.setUser(MYSQL.getUsername());
@@ -50,5 +48,18 @@ class MySqlMigrationUpgradeTest {
                                                 .orElseThrow(),
                                         "n"));
         assertEquals(0L, count);
+        long payloadExecutionIndexColumns =
+                db.transaction(
+                        tx ->
+                                MySqlRuntimeDatabase.number(
+                                        tx.row(
+                                                        "SELECT COUNT(*) AS n FROM"
+                                                            + " information_schema.statistics WHERE"
+                                                            + " table_schema=DATABASE() AND"
+                                                            + " table_name='engine_payload' AND"
+                                                            + " index_name='ix_payload_execution'")
+                                                .orElseThrow(),
+                                        "n"));
+        assertEquals(4L, payloadExecutionIndexColumns);
     }
 }

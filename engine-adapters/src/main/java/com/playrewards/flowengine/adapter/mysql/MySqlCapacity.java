@@ -5,7 +5,12 @@ final class MySqlCapacity {
     private MySqlCapacity() {}
 
     static void lock(MySqlRuntimeDatabase.Tx tx, String tenant) {
-        tx.update("INSERT IGNORE INTO engine_capacity VALUES(#{args[0]})", tenant);
+        // A duplicate-key UPDATE takes the tenant row's exclusive lock directly. INSERT IGNORE
+        // followed by FOR UPDATE can deadlock when many first-time writers all upgrade their locks.
+        tx.update(
+                "INSERT INTO engine_capacity VALUES(#{args[0]})"
+                        + " ON DUPLICATE KEY UPDATE tenant_id=VALUES(tenant_id)",
+                tenant);
         tx.row(
                         "SELECT tenant_id FROM engine_capacity WHERE tenant_id=#{args[0]} FOR"
                                 + " UPDATE",

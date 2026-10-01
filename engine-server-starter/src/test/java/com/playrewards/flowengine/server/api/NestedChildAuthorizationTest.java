@@ -5,12 +5,13 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 import com.alibaba.fastjson2.JSON;
+import com.alibaba.fastjson2.JSONObject;
 import com.playrewards.flowengine.contract.bundle.*;
 import com.playrewards.flowengine.contract.component.*;
 import com.playrewards.flowengine.contract.flow.*;
-import com.playrewards.flowengine.core.compile.RelatedFlowResolver;
 import com.playrewards.flowengine.server.security.ExecutionAccessPolicy;
-import com.playrewards.flowengine.spi.FlowBundleLoader;
+import com.playrewards.flowengine.server.security.ExecutionAccessPolicy.CapturedAuthorization;
+import com.playrewards.flowengine.spi.RelatedFlowBundleLoader;
 
 import jakarta.servlet.http.HttpServletRequest;
 
@@ -38,32 +39,46 @@ class NestedChildAuthorizationTest {
     void parent_read_does_not_reveal_child_nodes_through_events_or_sse() throws Exception {
         access.readable = Set.of("parent");
         String id = start();
+        Map<String, String> children = childExecutionIds(id);
         String events = events(id);
         assertFalse(events.contains("privateMiddleStart"), events);
         assertFalse(events.contains("privateLeafStart"), events);
+        assertDeniedMetadataAbsent(
+                restEvents(events), Set.copyOf(children.values()), children.keySet());
         String stream = stream(id);
         assertFalse(stream.contains("privateMiddleStart"), stream);
         assertFalse(stream.contains("privateLeafStart"), stream);
-        String childId =
-                service.store().readAfter(id, -1).stream()
-                        .filter(event -> event.eventType().equals("CHILD_CREATED"))
-                        .map(event -> (String) event.attributes().get("childExecutionId"))
-                        .findFirst()
-                        .orElseThrow();
-        mvc.perform(get("/v1/executions/" + childId).principal(() -> "reader"))
+        assertDeniedMetadataAbsent(
+                sseEvents(stream), Set.copyOf(children.values()), children.keySet());
+        String deniedMiddleId = children.get("middle");
+        mvc.perform(get("/v1/executions/" + deniedMiddleId).principal(() -> "reader"))
                 .andExpect(status().isForbidden());
+        mvc.perform(
+                        get("/v1/executions/" + deniedMiddleId + "/events")
+                                .principal(() -> "reader"))
+                .andExpect(status().isForbidden());
+        mvc.perform(
+                        get("/v1/executions/" + deniedMiddleId + "/stream")
+                                .principal(() -> "reader"))
+                .andExpect(status().isForbidden())
+                .andExpect(request().asyncNotStarted());
     }
 
     @Test
     void readable_middle_does_not_launder_private_grandchild_metadata() throws Exception {
         access.readable = Set.of("parent", "middle");
         String id = start();
+        Map<String, String> children = childExecutionIds(id);
         String events = events(id);
         assertTrue(events.contains("privateMiddleStart"), events);
         assertFalse(events.contains("privateLeafStart"), events);
+        assertDeniedMetadataAbsent(
+                restEvents(events), Set.of(children.get("leaf")), Set.of("leaf"));
         String stream = stream(id);
         assertTrue(stream.contains("privateMiddleStart"), stream);
         assertFalse(stream.contains("privateLeafStart"), stream);
+        assertDeniedMetadataAbsent(
+                sseEvents(stream), Set.of(children.get("leaf")), Set.of("leaf"));
     }
 
     @Test
@@ -88,6 +103,14 @@ class NestedChildAuthorizationTest {
         }
         assertTrue(events(id).contains("originEventType"));
         assertTrue(stream(id).contains("originEventType"));
+    }
+
+    @Test
+    void request_bound_authorization_survives_async_sse_handoff() throws Exception {
+        access.readable = Set.of("parent", "middle", "leaf");
+        String stream = stream(start());
+
+        assertTrue(stream.contains("event:COMPLETED"), stream);
     }
 
     private String start() throws Exception {
@@ -130,21 +153,90 @@ class NestedChildAuthorizationTest {
                 .getContentAsString();
     }
 
+    private Map<String, String> childExecutionIds(String rootExecutionId) {
+        Map<String, String> children = new HashMap<>();
+        service.store().readAfter(rootExecutionId, -1).forEach(event -> {
+            Object flowId = event.attributes().get("flowId");
+            Object childExecutionId = event.attributes().get("childExecutionId");
+            if (flowId instanceof String flow && childExecutionId instanceof String child) {
+                children.put(flow, child);
+            }
+        });
+        assertEquals(Set.of("middle", "leaf"), children.keySet());
+        return Map.copyOf(children);
+    }
+
+    private static List<JSONObject> restEvents(String body) {
+        return JSON.parseArray(body, JSONObject.class);
+    }
+
+    private static List<JSONObject> sseEvents(String body) {
+        return body.lines()
+                .filter(line -> line.startsWith("data:"))
+                .map(line -> JSON.parseObject(line.substring("data:".length())))
+                .toList();
+    }
+
+    private static void assertDeniedMetadataAbsent(
+            List<JSONObject> visibleEvents,
+            Set<String> deniedExecutionIds,
+            Set<String> deniedFlowIds) {
+        assertFalse(visibleEvents.isEmpty(), "fixture must expose authorized root events");
+        for (JSONObject event : visibleEvents) {
+            String diagnostic = event.toJSONString();
+            assertFalse(
+                    deniedExecutionIds.contains(event.getString("executionId")), diagnostic);
+            JSONObject attributes = event.getJSONObject("attributes");
+            assertNotNull(attributes, diagnostic);
+            for (String key : List.of("childExecutionId", "originExecutionId")) {
+                String executionId = attributes.getString(key);
+                assertTrue(
+                        executionId == null || !deniedExecutionIds.contains(executionId),
+                        key + " leaked denied execution metadata: " + diagnostic);
+            }
+            for (String key : List.of("childEventId", "originEventId")) {
+                String eventId = attributes.getString(key);
+                assertTrue(
+                        eventId == null
+                                || deniedExecutionIds.stream()
+                                        .noneMatch(deniedId -> eventId.startsWith(deniedId + ":")),
+                        key + " leaked denied execution metadata: " + diagnostic);
+            }
+            String flowId = attributes.getString("flowId");
+            assertTrue(
+                    flowId == null || !deniedFlowIds.contains(flowId),
+                    "flowId leaked denied flow metadata: " + diagnostic);
+            if (attributes.get("forwardingPath") instanceof List<?> path) {
+                assertTrue(
+                        Collections.disjoint(path, deniedExecutionIds),
+                        "forwardingPath leaked denied execution metadata: " + diagnostic);
+            }
+        }
+    }
+
     static final class SelectiveAccess implements ExecutionAccessPolicy {
         volatile Set<String> readable = Set.of("parent");
 
         @Override
-        public String tenantId(HttpServletRequest request) {
+        public CapturedAuthorization capture(HttpServletRequest request) {
             if (request.getUserPrincipal() == null) throw new SecurityException();
-            return "tenant";
+            return new ReaderAuthorization(
+                    "tenant", request.getUserPrincipal().getName(), Set.copyOf(readable));
         }
 
         @Override
-        public void authorize(String tenant, FlowIdentity flow, Action action) {
-            if (!tenant.equals(flow.tenantId())
-                    || (action != Action.EXECUTE && !readable.contains(flow.flowId())))
+        public void authorize(
+                CapturedAuthorization caller, FlowIdentity flow, Action action) {
+            if (!(caller instanceof ReaderAuthorization authorization)
+                    || !authorization.tenantId().equals(flow.tenantId())
+                    || (action != Action.EXECUTE
+                            && !authorization.readable().contains(flow.flowId())))
                 throw new SecurityException();
         }
+
+        private record ReaderAuthorization(
+                String tenantId, String subject, Set<String> readable)
+                implements CapturedAuthorization {}
     }
 
     @Configuration
@@ -156,8 +248,8 @@ class NestedChildAuthorizationTest {
         }
 
         @Bean
-        FlowBundleLoader loader() {
-            return new FlowBundleLoader() {
+        RelatedFlowBundleLoader loader() {
+            return new RelatedFlowBundleLoader() {
                 @Override
                 public String scheme() {
                     return "nested";
@@ -168,17 +260,18 @@ class NestedChildAuthorizationTest {
                     if (!"nested:parent".equals(reference)) throw new IllegalArgumentException();
                     return bundle("parent", "middle");
                 }
-            };
-        }
 
-        @Bean
-        RelatedFlowResolver resolver() {
-            return (parent, id) ->
-                    switch (id) {
+                @Override
+                public ExecutableFlowBundle loadRelated(
+                        String rootReference, FlowIdentity parent, String id) {
+                    if (!"nested:parent".equals(rootReference)) throw new IllegalArgumentException();
+                    return switch (id) {
                         case "middle" -> bundle("middle", "leaf");
                         case "leaf" -> bundle("leaf", null);
                         default -> throw new IllegalArgumentException();
                     };
+                }
+            };
         }
     }
 
