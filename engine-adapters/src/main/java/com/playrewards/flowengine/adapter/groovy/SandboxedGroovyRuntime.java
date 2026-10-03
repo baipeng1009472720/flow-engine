@@ -2,6 +2,8 @@ package com.playrewards.flowengine.adapter.groovy;
 
 import com.alibaba.fastjson2.JSON;
 import com.playrewards.flowengine.contract.json.JsonValues;
+import com.playrewards.flowengine.groovy.rules.GroovyScriptPolicy;
+import com.playrewards.flowengine.groovy.rules.GroovyScriptRules;
 import com.playrewards.flowengine.spi.ExecutionLogger;
 import com.playrewards.flowengine.spi.ScriptRuntime;
 import groovy.lang.Binding;
@@ -9,12 +11,9 @@ import groovy.lang.Closure;
 import groovy.lang.GroovyClassLoader;
 import groovy.lang.Script;
 import groovy.transform.ThreadInterrupt;
-import groovyjarjarantlr4.v4.runtime.CharStreams;
-import groovyjarjarantlr4.v4.runtime.Token;
 import java.io.PrintWriter;
 import java.io.Writer;
 import java.lang.reflect.Array;
-import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -24,7 +23,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -48,7 +46,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import org.apache.groovy.parser.antlr4.GroovyLexer;
 import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.ClassCodeExpressionTransformer;
 import org.codehaus.groovy.ast.ClassHelper;
@@ -57,35 +54,18 @@ import org.codehaus.groovy.ast.DynamicVariable;
 import org.codehaus.groovy.ast.expr.ArgumentListExpression;
 import org.codehaus.groovy.ast.expr.AttributeExpression;
 import org.codehaus.groovy.ast.expr.BinaryExpression;
-import org.codehaus.groovy.ast.expr.BooleanExpression;
 import org.codehaus.groovy.ast.expr.ConstantExpression;
 import org.codehaus.groovy.ast.expr.ClosureExpression;
-import org.codehaus.groovy.ast.expr.DeclarationExpression;
-import org.codehaus.groovy.ast.expr.ElvisOperatorExpression;
-import org.codehaus.groovy.ast.expr.EmptyExpression;
 import org.codehaus.groovy.ast.expr.Expression;
 import org.codehaus.groovy.ast.expr.GStringExpression;
 import org.codehaus.groovy.ast.expr.ListExpression;
-import org.codehaus.groovy.ast.expr.MapEntryExpression;
 import org.codehaus.groovy.ast.expr.MapExpression;
 import org.codehaus.groovy.ast.expr.MethodCallExpression;
-import org.codehaus.groovy.ast.expr.NotExpression;
 import org.codehaus.groovy.ast.expr.PropertyExpression;
 import org.codehaus.groovy.ast.expr.StaticMethodCallExpression;
-import org.codehaus.groovy.ast.expr.TernaryExpression;
-import org.codehaus.groovy.ast.expr.TupleExpression;
 import org.codehaus.groovy.ast.expr.UnaryMinusExpression;
 import org.codehaus.groovy.ast.expr.UnaryPlusExpression;
 import org.codehaus.groovy.ast.expr.VariableExpression;
-import org.codehaus.groovy.ast.stmt.BlockStatement;
-import org.codehaus.groovy.ast.stmt.BreakStatement;
-import org.codehaus.groovy.ast.stmt.ContinueStatement;
-import org.codehaus.groovy.ast.stmt.EmptyStatement;
-import org.codehaus.groovy.ast.stmt.ExpressionStatement;
-import org.codehaus.groovy.ast.stmt.IfStatement;
-import org.codehaus.groovy.ast.stmt.ReturnStatement;
-import org.codehaus.groovy.ast.stmt.Statement;
-import org.codehaus.groovy.ast.stmt.WhileStatement;
 import org.codehaus.groovy.classgen.GeneratorContext;
 import org.codehaus.groovy.control.CompilePhase;
 import org.codehaus.groovy.control.CompilerConfiguration;
@@ -126,7 +106,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
     private static final int MAX_RESULT_DEPTH = 32;
     private static final int MAX_RESULT_NODES = 10_000;
     private static final long STOP_POLL_MILLIS = 10;
-    private static final String INTERNAL_JSON_ROOTS = "__flowJsonRoots";
+    private static final String INTERNAL_JSON_ROOTS = GroovyScriptPolicy.INTERNAL_JSON_ROOTS;
     /**
      * Groovy Script 宿主属性名：脚本引用它们说明在探测宿主对象，必须保持沙箱违规；
      * 其余未注入的根变量只是宿主未提供该作用域（数据缺失），按运行时错误报告。
@@ -140,30 +120,6 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
     private static final Pattern SANDBOX_RULE = Pattern.compile(
             "script sandbox (?:rejected )?([A-Za-z][A-Za-z0-9 ,'_-]{0,160}?)(?: at line (\\d+))?(?=$|[\\r\\n])",
             Pattern.MULTILINE);
-    private static final Set<String> ALLOWED_METHODS = Set.of(
-            "contains", "containsKey", "containsValue", "endsWith", "get", "isEmpty",
-            "length", "max", "min", "size", "startsWith");
-    private static final Set<String> ALLOWED_COLLECTION_METHODS = Set.of(
-            "any", "collect", "every", "find", "findAll");
-    private static final Set<String> BUDGETED_STRING_METHODS = Set.of(
-            "strip", "substring", "toLowerCase", "toUpperCase", "trim");
-    private static final Set<String> BUDGETED_NUMERIC_METHODS = Set.of("abs");
-    private static final Set<String> LOG_METHODS = Set.of("print", "println");
-    private static final Set<String> RESERVED_VARIABLES = Set.of(
-            "this", "super", "owner", "delegate", "binding", "out", "metaClass",
-            INTERNAL_JSON_ROOTS);
-    private static final Set<String> RESERVED_PROPERTIES = Set.of(
-            "class", "metaClass", "classLoader", "declaredFields", "declaredMethods",
-            "fields", "methods", "protectionDomain", "binding", "properties",
-            "bytes", "chars", "codePoints");
-    private static final Set<Integer> ALLOWED_BINARY_TOKENS = Set.of(
-            Types.ASSIGN,
-            Types.COMPARE_EQUAL, Types.COMPARE_NOT_EQUAL,
-            Types.COMPARE_LESS_THAN, Types.COMPARE_LESS_THAN_EQUAL,
-            Types.COMPARE_GREATER_THAN, Types.COMPARE_GREATER_THAN_EQUAL,
-            Types.LOGICAL_AND, Types.LOGICAL_OR,
-            Types.PLUS, Types.MINUS, Types.MULTIPLY, Types.DIVIDE, Types.INTDIV, Types.MOD,
-            Types.LEFT_SQUARE_BRACKET);
     private static final Set<Integer> BUDGETED_BINARY_TOKENS = Set.of(
             Types.PLUS, Types.MINUS, Types.MULTIPLY, Types.DIVIDE, Types.INTDIV, Types.MOD);
     private static final ThreadLocal<OperationBudget> ACTIVE_OPERATION_BUDGET = new ThreadLocal<>();
@@ -398,17 +354,25 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
 
     /**
      * Rejects annotation tokens before Groovy can load a local AST transform such as ASTTest/Grab.
-     * The lexer distinguishes code from string/comment contents, so ordinary JSON text containing
-     * an at-sign remains valid.
+     * The shared lexer scan distinguishes code from string/comment contents, so ordinary JSON text
+     * containing an at-sign remains valid.
      */
     private static void rejectCompileTimeAnnotations(String source) {
-        GroovyLexer lexer = new GroovyLexer(CharStreams.fromString(source));
-        lexer.removeErrorListeners();
-        for (Token token = lexer.nextToken(); token.getType() != Token.EOF; token = lexer.nextToken()) {
-            if (token.getType() == GroovyLexer.AT) {
-                throw new SecurityException("annotations are not allowed by the script sandbox");
-            }
-        }
+        GroovyScriptRules.enforceNoAnnotations(source);
+    }
+
+    /**
+     * 包内验证缝：只做运行时编译期检查（注解预检 + 完整编译），不执行脚本、不进入缓存。
+     *
+     * <p>供守护测试比对 {@link GroovyScriptRules#check} 与运行时编译的拒绝/放行结论，生产路径不调用。</p>
+     *
+     * @param source 脚本源码
+     * @throws SecurityException 注解预检拒绝
+     * @throws MultipleCompilationErrorsException 编译期沙箱规则或语法拒绝
+     */
+    static void compileForVerification(String source) {
+        rejectCompileTimeAnnotations(source);
+        compile(source, digest(source), Instant.MAX).close();
     }
 
     private static CachedScript compile(String source, String digest, Instant expiresAt) {
@@ -435,19 +399,9 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
         }
     }
 
+    /** 编译器安全策略与静态检查共用同一份定义，每次编译新建实例（SecureASTCustomizer 有状态）。 */
     private static SecureASTCustomizer secureCustomizer() {
-        SecureASTCustomizer customizer = new SecureASTCustomizer();
-        // Closure syntax is admitted only so the semantic validator can recognize the five
-        // editor-published collection forms. Every other closure shape remains closed by default.
-        customizer.setClosuresAllowed(true);
-        customizer.setMethodDefinitionAllowed(false);
-        customizer.setPackageAllowed(false);
-        customizer.setAllowedImports(List.of());
-        customizer.setAllowedStarImports(List.of());
-        customizer.setAllowedStaticImports(List.of());
-        customizer.setAllowedStaticStarImports(List.of());
-        customizer.setIndirectImportCheckEnabled(false);
-        return customizer;
+        return GroovyScriptPolicy.newSecureCustomizer();
     }
 
     /**
@@ -1964,7 +1918,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                         return rewritten;
                     }
                     if (expression instanceof MethodCallExpression call
-                            && ALLOWED_COLLECTION_METHODS.contains(call.getMethodAsString())) {
+                            && GroovyScriptPolicy.COLLECTION_METHODS.contains(call.getMethodAsString())) {
                         ArgumentListExpression arguments = (ArgumentListExpression) call.getArguments();
                         ClosureExpression closure = (ClosureExpression) arguments.getExpression(0);
                         // The general expression transformer does not descend into closure code when
@@ -1981,7 +1935,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                         return rewritten;
                     }
                     if (expression instanceof MethodCallExpression call
-                            && BUDGETED_STRING_METHODS.contains(call.getMethodAsString())) {
+                            && GroovyScriptPolicy.STRING_METHODS.contains(call.getMethodAsString())) {
                         ArgumentListExpression sourceArguments =
                                 (ArgumentListExpression) call.getArguments();
                         ArgumentListExpression arguments = new ArgumentListExpression(
@@ -1996,7 +1950,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
                         return rewritten;
                     }
                     if (expression instanceof MethodCallExpression call
-                            && BUDGETED_NUMERIC_METHODS.contains(call.getMethodAsString())) {
+                            && GroovyScriptPolicy.NUMERIC_METHODS.contains(call.getMethodAsString())) {
                         ArgumentListExpression sourceArguments =
                                 (ArgumentListExpression) call.getArguments();
                         ArgumentListExpression arguments = new ArgumentListExpression(
@@ -2026,7 +1980,12 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
         }
     }
 
-    /** Semantic-phase allowlist which rejects every statement/expression shape not named here. */
+    /**
+     * 语义分析阶段的封闭世界白名单：委托共享规则模块失败快速检查，首条违规即拒绝编译。
+     *
+     * <p>平台设计态静态检查调用同一访问器的收集模式，两者口径由守护测试保证一致。
+     * 本类只负责“检查”；预算化改写由 {@link JsonPropertyAccessCustomizer} 负责。</p>
+     */
     private static final class RuntimeSecurityCustomizer extends CompilationCustomizer {
 
         private RuntimeSecurityCustomizer() {
@@ -2035,403 +1994,7 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
 
         @Override
         public void call(SourceUnit source, GeneratorContext context, ClassNode classNode) {
-            if (!classNode.isScript()) {
-                reject(classNode, "class declarations are outside the allowed AST");
-            }
-            var run = classNode.getMethod("run", org.codehaus.groovy.ast.Parameter.EMPTY_ARRAY);
-            if (run == null || run.getCode() == null) {
-                return;
-            }
-            new AllowedScriptAst().validateStatement(run.getCode());
-        }
-
-        /** Recursive closed-world validator; adding a Groovy AST type requires an explicit review. */
-        private static final class AllowedScriptAst {
-
-            private final Set<String> localVariables = new HashSet<>();
-            private final Set<String> assignedLocalVariables = new HashSet<>();
-            private final Set<String> capturedLocalVariables = new HashSet<>();
-            private final boolean closureMode;
-            private final Set<String> closureParameters;
-            private final AllowedScriptAst outerScope;
-
-            private AllowedScriptAst() {
-                this(false, Set.of(), null);
-            }
-
-            private AllowedScriptAst(boolean closureMode, Set<String> closureParameters,
-                    AllowedScriptAst outerScope) {
-                this.closureMode = closureMode;
-                this.closureParameters = closureParameters;
-                this.outerScope = outerScope;
-            }
-
-            private void validateStatement(Statement statement) {
-                if (statement instanceof BlockStatement block) {
-                    block.getStatements().forEach(this::validateStatement);
-                    return;
-                }
-                if (statement instanceof ExpressionStatement expression) {
-                    validateExpression(expression.getExpression());
-                    return;
-                }
-                if (statement instanceof ReturnStatement returned) {
-                    validateExpression(returned.getExpression());
-                    return;
-                }
-                if (statement instanceof IfStatement conditional) {
-                    validateExpression(conditional.getBooleanExpression());
-                    validateStatement(conditional.getIfBlock());
-                    validateStatement(conditional.getElseBlock());
-                    return;
-                }
-                if (statement instanceof WhileStatement loop) {
-                    if (closureMode) {
-                        reject(loop, "collection closures may only contain one scalar expression");
-                    }
-                    validateExpression(loop.getBooleanExpression());
-                    validateStatement(loop.getLoopBlock());
-                    return;
-                }
-                if (statement instanceof BreakStatement
-                        || statement instanceof ContinueStatement
-                        || statement instanceof EmptyStatement) {
-                    if (closureMode && !(statement instanceof EmptyStatement)) {
-                        reject(statement, "collection closures may not alter control flow");
-                    }
-                    return;
-                }
-                reject(statement, "statement type is outside the allowed AST");
-            }
-
-            private void validateExpression(Expression expression) {
-                if (expression == null || expression instanceof EmptyExpression) {
-                    return;
-                }
-                if (expression instanceof ConstantExpression constant) {
-                    Object value = constant.getValue();
-                    if (value != null && !(value instanceof String) && !(value instanceof Boolean)
-                            && !(value instanceof Number)) {
-                        reject(expression, "constant type is outside the JSON allowlist");
-                    }
-                    return;
-                }
-                if (expression instanceof GStringExpression interpolated) {
-                    interpolated.getValues().forEach(this::validateExpression);
-                    return;
-                }
-                if (expression instanceof VariableExpression variable) {
-                    validateVariable(variable);
-                    return;
-                }
-                if (expression instanceof DeclarationExpression declaration) {
-                    if (closureMode) {
-                        reject(declaration, "collection closures may not declare local state");
-                    }
-                    if (declaration.isMultipleAssignmentDeclaration()) {
-                        reject(declaration, "only one local variable may be declared at a time");
-                    }
-                    if (!(declaration.getLeftExpression() instanceof VariableExpression variable)) {
-                        reject(declaration, "local declaration must target one variable");
-                        return;
-                    }
-                    validateVariable(variable);
-                    validateExpression(declaration.getRightExpression());
-                    if (!localVariables.add(variable.getName())) {
-                        reject(declaration, "local variables may only be declared once");
-                    }
-                    return;
-                }
-                if (expression instanceof BinaryExpression binary) {
-                    validateBinary(binary);
-                    return;
-                }
-                if (expression instanceof BooleanExpression bool) {
-                    validateExpression(bool.getExpression());
-                    return;
-                }
-                if (expression instanceof NotExpression not) {
-                    validateExpression(not.getExpression());
-                    return;
-                }
-                if (expression instanceof UnaryMinusExpression unary) {
-                    validateExpression(unary.getExpression());
-                    return;
-                }
-                if (expression instanceof UnaryPlusExpression unary) {
-                    validateExpression(unary.getExpression());
-                    return;
-                }
-                if (expression instanceof ElvisOperatorExpression elvis) {
-                    validateTernary(elvis);
-                    return;
-                }
-                if (expression instanceof TernaryExpression ternary) {
-                    validateTernary(ternary);
-                    return;
-                }
-                if (expression instanceof ListExpression list) {
-                    list.getExpressions().forEach(this::validateExpression);
-                    return;
-                }
-                if (expression instanceof MapExpression map) {
-                    map.getMapEntryExpressions().forEach(this::validateExpression);
-                    return;
-                }
-                if (expression instanceof MapEntryExpression entry) {
-                    validateExpression(entry.getKeyExpression());
-                    validateExpression(entry.getValueExpression());
-                    return;
-                }
-                if (expression instanceof PropertyExpression property) {
-                    validateProperty(property);
-                    return;
-                }
-                if (expression instanceof MethodCallExpression methodCall) {
-                    validateMethodCall(methodCall);
-                    return;
-                }
-                if (expression instanceof ArgumentListExpression arguments) {
-                    arguments.getExpressions().forEach(this::validateExpression);
-                    return;
-                }
-                if (expression instanceof TupleExpression tuple) {
-                    tuple.getExpressions().forEach(this::validateExpression);
-                    return;
-                }
-                reject(expression, "expression type is outside the allowed AST");
-            }
-
-            private void validateVariable(VariableExpression variable) {
-                if (RESERVED_VARIABLES.contains(variable.getName()) || variable.isThisExpression()
-                        || variable.isSuperExpression()) {
-                    reject(variable, "host script variables are outside the receiver allowlist");
-                }
-                if (!variable.isDynamicTyped()) {
-                    reject(variable, "typed variables are outside the allowed AST");
-                }
-                if (closureMode && !closureParameters.contains(variable.getName())) {
-                    AllowedScriptAst declaredScope = findDeclaringOuterScope(variable.getName());
-                    if (declaredScope != null) {
-                        if (declaredScope.assignedLocalVariables.contains(variable.getName())) {
-                            reject(variable, "collection closures may only capture immutable local values");
-                        }
-                        declaredScope.capturedLocalVariables.add(variable.getName());
-                    }
-                }
-            }
-
-            private AllowedScriptAst findDeclaringOuterScope(String name) {
-                for (AllowedScriptAst scope = outerScope; scope != null; scope = scope.outerScope) {
-                    if (scope.localVariables.contains(name)) {
-                        return scope;
-                    }
-                }
-                return null;
-            }
-
-            private void validateBinary(BinaryExpression binary) {
-                int token = binary.getOperation().getType();
-                if (!ALLOWED_BINARY_TOKENS.contains(token)) {
-                    reject(binary, "operator is outside the token allowlist");
-                }
-                if (token == Types.ASSIGN) {
-                    if (closureMode) {
-                        reject(binary, "collection closures may not assign state");
-                    }
-                    if (!(binary.getLeftExpression() instanceof VariableExpression variable)
-                            || !localVariables.contains(variable.getName())) {
-                        reject(binary, "assignment targets must be declared local variables");
-                    } else if (capturedLocalVariables.contains(variable.getName())) {
-                        reject(binary, "captured local variables must remain immutable");
-                    } else {
-                        assignedLocalVariables.add(variable.getName());
-                    }
-                }
-                validateExpression(binary.getLeftExpression());
-                validateExpression(binary.getRightExpression());
-            }
-
-            private void validateTernary(TernaryExpression ternary) {
-                validateExpression(ternary.getBooleanExpression());
-                validateExpression(ternary.getTrueExpression());
-                validateExpression(ternary.getFalseExpression());
-            }
-
-            private void validateProperty(PropertyExpression property) {
-                String name = property.getPropertyAsString();
-                if (property instanceof AttributeExpression || name == null || property.isSpreadSafe()
-                        || RESERVED_PROPERTIES.contains(name)) {
-                    reject(property, "property is outside the JSON receiver allowlist");
-                }
-                if (!isExternalJsonPath(property.getObjectExpression())) {
-                    reject(property, "property receiver must originate from an external JSON scope");
-                }
-                validateExpression(property.getObjectExpression());
-            }
-
-            private boolean isExternalJsonPath(Expression expression) {
-                if (expression instanceof VariableExpression variable) {
-                    boolean readable = closureMode
-                            ? closureParameters.contains(variable.getName())
-                                    || findDeclaringOuterScope(variable.getName()) != null
-                                    || !localVariables.contains(variable.getName())
-                            : !localVariables.contains(variable.getName());
-                    return readable && !RESERVED_VARIABLES.contains(variable.getName())
-                            && !variable.isThisExpression() && !variable.isSuperExpression();
-                }
-                if (expression instanceof PropertyExpression property) {
-                    String name = property.getPropertyAsString();
-                    return !(property instanceof AttributeExpression)
-                            && name != null
-                            && !property.isSpreadSafe()
-                            && !RESERVED_PROPERTIES.contains(name)
-                            && isExternalJsonPath(property.getObjectExpression());
-                }
-                if (expression instanceof BinaryExpression binary) {
-                    return binary.getOperation().getType() == Types.LEFT_SQUARE_BRACKET
-                            && isExternalJsonPath(binary.getLeftExpression());
-                }
-                if (expression instanceof MethodCallExpression call) {
-                    return !call.isImplicitThis()
-                            && !call.isSpreadSafe()
-                            && "get".equals(call.getMethodAsString())
-                            && isExternalJsonPath(call.getObjectExpression());
-                }
-                return false;
-            }
-
-            private void validateMethodCall(MethodCallExpression call) {
-                String method = call.getMethodAsString();
-                if (method == null || call.isSpreadSafe()) {
-                    reject(call, "method dispatch is outside the method allowlist");
-                }
-                if (ALLOWED_COLLECTION_METHODS.contains(method)) {
-                    validateCollectionCall(call);
-                    return;
-                }
-                if (BUDGETED_STRING_METHODS.contains(method)) {
-                    validateBudgetedStringCall(call);
-                    return;
-                }
-                if (BUDGETED_NUMERIC_METHODS.contains(method)) {
-                    validateBudgetedNumericCall(call);
-                    return;
-                }
-                if (call.isImplicitThis()) {
-                    if (closureMode || !LOG_METHODS.contains(method)) {
-                        reject(call, "implicit host dispatch is outside the method allowlist");
-                    }
-                } else {
-                    if (!ALLOWED_METHODS.contains(method)) {
-                        reject(call, "method is outside the method allowlist");
-                    }
-                    validateReceiver(call.getObjectExpression());
-                }
-                validateExpression(call.getArguments());
-            }
-
-            private void validateBudgetedStringCall(MethodCallExpression call) {
-                if (call.isImplicitThis()
-                        || !(call.getArguments() instanceof ArgumentListExpression arguments)) {
-                    reject(call, "string operations require an explicit receiver");
-                    return;
-                }
-                String method = call.getMethodAsString();
-                int size = arguments.getExpressions().size();
-                if (("substring".equals(method) && (size < 1 || size > 2))
-                        || (!"substring".equals(method) && size != 0)) {
-                    reject(call, "string operation argument count is outside the allowlist");
-                }
-                validateReceiver(call.getObjectExpression());
-                validateExpression(arguments);
-            }
-
-            private void validateBudgetedNumericCall(MethodCallExpression call) {
-                if (call.isImplicitThis()
-                        || !(call.getArguments() instanceof ArgumentListExpression arguments)
-                        || !arguments.getExpressions().isEmpty()) {
-                    reject(call, "numeric operations require an explicit receiver and no arguments");
-                }
-                validateReceiver(call.getObjectExpression());
-            }
-
-            private void validateCollectionCall(MethodCallExpression call) {
-                if (closureMode || call.isImplicitThis()) {
-                    reject(call, "nested or implicit collection dispatch is outside the allowlist");
-                }
-                validateReceiver(call.getObjectExpression());
-                if (!(call.getArguments() instanceof ArgumentListExpression arguments)
-                        || arguments.getExpressions().size() != 1) {
-                    reject(call, "collection methods require exactly one controlled closure");
-                    return;
-                }
-                Expression argument = arguments.getExpression(0);
-                if (!(argument instanceof ClosureExpression)) {
-                    reject(call, "collection methods require exactly one controlled closure");
-                    return;
-                }
-                ClosureExpression closure = (ClosureExpression) argument;
-                validateCollectionClosure(closure);
-            }
-
-            private void validateCollectionClosure(ClosureExpression closure) {
-                org.codehaus.groovy.ast.Parameter[] parameters = closure.getParameters();
-                String parameterName;
-                if (!closure.isParameterSpecified()) {
-                    parameterName = "it";
-                } else if (parameters != null && parameters.length == 1
-                        && parameters[0].getType().equals(ClassHelper.DYNAMIC_TYPE)
-                        && !RESERVED_VARIABLES.contains(parameters[0].getName())) {
-                    parameterName = parameters[0].getName();
-                } else {
-                    reject(closure, "collection closures accept one untyped element parameter");
-                    return;
-                }
-                AllowedScriptAst body = new AllowedScriptAst(true, Set.of(parameterName), this);
-                body.validateClosureBody(closure.getCode());
-            }
-
-            private void validateClosureBody(Statement statement) {
-                if (statement instanceof BlockStatement block) {
-                    if (block.getStatements().size() != 1) {
-                        reject(block, "collection closures may only contain one scalar expression");
-                    }
-                    validateClosureBody(block.getStatements().getFirst());
-                    return;
-                }
-                if (statement instanceof ExpressionStatement expression) {
-                    validateExpression(expression.getExpression());
-                    return;
-                }
-                if (statement instanceof ReturnStatement returned) {
-                    validateExpression(returned.getExpression());
-                    return;
-                }
-                reject(statement, "collection closures may only contain one scalar expression");
-            }
-
-            private void validateReceiver(Expression receiver) {
-                if (!(receiver instanceof VariableExpression)
-                        && !(receiver instanceof ConstantExpression)
-                        && !(receiver instanceof PropertyExpression)
-                        && !(receiver instanceof MethodCallExpression)
-                        && !(receiver instanceof BinaryExpression)
-                        && !(receiver instanceof ListExpression)
-                        && !(receiver instanceof MapExpression)
-                        && !(receiver instanceof GStringExpression)
-                        && !(receiver instanceof TernaryExpression)
-                        && !(receiver instanceof UnaryMinusExpression)
-                        && !(receiver instanceof UnaryPlusExpression)) {
-                    reject(receiver, "receiver shape is outside the JSON receiver allowlist");
-                }
-                validateExpression(receiver);
-            }
-        }
-
-        private static void reject(ASTNode node, String message) {
-            throw new SecurityException(
-                    "script sandbox rejected " + message + " at line " + Math.max(1, node.getLineNumber()));
+            GroovyScriptRules.enforce(classNode);
         }
     }
 }

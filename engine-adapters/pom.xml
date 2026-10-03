@@ -30,6 +30,18 @@
             <version>${project.version}</version>
         </dependency>
         <dependency>
+            <groupId>com.playrewards</groupId>
+            <artifactId>engine-groovy-rules</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.playrewards</groupId>
+            <artifactId>engine-groovy-rules</artifactId>
+            <version>${project.version}</version>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>org.apache.groovy</groupId>
             <artifactId>groovy</artifactId>
         </dependency>
