@@ -5,6 +5,7 @@ Standalone Maven reactor for the PlayRewards flow runtime engine.
 - `engine-contract`: public runtime contracts
 - `engine-spi`: extension interfaces
 - `engine-core`: framework-independent execution core
+- `engine-groovy-rules`: Groovy 脚本沙箱规则（白名单 + AST 检查），运行时编译与平台设计态静态检查共用，只依赖 Groovy
 - `engine-adapters`: infrastructure adapters
 - `engine-server`: executable Spring Boot server with `/actuator/health`
 

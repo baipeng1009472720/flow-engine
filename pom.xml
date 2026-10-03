@@ -13,6 +13,7 @@
         <module>engine-contract</module>
         <module>engine-spi</module>
         <module>engine-core</module>
+        <module>engine-groovy-rules</module>
         <module>engine-adapters</module>
         <module>engine-server-starter</module>
         <module>engine-server</module>
