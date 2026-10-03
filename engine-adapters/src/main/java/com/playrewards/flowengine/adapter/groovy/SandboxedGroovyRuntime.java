@@ -46,6 +46,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.apache.groovy.parser.antlr4.GroovyLexer;
 import org.codehaus.groovy.ast.ASTNode;
 import org.codehaus.groovy.ast.ClassCodeExpressionTransformer;
@@ -125,6 +127,19 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
     private static final int MAX_RESULT_NODES = 10_000;
     private static final long STOP_POLL_MILLIS = 10;
     private static final String INTERNAL_JSON_ROOTS = "__flowJsonRoots";
+    /**
+     * Groovy Script 宿主属性名：脚本引用它们说明在探测宿主对象，必须保持沙箱违规；
+     * 其余未注入的根变量只是宿主未提供该作用域（数据缺失），按运行时错误报告。
+     */
+    private static final Set<String> SCRIPT_HOST_PROPERTY_NAMES = Set.of(
+            "binding", "properties", "metaClass", "class", "out", "args",
+            "context", "delegate", "owner", "thisObject");
+    /** 只接受普通标识符作为缺失作用域名回显，避免把任意文本写进错误消息。 */
+    private static final Pattern SCOPE_NAME = Pattern.compile("[A-Za-z_][A-Za-z0-9_]{0,63}");
+    /** 从沙箱自身抛出的规则消息中提取摘要与行号；这些消息均为常量文本，不含宿主类名或输入值。 */
+    private static final Pattern SANDBOX_RULE = Pattern.compile(
+            "script sandbox (?:rejected )?([A-Za-z][A-Za-z0-9 ,'_-]{0,160}?)(?: at line (\\d+))?(?=$|[\\r\\n])",
+            Pattern.MULTILINE);
     private static final Set<String> ALLOWED_METHODS = Set.of(
             "contains", "containsKey", "containsValue", "endsWith", "get", "isEmpty",
             "length", "max", "min", "size", "startsWith");
@@ -306,13 +321,11 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
             control.succeed(normalized);
         } catch (SecurityException failure) {
             output = closeLogOutput(output);
-            control.fail(new ScriptExecutionException(
-                    "SCRIPT_SECURITY_VIOLATION", "script violates the sandbox policy"));
+            control.fail(securityViolation(failure, scriptClass));
         } catch (MultipleCompilationErrorsException failure) {
             output = closeLogOutput(output);
             control.fail(isSecurityFailure(failure)
-                    ? new ScriptExecutionException(
-                            "SCRIPT_SECURITY_VIOLATION", "script violates the sandbox policy")
+                    ? securityViolation(failure, null)
                     : new ScriptExecutionException("SCRIPT_COMPILE_FAILED", "script compilation failed"));
         } catch (CancellationException failure) {
             output = closeLogOutput(output);
@@ -467,8 +480,15 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
     /** Resolves a script root only from the adapter-injected JSON map, never Script properties. */
     public static Object readExternalJsonRoot(Object receiver, String name) {
         operationBudget().consume(1);
-        if (!(receiver instanceof Map<?, ?> roots) || !roots.containsKey(name)) {
+        if (!(receiver instanceof Map<?, ?> roots)) {
             throw new SecurityException("script sandbox JSON root is unavailable");
+        }
+        if (!roots.containsKey(name)) {
+            if (SCRIPT_HOST_PROPERTY_NAMES.contains(name) || !SCOPE_NAME.matcher(name).matches()) {
+                throw new SecurityException("script sandbox JSON root is unavailable");
+            }
+            // 根变量只从注入的 JSON 根读取、从不回退到宿主属性，缺失作用域不构成越权。
+            throw new ScriptDataException("script references unavailable scope '" + name + "'");
         }
         return roots.get(name);
     }
@@ -1158,6 +1178,40 @@ public final class SandboxedGroovyRuntime implements ScriptRuntime, AutoCloseabl
             }
         }
         return -1;
+    }
+
+    /**
+     * 构造沙箱违规错误：在通用文案后附加沙箱自身的规则摘要与脚本行号，便于运营定位。
+     *
+     * <p>只回显匹配 {@link #SANDBOX_RULE} 的常量规则文本，不输出 Groovy 编译器原文、宿主类名、
+     * 文件路径或输入值；无法提取时保持原通用文案。</p>
+     *
+     * @param failure 沙箱拒绝异常（运行期 SecurityException 或编译期 MultipleCompilationErrorsException）
+     * @param scriptClass 运行期已编译脚本类，用于从调用栈定位行号；编译期传 null
+     */
+    private static ScriptExecutionException securityViolation(Throwable failure, Class<?> scriptClass) {
+        String summary = null;
+        int line = -1;
+        for (Throwable current = failure; current != null && summary == null;
+                current = current.getCause() == current ? null : current.getCause()) {
+            String message = current.getMessage();
+            Matcher matcher = message == null ? null : SANDBOX_RULE.matcher(message);
+            if (matcher != null && matcher.find()) {
+                summary = matcher.group(1).trim();
+                line = matcher.group(2) != null ? Integer.parseInt(matcher.group(2)) : -1;
+            }
+        }
+        if (line < 0) {
+            line = scriptLine(failure, scriptClass);
+        }
+        StringBuilder message = new StringBuilder("script violates the sandbox policy");
+        if (line > 0) {
+            message.append(" at line ").append(line);
+        }
+        if (summary != null && !summary.isEmpty()) {
+            message.append(": ").append(summary);
+        }
+        return new ScriptExecutionException("SCRIPT_SECURITY_VIOLATION", message.toString());
     }
 
     private static boolean isSecurityFailure(Throwable failure) {

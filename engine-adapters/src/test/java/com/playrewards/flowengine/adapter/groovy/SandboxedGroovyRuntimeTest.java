@@ -921,6 +921,41 @@ class SandboxedGroovyRuntimeTest {
         }
     }
 
+    @Test
+    void missing_host_scope_root_is_a_runtime_error_with_scope_name_and_line() {
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            // 宿主未注入 play 作用域（如画布试运行未带运营配置）属于数据缺失，不是越权访问。
+            ScriptExecutionException failure = scriptFailure(runtime,
+                    "def a = 1\nreturn play.config.question1", Map.of());
+            assertEquals("SCRIPT_RUNTIME_ERROR", failure.code());
+            assertEquals("script runtime error at line 2: script references unavailable scope 'play'",
+                    failure.getMessage());
+            // Groovy Script 宿主属性名仍按沙箱违规处理，不能被当成普通缺失作用域。
+            assertEquals("SCRIPT_SECURITY_VIOLATION",
+                    scriptFailure(runtime, "return properties.size()", Map.of()).code());
+        }
+    }
+
+    @Test
+    void sandbox_violations_carry_rule_summary_and_line_without_host_details() {
+        Map<String, Object> ctx = Map.of("text", "abc");
+        try (SandboxedGroovyRuntime runtime = new SandboxedGroovyRuntime()) {
+            ScriptExecutionException runtimeViolation = scriptFailure(runtime,
+                    "def a = 1\nreturn ctx.text.allWhitespace", ctx);
+            assertEquals("SCRIPT_SECURITY_VIOLATION", runtimeViolation.code());
+            assertEquals("script violates the sandbox policy at line 2: "
+                    + "property receiver must be a JSON object", runtimeViolation.getMessage());
+
+            ScriptExecutionException compileViolation = scriptFailure(runtime,
+                    "def a = 1\nreturn new File('x')", ctx);
+            assertEquals("SCRIPT_SECURITY_VIOLATION", compileViolation.code());
+            assertTrue(compileViolation.getMessage().startsWith(
+                    "script violates the sandbox policy at line 2: "), compileViolation.getMessage());
+            assertFalse(compileViolation.getMessage().contains("java."), compileViolation.getMessage());
+            assertFalse(compileViolation.getMessage().contains("abc"), compileViolation.getMessage());
+        }
+    }
+
     private static ScriptExecutionException scriptFailure(
             ScriptRuntime runtime, String script, Map<String, Object> ctx) {
         CompletionException failure = assertThrows(CompletionException.class,
