@@ -22,7 +22,7 @@
     <properties>
         <java.version>21</java.version>
         <spring-boot.version>3.5.14</spring-boot.version>
-        <fastjson2.version>2.0.61</fastjson2.version>
+        <fastjson2.version>2.0.65</fastjson2.version>
         <maven-surefire-plugin.version>3.5.4</maven-surefire-plugin.version>
         <maven-failsafe-plugin.version>3.5.4</maven-failsafe-plugin.version>
         <maven-enforcer-plugin.version>3.6.1</maven-enforcer-plugin.version>
